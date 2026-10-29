@@ -27,7 +27,7 @@ ping -c 3 <follower>; ssh <follower> 'df -h /data; iostat -x 1 3'
 
 1. First determine whether the cause is **bandwidth/disk** or **apply blocking**:
    - The follower's `apply_failures_total` / `apply_retries_total` increases → switch to
-     [wal-poison.md](wal-poison.md) to check apply errors and disk.
+     [wal-poison.en.md](wal-poison.en.md) to check apply errors and disk.
    - The follower's disk I/O is saturated or `df` is nearly full → expand capacity or clean up archives (do not delete the active WAL).
    - Network packet loss/latency → fix the network; do not blindly increase the queue depth `replication_queue_batches`
      to catch up (it strains the WAL write thread's memory).

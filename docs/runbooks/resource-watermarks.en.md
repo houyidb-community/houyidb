@@ -34,9 +34,9 @@ journalctl -u houyidb --since '2 hours ago' | grep -E 'graph snapshot|snapshot d
    never delete the active WAL or the most recent snapshot directly; prefer expanding capacity.
 3. **Snapshot rejected**: read the CRC/length/key reason from the logs:
    - CRC/truncation → file corruption; keep the corrupted sample and let the next snapshot overwrite it;
-   - Missing key → switch to [encryption-key-missing.md](encryption-key-missing.md);
+   - Missing key → switch to [encryption-key-missing.en.md](encryption-key-missing.en.md);
    - Recovery failure → check graph payload compatibility; perform a full replay if necessary.
-4. If writes have already failed and poisoning occurred, switch to [wal-poison.md](wal-poison.md).
+4. If writes have already failed and poisoning occurred, switch to [wal-poison.en.md](wal-poison.en.md).
 
 ## Recovery Verification
 

@@ -73,7 +73,7 @@ CONDITIONS OF ANY KIND.
 This CLA does not grant permission to use the trade names, trademarks, service
 marks, or product names of the Project, except as required for reasonable and
 customary use in describing the origin of the Contribution. See
-[`TRADEMARK.md`](TRADEMARK.md).
+[`TRADEMARK.en.md`](TRADEMARK.en.md).
 
 ## 7. Notification
 

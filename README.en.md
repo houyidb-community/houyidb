@@ -10,7 +10,7 @@ A single-node, memory-first vector database: HNSW vector search + PAX row-column
 
 ![HouyiDB 60-second demo: upsert, search, filter, kill -9, restart recovery](demo/houyidb-demo.gif)
 
-> First time here? See [`docs/USER_MANUAL.md`](docs/USER_MANUAL.md) (30 minutes from setup to restart recovery).
+> First time here? See [`docs/USER_MANUAL.en.md`](docs/USER_MANUAL.en.md) (30 minutes from setup to restart recovery).
 
 ## Quick Start
 
@@ -49,14 +49,14 @@ cargo run -p houyi-server --bin houyi-server -- \
 cargo run -p houyi-vector --example recall_gate --release
 ```
 
-For the reproducible VectorDBBench protocol, see `VDBBENCH_PROTOCOL.md` and
+For the reproducible VectorDBBench protocol, see `VDBBENCH_PROTOCOL.en.md` and
 `benchmarks/vectordb_bench_houyidb/`. Public reports in this repository
 contain HouyiDB self-measurements only; no third-party comparison results are
 published.
 
-HNSW connectivity density: the server defaults to **2×M** at level 0 (recall first, compatible with existing graph snapshots); for high-QPS scenarios explicitly set `HOUYI_HNSW_LAYER0_MULT=1` (the VDB campaign defaults to 1×). 1× improves QPS by roughly 35–60% over 2×, at about −0.9pp recall (Cohere). Measured comparisons of both modes are in `docs/benchmarks/houyidb-performance-2026-10.md`.
+HNSW connectivity density: the server defaults to **2×M** at level 0 (recall first, compatible with existing graph snapshots); for high-QPS scenarios explicitly set `HOUYI_HNSW_LAYER0_MULT=1` (the VDB campaign defaults to 1×). 1× improves QPS by roughly 35–60% over 2×, at about −0.9pp recall (Cohere). Measured comparisons of both modes are in `docs/benchmarks/houyidb-performance-2026-10.en.md`.
 
-HNSW graph merging defaults to "plan under read lock + commit under short write lock": searches can concurrently read the graph during construction; in the streaming 50% phase, serial query wall time dropped from 104s to 3.9s and p99 from 1.72s to 21ms, with mature recall unchanged. Set `HOUYI_HNSW_PLAN_APPLY=0` to fall back to the old path. See the streaming section of `docs/benchmarks/houyidb-performance-2026-10.md`.
+HNSW graph merging defaults to "plan under read lock + commit under short write lock": searches can concurrently read the graph during construction; in the streaming 50% phase, serial query wall time dropped from 104s to 3.9s and p99 from 1.72s to 21ms, with mature recall unchanged. Set `HOUYI_HNSW_PLAN_APPLY=0` to fall back to the old path. See the streaming section of `docs/benchmarks/houyidb-performance-2026-10.en.md`.
 
 ## Current Capabilities
 
@@ -65,7 +65,7 @@ HNSW graph merging defaults to "plan under read lock + commit under short write 
 - `houyi-query`: pg_wire protocol (text/binary), SQL hybrid search, predicate-pushdown bitset pruning
 - `houyi-persistence`: WAL (async writer thread + checkpoint/rotate), disk snapshots, cold-start recovery
 - `houyi-server`: HTTP API (collection upsert with payload, hybrid search with scores), pg_wire connection handling, metrics output
-- `houyi-mobile`: lightweight C ABI index (iOS/Android), see `docs/HOUYIDB_MOBILE_MANUAL.md`
+- `houyi-mobile`: lightweight C ABI index (iOS/Android), see `docs/HOUYIDB_MOBILE_MANUAL.en.md`
 
 ## Client SDKs (`sdk/`)
 
@@ -82,20 +82,20 @@ The six-language `stable_id` (BLAKE2b-8 big-endian & 2^63-1) is cross-checked ag
 
 ## Documentation
 
-- User guide: [`docs/USER_MANUAL.md`](docs/USER_MANUAL.md)
-- Server manual: [`docs/HOUYIDB_SERVER_MANUAL.md`](docs/HOUYIDB_SERVER_MANUAL.md)
-- Deployment guide: [`docs/DEPLOYMENT_GUIDE.md`](docs/DEPLOYMENT_GUIDE.md)
-- Embeddings (OpenAI-compatible gateway): [`docs/EMBEDDING_GUIDE.md`](docs/EMBEDDING_GUIDE.md)
-- VectorDBBench reproduction protocol: [`VDBBENCH_PROTOCOL.md`](VDBBENCH_PROTOCOL.md)
-- Performance measurements report: [`docs/benchmarks/houyidb-performance-2026-10.md`](docs/benchmarks/houyidb-performance-2026-10.md)
-- Mobile (C ABI): [`docs/HOUYIDB_MOBILE_MANUAL.md`](docs/HOUYIDB_MOBILE_MANUAL.md)
-- MCP server: [`mcp/houyidb-mcp/README.md`](mcp/houyidb-mcp/README.md)
-- SDK release guide: [`docs/SDK_RELEASE.md`](docs/SDK_RELEASE.md)
+- User guide: [`docs/USER_MANUAL.en.md`](docs/USER_MANUAL.en.md)
+- Server manual: [`docs/HOUYIDB_SERVER_MANUAL.en.md`](docs/HOUYIDB_SERVER_MANUAL.en.md)
+- Deployment guide: [`docs/DEPLOYMENT_GUIDE.en.md`](docs/DEPLOYMENT_GUIDE.en.md)
+- Embeddings (OpenAI-compatible gateway): [`docs/EMBEDDING_GUIDE.en.md`](docs/EMBEDDING_GUIDE.en.md)
+- VectorDBBench reproduction protocol: [`VDBBENCH_PROTOCOL.en.md`](VDBBENCH_PROTOCOL.en.md)
+- Performance measurements report: [`docs/benchmarks/houyidb-performance-2026-10.en.md`](docs/benchmarks/houyidb-performance-2026-10.en.md)
+- Mobile (C ABI): [`docs/HOUYIDB_MOBILE_MANUAL.en.md`](docs/HOUYIDB_MOBILE_MANUAL.en.md)
+- MCP server: [`mcp/houyidb-mcp/README.en.md`](mcp/houyidb-mcp/README.en.md)
+- SDK release guide: [`docs/SDK_RELEASE.en.md`](docs/SDK_RELEASE.en.md)
 
 ## License & Governance
 
 - Community edition: Apache-2.0, see [LICENSE](LICENSE) and [NOTICE](NOTICE);
-  licensing notes in [LICENSING.md](LICENSING.md).
-- Contributing: [CONTRIBUTING.md](CONTRIBUTING.md) (external contributions require a [CLA](CLA.md));
-  report security vulnerabilities through the private channel in [SECURITY.md](SECURITY.md);
-  trademark policy in [TRADEMARK.md](TRADEMARK.md).
+  licensing notes in [LICENSING.en.md](LICENSING.en.md).
+- Contributing: [CONTRIBUTING.en.md](CONTRIBUTING.en.md) (external contributions require a [CLA](CLA.en.md));
+  report security vulnerabilities through the private channel in [SECURITY.en.md](SECURITY.en.md);
+  trademark policy in [TRADEMARK.en.md](TRADEMARK.en.md).

@@ -11,7 +11,7 @@
 | Form | Use case | Entry point |
 |------|----------|------|
 | Docker Compose | Quick start, single-node trial | `docker-compose.yml` |
-| Prebuilt binary + systemd | Linux single-node deployment | Release package in `docs/USER_MANUAL.md` |
+| Prebuilt binary + systemd | Linux single-node deployment | Release package in `docs/USER_MANUAL.en.md` |
 | Source build | Custom features / development and debugging | `cargo build --release -p houyi-server` |
 | Kubernetes Helm | In-cluster single node or primary/standby | `deploy/helm/houyidb/` |
 
@@ -166,7 +166,7 @@ helm install houyi-follower ./deploy/helm/houyidb -n houyidb \
 ```
 
 For Secret conventions and how TLS/encryption/RBAC are mounted, see
-`deploy/helm/houyidb/README.md`; pass the full `config.toml` through a Secret, and do not
+`deploy/helm/houyidb/README.en.md`; pass the full `config.toml` through a Secret, and do not
 pass credentials via `--set` (they remain in the Helm release and shell history).
 
 ## 7. Configuration Precedence and TOML
@@ -300,7 +300,7 @@ curl -fsS -X POST http://<follower>:7000/v1/admin/promote \
 
 - Alert rules: `deploy/prometheus/houyidb-alerts.yml`, each alert carries a runbook link
   (`docs/runbooks/`);
-- SLOs and error budgets: `docs/SLO.md`;
+- SLOs and error budgets: `docs/SLO.en.md`;
 - Logs go to stdout/stderr (`tracing`); adjust with `RUST_LOG=info`;
   `--slow-query-ms` prints slow queries.
 
@@ -325,10 +325,10 @@ curl -fsS -X POST http://<follower>:7000/v1/admin/promote \
 | Audit chain verification fails | Log truncated/tampered; restore from backup or follow the security incident process |
 | Replication `AUTH REJECTED` | `replication_auth_token` differs between the two sides |
 | Follower read-only 503 / pgwire 25006 | Expected: followers do not accept writes; promote first |
-| Replication lag keeps growing | Check the network and the follower disk; see `docs/runbooks/replication-lag.md` |
+| Replication lag keeps growing | Check the network and the follower disk; see `docs/runbooks/replication-lag.en.md` |
 | Retrieval dimension 400 | The query vector length must equal the dimension of the collection's first write |
 | Filter returns no results | Confirm the backend is hnsw/flat and that column names and operators are valid |
 | WAL replay takes very long | Large data volume or `collections.wal` uncompacted for a long time; evaluate snapshots and capacity |
 
-For more trial/client questions, see `docs/USER_MANUAL.md`; for protocol details, see
-`docs/HOUYIDB_SERVER_MANUAL.md`.
+For more trial/client questions, see `docs/USER_MANUAL.en.md`; for protocol details, see
+`docs/HOUYIDB_SERVER_MANUAL.en.md`.

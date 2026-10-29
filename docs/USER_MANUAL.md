@@ -383,7 +383,7 @@ HOUYI_TRIAL_HTTP_ADDR=0.0.0.0:17000 \
 - 之后所有 `/v1/*`（除 `/v1/health`、`/readyz`）需
   `Authorization: Bearer <token>` 或 `X-Api-Key: <token>`。
 - 更细粒度权限用 TOML `[[auth_principals]]`（admin/writer/reader +
-  collection 作用域），见 `docs/HOUYIDB_SERVER_MANUAL.md`。
+  collection 作用域），见[部署指南的 TOML 配置示例](https://github.com/houyidb-community/houyidb/blob/main/docs/DEPLOYMENT_GUIDE.md)。
 - 公网暴露请加 TLS（`--tls-cert` / `--tls-key`）与反向代理；不要在公网
   裸跑无认证实例。
 

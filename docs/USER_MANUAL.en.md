@@ -244,7 +244,7 @@ client.embeddings.create(model="bge-m3", input=["苹果是水果"],
 - **identical texts overwrite each other**; business metadata cannot be
   attached; changing the model requires rebuilding the collection;
 - For the complete recipe (Ollama/TEI/OpenAI, model selection, limits, and
-  troubleshooting), see `docs/EMBEDDING_GUIDE.md`.
+  troubleshooting), see `docs/EMBEDDING_GUIDE.en.md`.
 
 ---
 
@@ -310,7 +310,7 @@ SELECT id FROM goods WHERE id IN (1, 3) LIMIT 3;
 - The dimensionality of the pgwire primary index is `HOUYI_TRIAL_DIM` at startup
   (default 768).
 - Batch writes use Extended Query + the `/* houyi:upsert_batch=$1 */` binary
-  protocol; see `docs/HOUYIDB_SERVER_MANUAL.md` in the package for details.
+  protocol; see `docs/HOUYIDB_SERVER_MANUAL.en.md` in the package for details.
 - After enabling `HOUYI_AUTH_TOKEN`, the pgwire password equals that token.
 
 ---
@@ -407,7 +407,7 @@ HOUYI_TRIAL_HTTP_ADDR=0.0.0.0:17000 \
 - Thereafter, all `/v1/*` (except `/v1/health` and `/readyz`) require
   `Authorization: Bearer <token>` or `X-Api-Key: <token>`.
 - For finer-grained permissions, use TOML `[[auth_principals]]` (admin/writer/reader +
-  collection scopes); see `docs/HOUYIDB_SERVER_MANUAL.md`.
+  collection scopes); see the [TOML configuration example in the deployment guide](https://github.com/houyidb-community/houyidb/blob/main/docs/DEPLOYMENT_GUIDE.en.md).
 - For public exposure, add TLS (`--tls-cert` / `--tls-key`) and a reverse proxy;
   do not run an unauthenticated instance bare on the public internet.
 

@@ -4,7 +4,7 @@
 
 For the complete deployment procedure (Docker, binary + systemd, source build,
 Kubernetes, authentication/TLS/encryption, backup and primary/standby), see
-[`docs/DEPLOYMENT_GUIDE.md`](../docs/DEPLOYMENT_GUIDE.md).
+[`docs/DEPLOYMENT_GUIDE.en.md`](../docs/DEPLOYMENT_GUIDE.en.md).
 
 This directory contains deployment-related configuration assets only:
 
@@ -17,5 +17,5 @@ deploy/
 ```
 
 - Container images: `Dockerfile` and `docker-compose.yml` in the repository root;
-- Kubernetes: see `deploy/helm/houyidb/README.md`;
+- Kubernetes: see `deploy/helm/houyidb/README.en.md`;
 - Python / TypeScript / Go / Java / .NET / Rust clients: see `sdk/`.

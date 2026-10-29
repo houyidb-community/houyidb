@@ -21,13 +21,13 @@
 
 | Alert / Event | Severity | Runbook |
 |-------------|--------|------|
-| Replication log divergence (diverged) / follower_ahead | Critical | [replication-divergence.md](replication-divergence.md) |
-| Replication lag, slow follower kicked | Warning | [replication-lag.md](replication-lag.md) |
-| WAL poisoned (writes rejected after a write failure) | Critical | [wal-poison.md](wal-poison.md) |
-| Missing encryption key for encrypted snapshot/WAL causes startup failure | Critical | [encryption-key-missing.md](encryption-key-missing.md) |
-| Audit chain verification failure / audit write error | Critical | [audit-chain-broken.md](audit-chain-broken.md) |
-| Quota rejection or authentication failure storm | Warning | [quota-and-auth-storm.md](quota-and-auth-storm.md) |
-| Memory watermark / low disk / snapshot rejected | Warning | [resource-watermarks.md](resource-watermarks.md) |
+| Replication log divergence (diverged) / follower_ahead | Critical | [replication-divergence.en.md](replication-divergence.en.md) |
+| Replication lag, slow follower kicked | Warning | [replication-lag.en.md](replication-lag.en.md) |
+| WAL poisoned (writes rejected after a write failure) | Critical | [wal-poison.en.md](wal-poison.en.md) |
+| Missing encryption key for encrypted snapshot/WAL causes startup failure | Critical | [encryption-key-missing.en.md](encryption-key-missing.en.md) |
+| Audit chain verification failure / audit write error | Critical | [audit-chain-broken.en.md](audit-chain-broken.en.md) |
+| Quota rejection or authentication failure storm | Warning | [quota-and-auth-storm.en.md](quota-and-auth-storm.en.md) |
+| Memory watermark / low disk / snapshot rejected | Warning | [resource-watermarks.en.md](resource-watermarks.en.md) |
 
 ## General Diagnostic Entry Points
 

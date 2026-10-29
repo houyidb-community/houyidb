@@ -5,7 +5,7 @@
 ## v0.2.0-beta.5 (2026-10-25)
 
 ### Added
-- **Embedding integration (Route A)**: `docs/EMBEDDING_GUIDE.md` (Ollama / OpenAI /
+- **Embedding integration (Route A)**: `docs/EMBEDDING_GUIDE.en.md` (Ollama / OpenAI /
   TEI / mock recipes), `examples/text_ingest.py` (chunk → automatic ingestion → search),
   `scripts/embed_smoke.sh` (end-to-end self-check), `scripts/mock_embedding_server.py`
   (semantic-free mock upstream). Added §2.6 to the trial manual; release packages natively include docs/examples/scripts.
@@ -54,7 +54,7 @@
   (it does not take the tombstone lock, avoiding batch-write queuing); `HOUYI_HNSW_PLAN_APPLY=0` reverts to
   the old path. On the same day, Cohere 1M bulk-load total wall clock +11% (1055s → 1170s, recall/QPS
   on par; use the fallback switch when load time is sensitive). See
-  `docs/benchmarks/houyidb-performance-2026-10.md`.
+  `docs/benchmarks/houyidb-performance-2026-10.en.md`.
 - **HNSW default connection density remains 2×M**: 1× would mark old 2× graph snapshots as incompatible and fall back to replay;
   if the WAL has already been truncated by a checkpoint, a data-loss window exists. Therefore the code default remains 2× (compatible
   with old snapshots); high-QPS scenarios should explicitly set `HOUYI_HNSW_LAYER0_MULT=1` (the VDB campaign

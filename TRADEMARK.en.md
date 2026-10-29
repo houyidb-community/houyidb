@@ -43,5 +43,5 @@ by the HouyiDB project.
 ## 6. Reporting misuse
 
 Report misleading use of the Marks through the repository's private security
-advisory channel (see `SECURITY.md`). We prefer resolving issues informally
+advisory channel (see `SECURITY.en.md`). We prefer resolving issues informally
 before taking formal action.
