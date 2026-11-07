@@ -1884,6 +1884,23 @@ mod tests {
                 s.write_all(&h).unwrap();
                 s.write_all(p).unwrap();
             }
+            // 先收完 follower 对两帧的 RECEIVED ACK 再退出。带未读入站数据
+            // 直接 close 会触发 RST（Linux 上尤其确定），RST 会丢弃仍在
+            // follower 内核接收队列里的 DATA 帧——随后退出兜底 drain 只能
+            // apply 部分记录，durable 水位线永远到不了 1（公共 CI Linux
+            // 偶发超时的根因）。收齐两个 ACK 等价于两帧均已被 follower 解析，
+            // 关闭即走 FIN，尾帧不会丢。
+            // EN: Drain the follower's RECEIVED ACKs for both frames before
+            // returning. close() with unread inbound data raises RST (reliably on
+            // Linux), and RST discards DATA frames still queued in the follower's
+            // kernel receive buffer — the exit drain then applies only some
+            // records and the durable watermark never reaches 1 (root cause of the
+            // intermittent Linux CI timeout). Once both ACKs are read, both frames
+            // have been parsed by the follower, so the close is a FIN and the tail
+            // cannot be lost.
+            let mut ack = [0u8; proto::ACK_LEN];
+            s.read_exact(&mut ack).unwrap();
+            s.read_exact(&mut ack).unwrap();
             // 不满批（2 < 32）、不发心跳，直接断连
             // EN: Below the batch threshold (2 < 32), no heartbeat, disconnect directly.
         });
