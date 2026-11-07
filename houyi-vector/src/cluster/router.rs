@@ -1,7 +1,7 @@
 //! 路由器：查询路由到 top-nprobe 聚类 + 向量分配到聚类。
 //! Router: query-to-cluster routing + vector assignment.
 
-use crate::distance;
+use super::boundary::dist_fn;
 use crate::DistanceMetric;
 use rayon::prelude::*;
 
@@ -78,14 +78,6 @@ pub fn group_by_cluster(assignments: &[usize], num_clusters: usize) -> Vec<Vec<u
         clusters[cluster_id].push(vec_idx);
     }
     clusters
-}
-
-#[inline]
-fn dist_fn(metric: DistanceMetric, a: &[f32], b: &[f32]) -> f32 {
-    match metric {
-        DistanceMetric::L2 => distance::l2_squared(a, b),
-        DistanceMetric::Cosine => distance::cosine(a, b),
-    }
 }
 
 #[cfg(test)]

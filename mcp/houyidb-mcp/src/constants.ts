@@ -28,3 +28,47 @@ export const MAX_SEARCH_K = 10_000;
 // 与服务端 MAX_SEARCH_EF 同口径，避免请求侧放大预分配。
 // EN: Mirrors the server's MAX_SEARCH_EF to avoid request-side allocation blowups.
 export const MAX_SEARCH_EF = 10_000;
+
+// 显式建集合的 HNSW 三元组边界（与服务端 400 校验一致）：m ∈ [2,1024]，
+// ef_construction / ef_search ∈ [1,65536]。注意创建期的 ef_search 上限
+// 高于检索期的 MAX_SEARCH_EF（建集合只落参数，不预分配检索缓冲）。
+// EN: HNSW triple bounds for explicit creation (matching the server's 400
+// validation): m ∈ [2,1024], ef_construction / ef_search ∈ [1,65536]. The
+// creation-time ef_search ceiling is higher than search-time MAX_SEARCH_EF
+// because creation only persists parameters and allocates no search buffer.
+export const MIN_HNSW_M = 2;
+export const MAX_HNSW_M = 1_024;
+export const MIN_HNSW_EF = 1;
+export const MAX_HNSW_EF = 65_536;
+
+// 度量与后端的字面量集合在此单点定义：zod schema 与后端/度量约束表共用，
+// 避免键名拼错或字面量漂移后仍编译通过、静默绕过本地预拒绝（OCR 195e6be #01）。
+// EN: The metric/backend literal sets are defined once here and shared by the
+// zod schemas and the backend/metric constraint table, so a key typo or drifted
+// literal cannot compile and silently disable the local pre-rejection
+// (OCR 195e6be #01).
+export const METRICS = ["l2", "cosine", "ip", "l1"] as const;
+export type MetricName = (typeof METRICS)[number];
+
+export const INDEX_TYPES = [
+  "hnsw",
+  "pq-flat",
+  "flat",
+  "clustered",
+  "flat-clustered",
+  "hii-l0",
+] as const;
+export type IndexTypeName = (typeof INDEX_TYPES)[number];
+
+// 各后端唯一支持的度量：pq-flat 仅 L2（ADC 码本按平方欧氏距离训练），
+// hii-l0 仅 Cosine。省略 metric 时据此派生默认值（与服务端一致）。
+// EN: The only metric each backend supports: pq-flat is L2-only (its ADC
+// codebooks are trained on squared Euclidean distance) and hii-l0 is
+// Cosine-only. When metric is omitted the default is derived accordingly,
+// matching the server.
+export const BACKEND_METRIC_CONSTRAINTS: Partial<
+  Record<IndexTypeName, MetricName>
+> = {
+  "pq-flat": "l2",
+  "hii-l0": "cosine",
+};

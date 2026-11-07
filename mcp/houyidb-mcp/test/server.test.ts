@@ -123,6 +123,7 @@ describe("configuration", () => {
     const config = loadConfig({});
     expect(config.baseUrl).toBe("http://127.0.0.1:17000");
     expect(config.authToken).toBeUndefined();
+    expect(config.adminToken).toBeUndefined();
     expect(config.readOnly).toBe(true);
     expect(config.collections.size).toBe(0);
   });
@@ -131,11 +132,13 @@ describe("configuration", () => {
     const config = loadConfig({
       HOUYIDB_URL: "http://houyi.local:18000///",
       HOUYI_AUTH_TOKEN: "  secret-token  ",
+      HOUYI_ADMIN_TOKEN: "  admin-token  ",
       HOUYIDB_MCP_READ_ONLY: "0",
       HOUYIDB_MCP_COLLECTIONS: " docs, notes ,, docs ",
     });
     expect(config.baseUrl).toBe("http://houyi.local:18000");
     expect(config.authToken).toBe("secret-token");
+    expect(config.adminToken).toBe("admin-token");
     expect(config.readOnly).toBe(false);
     expect([...config.collections]).toEqual(["docs", "notes"]);
   });
@@ -174,7 +177,9 @@ describe("tool registration", () => {
     );
     expect(await toolNames(client)).toEqual([
       "collection_status",
+      "create_collection",
       "delete",
+      "delete_collection",
       "hybrid_search",
       "list_collections",
       "search",
@@ -222,6 +227,8 @@ describe("collection allowlist", () => {
         { collection: "secret", vectors: [{ id: 1, values: [1, 0] }] },
       ],
       ["delete", { collection: "secret", ids: [1] }],
+      ["delete_collection", { collection: "secret" }],
+      ["create_collection", { collection: "secret", dims: 2 }],
     ];
 
     for (const [name, args] of calls) {
@@ -343,6 +350,167 @@ describe("search request mapping", () => {
 });
 
 describe("write request mapping", () => {
+  it("maps create_collection to PUT with the normal token only", async () => {
+    const mock = createMockFetch(() =>
+      jsonResponse({
+        created: true,
+        collection: "docs/2026",
+        dims: 4,
+        metric: "ip",
+        index_type: "hnsw",
+        hnsw: { m: 16, ef_construction: 100, ef_search: 32 },
+      }),
+    );
+    const client = await connect(
+      makeConfig({
+        readOnly: false,
+        authToken: "write-token",
+        adminToken: "admin-token",
+      }),
+      mock.fetchImpl,
+    );
+
+    const { isError, text } = await callText(client, "create_collection", {
+      collection: "docs/2026",
+      dims: 4,
+      metric: "ip",
+      index_type: "hnsw",
+      hnsw: { m: 16, ef_construction: 100, ef_search: 32 },
+    });
+
+    expect(isError).not.toBe(true);
+    expect(JSON.parse(text)).toEqual({
+      created: true,
+      collection: "docs/2026",
+      dims: 4,
+      metric: "ip",
+      index_type: "hnsw",
+      hnsw: { m: 16, ef_construction: 100, ef_search: 32 },
+    });
+    const request = mock.calls[0];
+    expect(request?.url).toBe(
+      "http://houyi.test:17000/v1/collections/docs%2F2026",
+    );
+    expect(request?.method).toBe("PUT");
+    // 显式创建是普通写路径：只带 auth token，绝不外泄 admin token。
+    // EN: explicit creation is a normal write path: only the auth token, never
+    // the admin token.
+    expect(request?.headers.Authorization).toBe("Bearer write-token");
+    expect(JSON.parse(request?.body ?? "{}")).toEqual({
+      dims: 4,
+      metric: "ip",
+      index_type: "hnsw",
+      hnsw_m: 16,
+      hnsw_ef_construction: 100,
+      hnsw_ef_search: 32,
+    });
+  });
+
+  it("rejects hnsw parameters on a non-hnsw backend without calling upstream", async () => {
+    const mock = createMockFetch(() => jsonResponse({}));
+    const client = await connect(
+      makeConfig({ readOnly: false }),
+      mock.fetchImpl,
+    );
+
+    const { isError, text } = await callText(client, "create_collection", {
+      collection: "docs",
+      dims: 4,
+      index_type: "pq-flat",
+      hnsw: { m: 16, ef_construction: 100, ef_search: 32 },
+    });
+
+    expect(isError).toBe(true);
+    expect(text).toContain("hnsw");
+    expect(mock.calls.length).toBe(0);
+  });
+
+  it("forwards hnsw parameters without inferring index_type", async () => {
+    // 省略 index_type 时不得推断后端、也不得本地拒绝：服务端按部署的
+    // default_index_type 解析（默认非 hnsw 时自行 400）。本地校验必须与
+    // 服务端契约同宽（OCR 195e6be #02、cf1d19f #00）。
+    // EN: An omitted index_type must be neither inferred nor rejected locally:
+    // the server resolves the deployment's default_index_type (and returns its
+    // own 400 when that default is not hnsw). Local validation must be no
+    // stricter than the server contract (OCR 195e6be #02, cf1d19f #00).
+    const mock = createMockFetch(() =>
+      jsonResponse({
+        created: true,
+        collection: "docs",
+        dims: 4,
+        metric: "cosine",
+        index_type: "hnsw",
+        hnsw: { m: 16, ef_construction: 100, ef_search: 32 },
+      }),
+    );
+    const client = await connect(
+      makeConfig({ readOnly: false }),
+      mock.fetchImpl,
+    );
+
+    const { isError } = await callText(client, "create_collection", {
+      collection: "docs",
+      dims: 4,
+      hnsw: { m: 16, ef_construction: 100, ef_search: 32 },
+    });
+
+    expect(isError).not.toBe(true);
+    expect(mock.calls.length).toBe(1);
+    expect(JSON.parse(mock.calls[0]?.body ?? "{}")).toEqual({
+      dims: 4,
+      hnsw_m: 16,
+      hnsw_ef_construction: 100,
+      hnsw_ef_search: 32,
+    });
+  });
+
+  it("rejects a metric the backend cannot use without calling upstream", async () => {
+    const mock = createMockFetch(() => jsonResponse({}));
+    const client = await connect(
+      makeConfig({ readOnly: false }),
+      mock.fetchImpl,
+    );
+
+    const { isError, text } = await callText(client, "create_collection", {
+      collection: "docs",
+      dims: 4,
+      metric: "ip",
+      index_type: "hii-l0",
+    });
+
+    expect(isError).toBe(true);
+    expect(text).toContain("cosine");
+    expect(mock.calls.length).toBe(0);
+  });
+
+  it("fills the backend-mandated metric when omitted", async () => {
+    const mock = createMockFetch(() =>
+      jsonResponse({
+        created: true,
+        collection: "docs",
+        dims: 4,
+        metric: "l2",
+        index_type: "pq-flat",
+      }),
+    );
+    const client = await connect(
+      makeConfig({ readOnly: false }),
+      mock.fetchImpl,
+    );
+
+    await callText(client, "create_collection", {
+      collection: "docs",
+      dims: 4,
+      index_type: "pq-flat",
+    });
+
+    expect(JSON.parse(mock.calls[0]?.body ?? "{}")).toEqual({
+      dims: 4,
+      metric: "l2",
+      index_type: "pq-flat",
+    });
+  });
+
   it("maps upsert vectors to the upsert endpoint", async () => {
     const mock = createMockFetch(() => jsonResponse({ inserted: 1 }));
     const client = await connect(
@@ -395,6 +563,88 @@ describe("write request mapping", () => {
     expect(empty.isError).toBe(true);
     expect(empty.text).toContain("at least one id or filter");
     expect(mock.calls).toHaveLength(1);
+  });
+});
+
+describe("collection delete mapping", () => {
+  it("issues an admin DELETE with the admin token only", async () => {
+    const mock = createMockFetch(() =>
+      jsonResponse({ deleted: true, collection: "docs" }),
+    );
+    const client = await connect(
+      makeConfig({
+        readOnly: false,
+        authToken: "read-token",
+        adminToken: "admin-token",
+      }),
+      mock.fetchImpl,
+    );
+
+    const { isError, text } = await callText(client, "delete_collection", {
+      collection: "docs",
+    });
+
+    expect(isError).not.toBe(true);
+    expect(JSON.parse(text)).toEqual({ deleted: true, collection: "docs" });
+    expect(mock.calls).toHaveLength(1);
+    const request = mock.calls[0];
+    expect(request?.url).toBe(
+      "http://houyi.test:17000/v1/admin/collections/docs",
+    );
+    expect(request?.method).toBe("DELETE");
+    expect(request?.headers.Authorization).toBe("Bearer admin-token");
+    expect(request?.body).toBeUndefined();
+  });
+
+  it("rejects when HOUYI_ADMIN_TOKEN is not configured", async () => {
+    const mock = createMockFetch(() => jsonResponse({}));
+    const client = await connect(
+      makeConfig({ readOnly: false }),
+      mock.fetchImpl,
+    );
+
+    const { isError, text } = await callText(client, "delete_collection", {
+      collection: "docs",
+    });
+
+    expect(isError).toBe(true);
+    expect(text).toContain("HOUYI_ADMIN_TOKEN");
+    expect(mock.calls).toHaveLength(0);
+  });
+
+  it("encodes the collection name in the admin path", async () => {
+    const mock = createMockFetch(() => jsonResponse({ deleted: true }));
+    const client = await connect(
+      makeConfig({ readOnly: false, adminToken: "admin-token" }),
+      mock.fetchImpl,
+    );
+
+    await callText(client, "delete_collection", {
+      collection: "docs/2026",
+    });
+
+    expect(mock.calls[0]?.url).toBe(
+      "http://houyi.test:17000/v1/admin/collections/docs%2F2026",
+    );
+  });
+
+  it("redacts the admin token in error messages", async () => {
+    const mock = createMockFetch(() =>
+      textResponse("forbidden admin-token", 403),
+    );
+    const client = await connect(
+      makeConfig({ readOnly: false, adminToken: "admin-token" }),
+      mock.fetchImpl,
+    );
+
+    const { isError, text } = await callText(client, "delete_collection", {
+      collection: "docs",
+    });
+
+    expect(isError).toBe(true);
+    expect(text).toContain("HouyiDB HTTP 403");
+    expect(text).toContain("[REDACTED]");
+    expect(text).not.toContain("admin-token");
   });
 });
 

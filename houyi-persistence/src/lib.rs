@@ -6,6 +6,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use encryption::Encryption;
 
+pub mod collection_snapshot_file;
 pub mod collection_wal;
 /// P4.5.4 故障注入点（feature `failpoints`；未启用时为空操作）。
 /// Failpoint hooks — no-op unless the `failpoints` feature is enabled.
@@ -488,7 +489,7 @@ fn list_archived_segments(wal_path: &Path) -> io::Result<Vec<PathBuf>> {
     let Some(marker) = archived_segment_marker(wal_path) else {
         return Ok(Vec::new());
     };
-    let parent = wal_path.parent().unwrap_or_else(|| Path::new("."));
+    let parent = parent_dir_or_dot(wal_path);
     let mut paths: Vec<PathBuf> = fs::read_dir(parent)?
         .filter_map(|e| e.ok())
         .map(|e| e.path())
@@ -512,13 +513,22 @@ fn encryption_migration_marker_path(wal_path: &Path) -> PathBuf {
     wal_path.with_extension("wal.encrypt.migrating")
 }
 
+/// 父目录归一：`Path::new("data.wal").parent()` 是 `Some("")` 而非 None，
+/// 直接打开 "" 做 fsync/read_dir 会 ENOENT。
+/// EN: normalize an empty parent (bare file names) to "." — `parent()` of a
+/// bare file name is `Some("")`, not None.
+pub fn parent_dir_or_dot(path: &Path) -> &Path {
+    path.parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."))
+}
+
 /// 目录项 fsync：迁移顺序（标记→rename→删归档）的每一步都要落盘，
 /// 否则崩溃后可能「删了归档但 rename 未持久」= 丢历史。失败上抛。
 /// EN: fsync the directory between migration steps; failure is fatal — an
 /// unpersisted rename followed by archive deletion would lose history.
 fn sync_parent_dir(path: &Path) -> io::Result<()> {
-    let dir = path.parent().unwrap_or_else(|| Path::new("."));
-    fs::File::open(dir)?.sync_all()
+    fs::File::open(parent_dir_or_dot(path))?.sync_all()
 }
 
 /// 读 v3 段头里的密钥 id（轮换判定用）。 / EN: key id pinned by a v3 header.
@@ -550,6 +560,8 @@ fn rehead_empty_v3_segment(wal: &mut FileWal, enc: &Encryption) -> io::Result<()
     reopened.seek(SeekFrom::End(0))?;
     wal.file = Some(reopened);
     wal.format = WalFormat::V3;
+    wal.active_bytes = WAL_ENCRYPTED_HEADER_LEN as u64;
+    wal.active_first_lsn = None;
     if wal.next_lsn > 0 {
         write_wal_next_lsn_meta_atomic(wal.path(), wal.next_lsn)?;
     }
@@ -585,6 +597,40 @@ impl Wal for InMemoryWal {
     }
 }
 
+/// 归档段元数据（P5.0.2）：按 first_lsn 排序，与文件名/时钟无关。
+/// EN: Archived-segment metadata (P5.0.2), sorted by first_lsn rather than
+/// filename or wall clock.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WalSegmentMeta {
+    pub path: PathBuf,
+    pub first_lsn: u64,
+    pub last_lsn: u64,
+    pub bytes: u64,
+}
+
+/// WAL 段统计（状态端点/保留决策共用）。
+/// EN: WAL segment statistics (shared by status and retention decisions).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SegmentStats {
+    pub first_available_lsn: u64,
+    pub next_lsn: u64,
+    pub active_bytes: u64,
+    pub archived_bytes: u64,
+    pub archives: Vec<WalSegmentMeta>,
+}
+
+/// 段保留结果（删除整段；活动文件永不删除）。
+/// EN: Segment-retention outcome (whole segments only; the active file is never deleted).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RetentionOutcome {
+    pub deleted_segments: usize,
+    pub bytes_freed: u64,
+    pub first_available_lsn: u64,
+    /// None = 已按预算执行（可能未删任何段）；Some = 被阻塞的原因。
+    /// EN: None = ran within budget (may delete zero); Some = blocked reason.
+    pub blocked_reason: Option<String>,
+}
+
 /// 文件 WAL：v2 格式（文件头 + 每记录 CRC32），v1 遗留文件只读兼容、按 v1 追加。
 /// File WAL: v2 on-disk format (header + per-record CRC32); legacy v1 files stay
 /// appendable in v1 and age out via rotate/truncate.
@@ -613,6 +659,17 @@ pub struct FileWal {
     /// torn boundary that replay treats as end-of-log. All writes error until the
     /// process reopens the WAL. The first failure is kept (later ones echo it).
     poisoned: Option<String>,
+    /// 自动轮转阈值字节（0 = 关闭）；超过时在下一条记录前轮转。
+    /// EN: Auto-rotation threshold in bytes (0 = disabled); rotate before the
+    /// next record once exceeded.
+    segment_bytes: u64,
+    /// 活动文件当前字节数与首条记录 LSN（空活动段为 None）。
+    /// EN: Active file size and first-record LSN (None for an empty segment).
+    active_bytes: u64,
+    active_first_lsn: Option<u64>,
+    /// 归档段元数据，按 first_lsn 排序。
+    /// EN: Archived segments sorted by first_lsn.
+    archives: Vec<WalSegmentMeta>,
 }
 
 impl FileWal {
@@ -721,6 +778,8 @@ impl FileWal {
         } else {
             Vec::new()
         };
+        let final_active_len = file.metadata()?.len();
+        let active_first_lsn = active_entries.first().map(|e| e.lsn);
         let mut wal = Self {
             path,
             file: Some(file),
@@ -728,6 +787,10 @@ impl FileWal {
             format,
             encryption,
             poisoned: None,
+            segment_bytes: 0,
+            active_bytes: final_active_len,
+            active_first_lsn,
+            archives: Vec::new(),
         };
         // 迁移标记 + 已是 v3 ⇒ rename 已完成、归档段只是待删的明文副本。
         // 此时绝不能再次合并归档（重复 LSN 会破坏连续性/指纹）；直接清掉。
@@ -748,9 +811,24 @@ impl FileWal {
                 "wal: finished an interrupted encryption migration (removed stale plaintext archives)"
             );
         } else {
+            let encryption_for_read = wal.encryption.clone();
             for p in list_archived_segments(wal.path())? {
-                replayed.extend(read_records_from_path(&p, wal.encryption.as_deref())?);
+                let entries = read_records_from_path(&p, encryption_for_read.as_deref())?;
+                if let (Some(first), Some(last)) = (entries.first(), entries.last()) {
+                    let bytes = fs::metadata(&p)?.len();
+                    wal.archives.push(WalSegmentMeta {
+                        path: p.clone(),
+                        first_lsn: first.lsn,
+                        last_lsn: last.lsn,
+                        bytes,
+                    });
+                }
+                replayed.extend(entries);
             }
+            // 段顺序按 LSN，不按文件名（时钟回拨/跨进程命名可能乱序）。
+            // EN: order segments by LSN, not filename (clock skew/cross-process
+            // naming can invert lexical order).
+            wal.archives.sort_by_key(|m| m.first_lsn);
         }
         let active_had_records = !active_entries.is_empty();
         replayed.extend(active_entries);
@@ -759,6 +837,9 @@ impl FileWal {
         // EN: one-time migration of the whole plaintext history into one v3 segment.
         if wal.encryption.is_some() && wal.format != WalFormat::V3 {
             wal.rewrite_all_encrypted(&replayed)?;
+            wal.archives.clear();
+            wal.active_bytes = fs::metadata(wal.path()).map(|m| m.len()).unwrap_or(0);
+            wal.active_first_lsn = replayed.first().map(|e| e.lsn);
         }
         if let Some(last) = replayed.last() {
             wal.next_lsn = last.lsn + 1;
@@ -917,6 +998,104 @@ impl FileWal {
         self.next_lsn
     }
 
+    /// 配置自动轮转阈值（0 = 关闭）。仅在构造后、写入前调用。
+    /// EN: Configure the auto-rotation threshold (0 disables). Call before writes.
+    pub fn set_segment_bytes(&mut self, bytes: u64) {
+        self.segment_bytes = bytes;
+    }
+
+    /// 当前最早可读 LSN（无记录时等于 next_lsn）。
+    /// EN: Earliest readable LSN (equal to next_lsn when the log is empty).
+    pub fn first_available_lsn(&self) -> u64 {
+        self.archives
+            .first()
+            .map(|m| m.first_lsn)
+            .or(self.active_first_lsn)
+            .unwrap_or(self.next_lsn)
+    }
+
+    /// 段统计快照（状态端点/保留决策）。
+    /// EN: Segment statistics snapshot (status and retention decisions).
+    pub fn segment_stats(&self) -> SegmentStats {
+        let archived_bytes = self.archives.iter().map(|m| m.bytes).sum();
+        SegmentStats {
+            first_available_lsn: self.first_available_lsn(),
+            next_lsn: self.next_lsn,
+            active_bytes: self.active_bytes,
+            archived_bytes,
+            archives: self.archives.clone(),
+        }
+    }
+
+    /// 按整段删除最旧归档：仅删除 `last_lsn <= safe_floor` 的段，且最多删
+    /// `max_deletes` 个；活动文件永不删除。删除后更新 first_available_lsn。
+    /// EN: Delete oldest whole archives with `last_lsn <= safe_floor`, at most
+    /// `max_deletes`; never touches the active file. Updates first_available_lsn.
+    ///
+    /// 最后一个归档被删且活动段为空时，先落盘 `next_lsn` 侧车——否则重启只能
+    /// 从 0 重新分配 LSN，复制 resume 与快照 checkpoint 全部失义。
+    /// EN: When deleting the last archive while the active segment is empty, write
+    /// the durable next_lsn sidecar first; otherwise restart would reallocate from
+    /// zero and invalidate replication resume/snapshot checkpoints.
+    pub fn retain_segments(
+        &mut self,
+        safe_floor_lsn: u64,
+        max_segments: usize,
+        max_deletes: usize,
+    ) -> io::Result<RetentionOutcome> {
+        let first_available = self.first_available_lsn();
+        if max_segments == 0 {
+            return Ok(RetentionOutcome {
+                deleted_segments: 0,
+                bytes_freed: 0,
+                first_available_lsn: first_available,
+                blocked_reason: Some("retention_disabled".to_string()),
+            });
+        }
+        if self.archives.len() <= max_segments {
+            return Ok(RetentionOutcome {
+                deleted_segments: 0,
+                bytes_freed: 0,
+                first_available_lsn: first_available,
+                blocked_reason: None,
+            });
+        }
+        let mut deleted = 0usize;
+        let mut freed = 0u64;
+        let mut blocked = None;
+        while self.archives.len() > max_segments && deleted < max_deletes {
+            let oldest = &self.archives[0];
+            if oldest.last_lsn > safe_floor_lsn {
+                blocked = Some(format!(
+                    "floor_below_oldest_segment: safe_floor={safe_floor_lsn}, \
+                     oldest_last_lsn={}",
+                    oldest.last_lsn
+                ));
+                break;
+            }
+            // 删除最后一个归档且活动段为空：next_lsn 侧车必须先落盘。
+            // EN: Deleting the last archive with an empty active segment requires
+            // a durable next_lsn sidecar first.
+            if self.archives.len() == 1 && self.active_first_lsn.is_none() {
+                crate::wal_sidecar::write_wal_next_lsn_meta_atomic(&self.path, self.next_lsn)?;
+            }
+            let meta = self.archives[0].clone();
+            fs::remove_file(&meta.path)?;
+            self.archives.remove(0);
+            deleted += 1;
+            freed += meta.bytes;
+        }
+        if deleted > 0 {
+            sync_parent_dir(&self.path)?;
+        }
+        Ok(RetentionOutcome {
+            deleted_segments: deleted,
+            bytes_freed: freed,
+            first_available_lsn: self.first_available_lsn(),
+            blocked_reason: blocked,
+        })
+    }
+
     /// 删除 LSN ≤ `through_lsn` 的记录并重写 WAL 文件（同目录下原子 `rename`）。
     ///
     /// **安全 / Safety**：仅删除**已确认**可丢弃的日志（通常与 `*.applied_lsn` 对齐）。当前索引仍为内存态、
@@ -983,6 +1162,11 @@ impl FileWal {
         } else {
             WalFormat::V2
         };
+        // 全量重写后归档段全部消失，活动文件即完整保留前缀。
+        // EN: A full rewrite drops every archive; the active file is the retained prefix.
+        self.archives.clear();
+        self.active_bytes = fs::metadata(&self.path).map(|m| m.len()).unwrap_or(0);
+        self.active_first_lsn = entries.first().map(|e| e.lsn);
         // 截断是全量重写（解析有效前缀 → tmp → fsync → rename）：成功后
         // 文件本身就是一致前缀，等价于一次 reopen，毒标记可以安全清除
         // （OCR 批次二十八）。失败路径不置毒——tmp+rename 在 rename 前
@@ -1035,6 +1219,8 @@ impl FileWal {
                 self.format = format;
             }
             self.file = Some(f);
+            self.active_bytes = len;
+            self.active_first_lsn = None;
             write_wal_next_lsn_meta_atomic(&self.path, self.next_lsn)?;
             return Ok(None);
         }
@@ -1069,6 +1255,25 @@ impl FileWal {
         write_wal_header(&mut reopened, format, self.encryption.as_deref())?;
         self.file = Some(reopened);
         self.format = format;
+        // 归档段元数据：first 取运行态记录的首 LSN，last 取 next_lsn-1。
+        // EN: Archive metadata: first is the active segment's first LSN; last is
+        // next_lsn - 1.
+        let first_lsn = self
+            .active_first_lsn
+            .unwrap_or_else(|| self.next_lsn.saturating_sub(1));
+        self.archives.push(WalSegmentMeta {
+            path: archived.clone(),
+            first_lsn,
+            last_lsn: self.next_lsn.saturating_sub(1),
+            bytes: len,
+        });
+        self.archives.sort_by_key(|m| m.first_lsn);
+        self.active_bytes = match format {
+            WalFormat::V1 => 0,
+            WalFormat::V2 => WAL_HEADER_LEN as u64,
+            WalFormat::V3 => WAL_ENCRYPTED_HEADER_LEN as u64,
+        };
+        self.active_first_lsn = None;
         write_wal_next_lsn_meta_atomic(&self.path, self.next_lsn)?;
         Ok(Some(archived))
     }
@@ -1076,13 +1281,13 @@ impl FileWal {
     /// 归档段数量（不含活动文件）。
     /// EN: Number of archive segments (excluding the active file).
     pub fn archived_segment_count(&self) -> io::Result<usize> {
-        Ok(list_archived_segments(&self.path)?.len())
+        Ok(self.archives.len())
     }
 
     /// 活动 WAL 文件字节数。
     /// EN: Size of the active WAL file in bytes.
     pub fn active_file_len(&self) -> io::Result<u64> {
-        Ok(fs::metadata(&self.path).map(|m| m.len()).unwrap_or(0))
+        Ok(self.active_bytes)
     }
 
     pub fn replay_all(&mut self) -> std::io::Result<Vec<WalEntry>> {
@@ -1105,6 +1310,20 @@ impl FileWal {
         // EN: pre-write error simulates ENOSPC/EIO; post-write panic/pause targets
         // the window where bytes are buffered but `next_lsn` has not advanced.
         self.ensure_healthy()?;
+        // 自动轮转只在记录边界发生：先整体归档旧段，再写新记录。
+        // EN: Auto-rotation happens only at record boundaries: archive the old
+        // segment first, then write the new record.
+        let header_len = match self.format {
+            WalFormat::V1 => 0,
+            WalFormat::V2 => WAL_HEADER_LEN as u64,
+            WalFormat::V3 => WAL_ENCRYPTED_HEADER_LEN as u64,
+        };
+        if self.segment_bytes > 0
+            && self.active_bytes >= self.segment_bytes
+            && self.active_bytes > header_len
+        {
+            self.rotate_archive()?;
+        }
         crate::fail_point!("wal_append_pre");
         let lsn = self.next_lsn;
         let record = encode_record(lsn, &payload, self.format, self.encryption.as_deref())?;
@@ -1116,6 +1335,10 @@ impl FileWal {
             return Err(e);
         }
         crate::fail_point!("wal_append_post");
+        self.active_bytes = self.active_bytes.saturating_add(record.len() as u64);
+        if self.active_first_lsn.is_none() {
+            self.active_first_lsn = Some(lsn);
+        }
         self.next_lsn += 1;
         Ok(WalEntry { lsn, payload })
     }
@@ -1810,5 +2033,103 @@ mod tests {
         );
         let _ = std::fs::remove_file(&path);
         cleanup_own_archived_segments(&path);
+    }
+
+    /// P5.0.2：自动轮转 + 按段保留 + 重开后 first_available/next 连续。
+    /// EN: P5.0.2 — auto-rotation, whole-segment retention, and contiguous
+    /// first_available/next after reopen.
+    #[test]
+    fn wal_segment_metadata_and_retention() {
+        let path = temp_wal_path();
+        {
+            let (mut wal, _) = FileWal::open(&path).expect("open");
+            wal.set_segment_bytes((WAL_HEADER_LEN + 1) as u64);
+            for i in 0..3u8 {
+                let _ = wal.append(vec![i]);
+            }
+            let stats = wal.segment_stats();
+            assert_eq!(stats.first_available_lsn, 0);
+            assert_eq!(stats.next_lsn, 3);
+            assert_eq!(
+                stats.archives.len(),
+                2,
+                "two rotations must archive two segments"
+            );
+            assert!(stats.active_bytes > 0);
+            assert!(stats.archived_bytes > 0);
+
+            let outcome = wal
+                .retain_segments(0, 1, 8)
+                .expect("retention must succeed");
+            assert_eq!(outcome.deleted_segments, 1);
+            assert!(outcome.bytes_freed > 0);
+            assert_eq!(outcome.first_available_lsn, 1);
+            assert_eq!(wal.first_available_lsn(), 1);
+
+            // 旧段已删，floor 不够时不再删除。
+            // EN: Older segments were removed; a low floor no longer deletes anything.
+            let blocked = wal
+                .retain_segments(0, 0, 8)
+                .expect("disabled retention must not error");
+            assert_eq!(blocked.deleted_segments, 0);
+            assert_eq!(
+                blocked.blocked_reason.as_deref(),
+                Some("retention_disabled")
+            );
+        }
+        let (_wal, entries) = FileWal::open(&path).expect("reopen");
+        let lsns: Vec<u64> = entries.iter().map(|e| e.lsn).collect();
+        assert_eq!(lsns, vec![1, 2], "retained history must remain contiguous");
+        let _ = std::fs::remove_file(&path);
+        cleanup_own_archived_segments(&path);
+    }
+
+    /// P5.0.2：safe_floor 低于最旧段末 LSN 时保留动作被阻塞而非越界删除。
+    /// EN: P5.0.2 — a safe floor below the oldest segment's last LSN blocks
+    /// retention instead of deleting needed history.
+    #[test]
+    fn wal_retention_respects_safe_floor() {
+        let path = temp_wal_path();
+        {
+            let (mut wal, _) = FileWal::open(&path).expect("open");
+            for i in 0..2u8 {
+                let _ = wal.append(vec![i]);
+            }
+            let _ = wal.rotate_archive().expect("rotate");
+            for i in 2..4u8 {
+                let _ = wal.append(vec![i]);
+            }
+            let _ = wal.rotate_archive().expect("rotate");
+            let _ = wal.append(b"tail".to_vec());
+            let outcome = wal
+                .retain_segments(0, 1, 8)
+                .expect("retention must not error");
+            assert_eq!(outcome.deleted_segments, 0);
+            assert!(
+                outcome
+                    .blocked_reason
+                    .as_deref()
+                    .unwrap_or_default()
+                    .contains("floor_below_oldest_segment"),
+                "got: {:?}",
+                outcome.blocked_reason
+            );
+        }
+        let _ = std::fs::remove_file(&path);
+        cleanup_own_archived_segments(&path);
+    }
+}
+
+#[cfg(test)]
+mod parent_dir_tests {
+    use super::*;
+
+    #[test]
+    fn bare_filename_parent_normalizes_to_dot() {
+        assert_eq!(parent_dir_or_dot(Path::new("data.wal")), Path::new("."));
+        assert_eq!(
+            parent_dir_or_dot(Path::new("/var/lib/houyi/data.wal")),
+            Path::new("/var/lib/houyi")
+        );
     }
 }

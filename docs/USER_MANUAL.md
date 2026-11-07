@@ -1,4 +1,4 @@
-# HouyiDB 试用手册（v0.2.0-beta.5）
+# HouyiDB 试用手册（v0.2.0-beta.8）
 
 > [English](USER_MANUAL.en.md)
 
@@ -17,8 +17,8 @@
 预编译包（macOS；Apple Silicon 与 Intel 各一份）：
 
 ```
-houyidb-0.2.0-beta.5-<date>-darwin-arm64/     # Apple Silicon (M1/M2/M3/M4)
-houyidb-0.2.0-beta.5-<date>-darwin-x86_64/    # Intel Mac
+houyidb-0.2.0-beta.8-<date>-darwin-arm64/     # Apple Silicon (M1/M2/M3/M4)
+houyidb-0.2.0-beta.8-<date>-darwin-x86_64/    # Intel Mac
 ├── bin/houyi-server          # 主服务（约 10MB，无外部 C 依赖）
 ├── scripts/trial_start.sh    # 一键启动（默认 17000/15432）
 ├── scripts/trial_smoke.sh    # 自检：写入/检索/过滤/删除
@@ -31,7 +31,7 @@ houyidb-0.2.0-beta.5-<date>-darwin-x86_64/    # Intel Mac
 └── sdk/python/               # Python 客户端 + LangChain/LlamaIndex 适配器
 ```
 
-源码包：`houyidb-0.2.0-beta.5-src.tar.gz`（任意平台；含 Dockerfile 与全部 SDK）。
+源码包：`houyidb-0.2.0-beta.8-src.tar.gz`（任意平台；含 Dockerfile 与全部 SDK）。
 
 > 请按 CPU 架构选择预编译包（`uname -m`：`arm64` 用 arm64 包，`x86_64` 用
 > x86_64 包）。Linux/Windows 请用源码包 `cargo build` 或 Docker。
@@ -46,8 +46,8 @@ Apple Silicon（M 系列）用 `darwin-arm64`，Intel Mac 用 `darwin-x86_64`：
 
 ```bash
 uname -m        # arm64 → darwin-arm64；x86_64 → darwin-x86_64
-tar xzf houyidb-0.2.0-beta.5-*-darwin-<arch>.tar.gz
-cd houyidb-0.2.0-beta.5-*-darwin-<arch>
+tar xzf houyidb-0.2.0-beta.8-*-darwin-<arch>.tar.gz
+cd houyidb-0.2.0-beta.8-*-darwin-<arch>
 
 # 若二进制来自网络传输被 Gatekeeper 隔离，先解除（无签名 beta 的常见问题）：
 xattr -dr com.apple.quarantine . 2>/dev/null || true
@@ -66,8 +66,8 @@ xattr -dr com.apple.quarantine . 2>/dev/null || true
 解压源码包后：
 
 ```bash
-tar xzf houyidb-0.2.0-beta.5-src.tar.gz
-cd houyidb-0.2.0-beta.5-src
+tar xzf houyidb-0.2.0-beta.8-src.tar.gz
+cd houyidb-0.2.0-beta.8-src
 docker compose up -d --build        # 首次会编译 Rust，约 5–15 分钟
 curl http://127.0.0.1:7000/v1/health
 ```
@@ -87,8 +87,8 @@ curl http://127.0.0.1:7000/v1/health
 ### 1.3 源码构建（需要 Rust 1.87+）
 
 ```bash
-tar xzf houyidb-0.2.0-beta.5-src.tar.gz
-cd houyidb-0.2.0-beta.5-src
+tar xzf houyidb-0.2.0-beta.8-src.tar.gz
+cd houyidb-0.2.0-beta.8-src
 cargo build --release -p houyi-server
 ./scripts/trial_start.sh
 ```
@@ -112,9 +112,9 @@ HOUYI_TRIAL_PGWIRE_ADDR=127.0.0.1:16432 \
 
 ## 2. 五分钟上手（HTTP API）
 
-数据模型：**Collection**（类似表，首次写入自动创建，维度由第一批向量决定）
-→ 每个 Collection 内是 `id + 向量 + label + payload`。`id` 为 `u64`；
-字符串 id 可由 SDK 确定性哈希成 u64。
+数据模型：**Collection**（类似表，首次写入自动创建，维度由第一批向量决定；
+也可用 `PUT` 显式创建并一次定型维度/度量/后端）→ 每个 Collection 内是
+`id + 向量 + label + payload`。`id` 为 `u64`；字符串 id 可由 SDK 确定性哈希成 u64。
 
 ### 2.1 写入
 
@@ -137,6 +137,34 @@ curl -sS --noproxy '*' -X POST http://127.0.0.1:17000/v1/collections/goods/upser
   `payload` 里的 `label` 键会被拒绝（400）。
 - 单请求体上限 64MB；批量越大吞吐越好。
 
+### 2.1.1 显式创建 collection（可选）
+
+隐式创建使用服务端默认后端与默认度量（hnsw → cosine）。需要 L2 / 内积 / L1
+或自定义 HNSW 参数时，用 `PUT /v1/collections/{name}` 一次定型（普通写权限，
+不需要 admin token）：
+
+```bash
+curl -sS --noproxy '*' -X PUT http://127.0.0.1:17000/v1/collections/goods \
+  -H 'Content-Type: application/json' -d '{
+  "dims": 8,
+  "metric": "ip",
+  "index_type": "hnsw",
+  "hnsw_m": 16, "hnsw_ef_construction": 100, "hnsw_ef_search": 64
+}'
+# 201 {"created":true,"collection":"goods","dims":8,"metric":"ip",
+#      "index_type":"hnsw","hnsw":{"m":16,"ef_construction":100,"ef_search":64}}
+```
+
+- `metric`：`l2` / `cosine` / `ip` / `l1`，省略为后端默认；**创建后不可变**，
+  改度量只能删除重建。
+- `index_type`：`hnsw` / `flat` / `clustered` / `flat-clustered` / `pq-flat` /
+  `hii-l0`，省略为服务端默认。支持矩阵：前四者支持全部四种度量；`pq-flat`
+  仅 `l2`；`hii-l0` 仅 `cosine`。
+- HNSW 三参数必须同时给出（`m` 1..1024，`ef_construction` / `ef_search`
+  1..65536），且仅在 hnsw 后端有意义。
+- 同名已存在 → 409（参数一致也返回 409）；参数非法 → 400；follower/只读 →
+  503。
+
 ### 2.2 向量检索
 
 ```bash
@@ -149,8 +177,10 @@ curl -sS --noproxy '*' -X POST http://127.0.0.1:17000/v1/collections/goods/searc
 # {"ids":[1,3,2],"scores":[...],"payloads":{"1":{...},"3":{...},"2":{...}}}
 ```
 
-- `scores` 与 `ids` 等长，越大越相似（COSINE 后端为 `1 - cosine_distance`，
-  钳制到 `[-1,1]`）。
+- `scores` 与 `ids` 等长，越大越相似；换算由 collection 的 `metric` 决定：
+  `cosine` → `1 - cosine_distance`（钳制到 `[-1,1]`）；`l2` / `l1` →
+  `1 - distance`（不截断）；`ip` → 点积本身（越大越相关）。响应同时回传
+  `metric` 字段。
 - `ef_search` 可选，越大召回越高、延迟越高。
 
 ### 2.3 向量 + 标量过滤（混合检索）
@@ -183,6 +213,24 @@ curl -sS --noproxy '*' http://127.0.0.1:17000/v1/collections/goods/status
 
 删除也支持 `{"filters":[...]}`（按条件删，与显式 id 取并集）。
 
+### 2.4.1 删除整个 collection（管理员，不可逆）
+
+```bash
+# RBAC 开启时使用 admin token；未开启鉴权时可省略 Authorization
+curl -sS --noproxy '*' -X DELETE \
+  -H "Authorization: Bearer $HOUYI_ADMIN_TOKEN" \
+  http://127.0.0.1:17000/v1/admin/collections/goods
+# {"deleted":true,"collection":"goods"}
+```
+
+- **不可逆**：无条件删除（不要求 collection 为空，也没有二次确认参数）。
+  删除前建议先导出备份：`GET /v1/collections/{name}/export`。
+- **权限**：路径归属 `/v1/admin/*`，需要 admin 主体（`Action::Admin`）；审计
+  日志自动记录 actor/路由/状态。
+- **持久化与复制**：WAL-first（`collection_drop`），崩溃重放与 follower 都会
+  收敛到「已删除」；删除后的同名 upsert 会创建全新的空 collection。
+- **状态码**：不存在或重复删除 404；并发删除竞争 409；follower/只读模式 503。
+
 ### 2.5 其它常用端点
 
 | 端点 | 作用 |
@@ -191,6 +239,9 @@ curl -sS --noproxy '*' http://127.0.0.1:17000/v1/collections/goods/status
 | `GET /readyz` | 就绪检查（认证豁免） |
 | `GET /v1/openapi.json` | OpenAPI 文档（可贴进 Swagger UI） |
 | `GET /v1/collections` | 列出 Collection |
+| `PUT /v1/collections/{name}` | 显式创建 collection（写权限；一次定型 dims/度量/后端/HNSW） |
+| `GET /v1/collections/{name}/export` | 流式 NDJSON 逻辑导出（header/记录/footer，备份/迁移用） |
+| `DELETE /v1/admin/collections/{name}` | 删除整个 collection（管理员，不可逆，WAL-first） |
 | `GET /metrics` | Prometheus 指标（认证豁免） |
 | `GET /v1/index/status` | 主索引（/v1/vectors 路径）状态 |
 | `POST /v1/optimize` | 排空构图队列 / 触发压缩 |
@@ -315,8 +366,10 @@ SELECT id FROM goods WHERE id IN (1, 3) LIMIT 3;
 - 周期图快照默认 600s 一次；关停时也会写图快照
   （`HOUYI_SHUTDOWN_SNAPSHOT=0` 可关）。
 - **重置试用数据**（会丢数据）：停止服务后 `rm -rf data/`。
-- 已知限制：collections WAL **只增不减**，尚无压实/截断；长期大量写入会让
-  该文件持续增长（试用阶段可定期重置）。
+- collections WAL **有界保留**（P5.0）：默认每 16 段 × 64 MiB 从 manifest 的
+  safe checkpoint 起按整段删除；follower 由已确认 durable LSN 保护 floor。
+  存在 clustered / flat-clustered / pq-flat collection 时保留会停在旧 floor
+  并在 `/v1/wal/status` 报告 `blocked_reason`。
 
 ---
 
@@ -392,10 +445,17 @@ HOUYI_TRIAL_HTTP_ADDR=0.0.0.0:17000 \
 ## 9. 已知限制（beta）
 
 - 单机架构，无分片；高可用是 leader/follower 手动 promote，无自动选主。
-- collections WAL 只增不减（无压实）。
-- 重复 upsert 时标量页 append-only，会保留旧行；检索/过滤按 id 去重。
-  payload 的数组/对象值按 JSON 文本列处理，过滤语义有限。
-- `pq-flat` 后端的距离全链路为 L2，HTTP score 为 `1 − L2²`（无界）。
+- collections WAL 有界保留（默认 16 段 × 64 MiB）。follower 落后到保留范围
+  之外会收到 `BEHIND_RETAINED`，必须按
+  `docs/runbooks/collections-retention-resync.md` 做全量重同步；不会自动清库。
+  复制协议 v8 不做跨版本滚动兼容，升级需所有副本一起进行（见服务手册）。
+- 标量页默认每 10 分钟检查、stale 行 ≥50% 时压实；压实后过滤只命中每个 id
+  的最后一行（此前旧行仍会命中）。clustered / flat-clustered / pq-flat 暂不
+  支持快照压缩。
+- payload 的数组/对象值按 JSON 文本列处理，过滤语义有限。
+- 后端与度量支持矩阵：hnsw / flat / clustered / flat-clustered 支持
+  l2/cosine/ip/l1；`pq-flat` 仅 `l2`（HTTP score 为 `1 − L2²`，无界）；
+  `hii-l0` 仅 `cosine`。
 - HII L1（GPU CAGRA）/ L2（NVMe DiskANN）未实现；`simd-avx512` 仅骨架。
 - 过滤检索仅 hnsw / flat 后端支持。
 - 单请求体上限 64MB。

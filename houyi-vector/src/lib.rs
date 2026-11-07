@@ -80,10 +80,26 @@ fn rerank_expand() -> usize {
     })
 }
 
+/// 距离度量。内核统一约定「距离越小越近」——内积因此取负点积，而非直接返回点积，
+/// 否则所有上层排序/近邻选择都需要按度量翻转比较方向（双轨语义是历史 bug 来源）。
+/// EN: Distance metric. The kernel uniformly treats smaller distance as closer, so
+/// inner product is expressed as the negated dot product; returning the raw dot
+/// would force every sorter/neighbor selector to flip comparison direction by metric.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DistanceMetric {
+    /// 欧氏距离的平方（不开方，单调等价且省一次 sqrt）。
+    /// EN: Squared Euclidean distance (no sqrt — monotonic and cheaper).
     L2,
+    /// 余弦距离 `1 - cosine_similarity`；图/写入路径按 L2 单位化后走预归一化点积。
+    /// EN: Cosine distance `1 - cosine_similarity`; graph/write paths pre-normalize.
     Cosine,
+    /// 内积距离 `-dot(a,b)`：点积越大（距离越小）越近，与 Milvus/DM 的 IP 语义一致。
+    /// EN: Inner-product distance `-dot(a,b)`; larger dot (smaller distance) is
+    /// closer, matching Milvus/DM IP semantics.
+    InnerProduct,
+    /// L1 / 曼哈顿距离 `Σ|a_i - b_i|`。
+    /// EN: L1 / Manhattan distance `Σ|a_i - b_i|`.
+    L1,
 }
 
 impl DistanceMetric {
@@ -91,19 +107,61 @@ impl DistanceMetric {
         match self {
             DistanceMetric::L2 => "l2",
             DistanceMetric::Cosine => "cosine",
+            DistanceMetric::InnerProduct => "ip",
+            DistanceMetric::L1 => "l1",
         }
     }
 
-    /// 从快照/配置字符串解析（ASCII 大小写不敏感）。
-    /// EN: Parses from a snapshot/config string (ASCII case-insensitive).
+    /// 从快照/配置字符串解析（ASCII 大小写不敏感）。接受常见别名，便于客户端
+    /// 从 Milvus（`IP`）、DM（`MANHATTAN`）等迁移时直接复用其度量名。
+    /// EN: Parses from a snapshot/config string (ASCII case-insensitive). Common
+    /// aliases are accepted so clients migrating from Milvus (`IP`) or DM
+    /// (`MANHATTAN`) can reuse their metric names directly.
     pub fn parse_str(s: &str) -> Option<Self> {
         let t = s.trim();
-        if t.eq_ignore_ascii_case("l2") {
+        if t.eq_ignore_ascii_case("l2") || t.eq_ignore_ascii_case("euclidean") {
             Some(DistanceMetric::L2)
         } else if t.eq_ignore_ascii_case("cosine") {
             Some(DistanceMetric::Cosine)
+        } else if t.eq_ignore_ascii_case("ip")
+            || t.eq_ignore_ascii_case("inner_product")
+            || t.eq_ignore_ascii_case("inner-product")
+            || t.eq_ignore_ascii_case("dot")
+        {
+            Some(DistanceMetric::InnerProduct)
+        } else if t.eq_ignore_ascii_case("l1") || t.eq_ignore_ascii_case("manhattan") {
+            Some(DistanceMetric::L1)
         } else {
             None
+        }
+    }
+
+    /// 图快照头部的度量字节（0=L2、1=Cosine、2=IP、3=L1）。旧二进制读到未知
+    /// 字节会 fail-fast 拒绝快照并回退，而不是静默按错误度量解释图结构——因此
+    /// 新增度量不需要 bump 快照版本，但降级重放新快照不可用。
+    /// EN: Metric byte in the graph-snapshot header (0=L2, 1=Cosine, 2=IP, 3=L1).
+    /// Old binaries reject unknown bytes and fall back instead of silently
+    /// interpreting the graph under the wrong metric, so no snapshot version bump
+    /// is needed — but downgraded binaries cannot replay newer snapshots.
+    pub fn to_snapshot_byte(self) -> u8 {
+        match self {
+            DistanceMetric::L2 => 0,
+            DistanceMetric::Cosine => 1,
+            DistanceMetric::InnerProduct => 2,
+            DistanceMetric::L1 => 3,
+        }
+    }
+
+    /// 解析图快照头部的度量字节；未知值返回 `None`（调用方映射 `InvalidMetric`）。
+    /// EN: Parse the snapshot metric byte; unknown values yield `None`
+    /// (callers map it to `InvalidMetric`).
+    pub fn from_snapshot_byte(b: u8) -> Option<Self> {
+        match b {
+            0 => Some(DistanceMetric::L2),
+            1 => Some(DistanceMetric::Cosine),
+            2 => Some(DistanceMetric::InnerProduct),
+            3 => Some(DistanceMetric::L1),
+            _ => None,
         }
     }
 }
@@ -178,6 +236,8 @@ pub fn search_flat_contiguous(
             let d = match metric {
                 DistanceMetric::L2 => distance::l2_squared(q, v),
                 DistanceMetric::Cosine => distance::cosine_distance_prenormalized(q, v),
+                DistanceMetric::InnerProduct => distance::inner_product_distance(q, v),
+                DistanceMetric::L1 => distance::l1_distance(q, v),
             };
             (*id, d)
         })
@@ -587,9 +647,14 @@ impl HotBufferIndex {
 
     #[inline]
     fn distance(&self, a: &[f32], b: &[f32]) -> f32 {
+        // 内积/IP 走 `-a·b`、L1 走曼哈顿原值，二者都保持「越小越近」的全序约定。
+        // EN: IP uses `-a·b` and L1 the raw Manhattan sum; both keep the
+        // "smaller = closer" total order the kernel relies on.
         match self.metric {
             DistanceMetric::L2 => l2_distance(a, b),
             DistanceMetric::Cosine => cosine_distance(a, b),
+            DistanceMetric::InnerProduct => distance::inner_product_distance(a, b),
+            DistanceMetric::L1 => distance::l1_distance(a, b),
         }
     }
 
@@ -1373,6 +1438,49 @@ impl HotBufferIndex {
         self.metric
     }
 
+    /// 共享指针导出：已构建向量只克隆 `Arc`，未构建的 hot/queue 行克隆少量数据。
+    /// 用于逻辑备份/迁移的流式导出，避免 10M 规模时把整个向量表再复制一份。
+    /// 三层读锁沿用 `export_snapshot_vectors` 的嵌套模式，但**不单独构成**
+    /// 「行不会丢失」的保证：构建器的 drain→merge 跨越队列写锁与主表写锁，
+    /// 读锁之间仍有窗口。真正的保证来自调用方——先 `drain_pending_builder`
+    /// 等在途合并结束，再由集合写锁阻止新入队（见 HTTP 导出处理器）。
+    /// EN: Shared-pointer export — built vectors clone only the `Arc`; the small
+    /// hot/queue tail is copied. Used by streaming logical backup so a 10M-vector
+    /// table is not duplicated in memory. The nested read guards mirror
+    /// `export_snapshot_vectors` but do **not** alone guarantee no lost rows: the
+    /// builder's drain→merge spans the queue and main write locks, leaving a
+    /// window between our read guards. The guarantee comes from the caller —
+    /// drain the builder first, then hold the collection write lock so nothing
+    /// new is enqueued (see the HTTP export handler).
+    pub async fn export_vectors_shared(&self) -> Result<Vec<(VectorId, Arc<Vec<f32>>)>, String> {
+        let main = self.main_index.read().await;
+        let hot = self.hot_buffer.read().await;
+        let queue = self.builder_queue.read().await;
+        let mut map: AHashMap<VectorId, Arc<Vec<f32>>> =
+            AHashMap::with_capacity(main.len() + hot.len() + queue.len());
+        for (id, v) in main.iter() {
+            map.insert(*id, Arc::clone(v));
+        }
+        for (id, v) in hot.iter() {
+            map.insert(*id, Arc::new(v.clone()));
+        }
+        for (id, v) in queue.iter() {
+            map.insert(*id, Arc::new(v.clone()));
+        }
+        drop(main);
+        drop(hot);
+        drop(queue);
+        let mut out: Vec<_> = Vec::with_capacity(map.len());
+        out.extend(map);
+        out.sort_by_key(|(id, _)| *id);
+        for (id, v) in &out {
+            if v.len() != self.dims {
+                return Err(format!("export: id={id} dim {} != {}", v.len(), self.dims));
+            }
+        }
+        Ok(out)
+    }
+
     /// 导出磁盘快照：main ∪ hot ∪ builder_queue，同 id 以后写为准（queue > hot > main）。
     /// Export for disk snapshot: last-wins per id (queue over hot over main).
     pub async fn export_snapshot_vectors(&self) -> Result<Vec<(VectorId, Vec<f32>)>, String> {
@@ -1858,8 +1966,13 @@ impl HotBufferIndex {
     /// - [`DistanceMetric::Cosine`] → cosine distance `1 - cosine_similarity`
     ///   （由 [`cosine_distance`] 内部按范数归一化计算，存储/查询向量无需预归一化，
     ///   完全相同的向量距离为 0）；
-    /// - [`DistanceMetric::L2`] → L2 距离平方（不开方）。
-    ///   两种语义均为「越小越近」。
+    /// - [`DistanceMetric::L2`] → L2 距离平方（不开方）；
+    /// - [`DistanceMetric::InnerProduct`] → 负点积 `-a·b`（点积越大距离越小）；
+    /// - [`DistanceMetric::L1`] → 曼哈顿距离 `Σ|a_i - b_i|`。
+    ///
+    /// 四种语义均为「越小越近」；服务端在响应边缘把 IP 再取负回正为点积分数。
+    /// EN: All four keep "smaller = closer"; the server flips the IP sign back
+    /// to a raw dot-product score at the response edge.
     ///
     /// 为什么同时保留 scored 与 id-only 两个入口：内核内部链路（HNSW 图遍历、
     /// sanity check）只需要 id，而对外生产 HTTP 检索需要返回相似度分数；后端统一保持
@@ -2033,6 +2146,95 @@ mod tests {
     async fn drain_builder_queue(index: &HotBufferIndex) {
         while index.pending_build_count().await > 0 {
             let _ = index.run_async_builder_once().await;
+        }
+    }
+
+    /// 度量枚举的配置/快照字节契约：别名解析、字符串回写与快照字节往返一致。
+    /// EN: Metric enum config/snapshot-byte contract: alias parsing, string
+    /// roundtrip, and snapshot-byte roundtrip all agree.
+    #[test]
+    fn distance_metric_parse_and_snapshot_bytes_roundtrip() {
+        let all = [
+            DistanceMetric::L2,
+            DistanceMetric::Cosine,
+            DistanceMetric::InnerProduct,
+            DistanceMetric::L1,
+        ];
+        for m in all {
+            assert_eq!(DistanceMetric::parse_str(m.as_str()), Some(m));
+            assert_eq!(
+                DistanceMetric::from_snapshot_byte(m.to_snapshot_byte()),
+                Some(m)
+            );
+        }
+        // 常见迁移别名（Milvus `IP` / DM `MANHATTAN` / 欧氏）。
+        // EN: Common migration aliases (Milvus `IP`, DM `MANHATTAN`, Euclidean).
+        assert_eq!(
+            DistanceMetric::parse_str("IP"),
+            Some(DistanceMetric::InnerProduct)
+        );
+        assert_eq!(
+            DistanceMetric::parse_str("dot"),
+            Some(DistanceMetric::InnerProduct)
+        );
+        assert_eq!(
+            DistanceMetric::parse_str("EUCLIDEAN"),
+            Some(DistanceMetric::L2)
+        );
+        assert_eq!(
+            DistanceMetric::parse_str("manhattan"),
+            Some(DistanceMetric::L1)
+        );
+        assert_eq!(DistanceMetric::parse_str("hamming"), None);
+        assert_eq!(DistanceMetric::from_snapshot_byte(255), None);
+    }
+
+    /// IP/L1 的图检索 top-k 与暴力排序一致（HotBuffer 热路径同一 `distance` 分派）。
+    /// EN: Graph top-k under IP/L1 equals brute-force ranking through the same
+    /// HotBuffer `distance` dispatch.
+    #[tokio::test]
+    async fn hotbuffer_ip_and_l1_topk_match_brute_force() {
+        for metric in [DistanceMetric::InnerProduct, DistanceMetric::L1] {
+            let dims = 8usize;
+            let index = HotBufferIndex::new_with_metric(dims, metric);
+            // 固定 HNSW 参数：`new_with_metric` 从环境变量推导 m/ef，默认值
+            // 随 `HOUYI_VECTOR_*` 变化，低 ef_search 会让 beam 漏候选，
+            // 「top-k 与暴力一致」变成偶发失败（OCR #18）。
+            // EN: Pin HNSW params: `new_with_metric` derives m/ef from env vars,
+            // so defaults shift with `HOUYI_VECTOR_*`; a low ef_search makes the
+            // beam miss candidates and turns the exact top-k assertion flaky
+            // (OCR #18).
+            index.set_hnsw_m(16).unwrap();
+            index.set_hnsw_ef_construction(200).unwrap();
+            index.set_hnsw_ef_search(128).unwrap();
+            let mut rows = Vec::new();
+            for id in 0..64u64 {
+                let v: Vec<f32> = (0..dims)
+                    .map(|i| ((id as usize * 7 + i * 13) % 23) as f32 * 0.05 - 0.5)
+                    .collect();
+                rows.push((id, v));
+            }
+            index.insert_batch(rows.clone()).await.unwrap();
+            drain_builder_queue(&index).await;
+            let query: Vec<f32> = (0..dims).map(|i| (i % 5) as f32 * 0.1).collect();
+            let got = index
+                .search_scored_with_ef_override(&query, 5, None, None)
+                .await;
+            let mut scored: Vec<(u64, f32)> = rows
+                .iter()
+                .map(|(id, v)| {
+                    let d = match metric {
+                        DistanceMetric::InnerProduct => distance::inner_product_distance(&query, v),
+                        DistanceMetric::L1 => distance::l1_distance(&query, v),
+                        _ => unreachable!(),
+                    };
+                    (*id, d)
+                })
+                .collect();
+            scored.sort_by(|a, b| a.1.total_cmp(&b.1).then(a.0.cmp(&b.0)));
+            let want: Vec<u64> = scored.iter().take(5).map(|(id, _)| *id).collect();
+            let got_ids: Vec<u64> = got.iter().take(5).map(|(id, _)| *id).collect();
+            assert_eq!(got_ids, want, "metric={metric:?}");
         }
     }
 
@@ -2918,7 +3120,17 @@ mod tests {
             task.await.unwrap();
         }
 
-        sleep(Duration::from_millis(2500)).await;
+        // 自适应等待队列排空：Linux CI 高并发下固定 2.5s 偶发不足（OOM/抢占），
+        // 会让「并发构建一致性」用例误报；超时后仍由下面的断言暴露真实停滞。
+        // EN: adaptively wait for the queue to drain — a fixed 2.5s window is
+        // flaky on loaded Linux CI. A real stall still fails the assertion below.
+        let deadline = std::time::Instant::now() + Duration::from_secs(15);
+        while index.pending_build_count().await != 0 {
+            if std::time::Instant::now() >= deadline {
+                break;
+            }
+            sleep(Duration::from_millis(25)).await;
+        }
         worker.shutdown().await;
 
         assert_eq!(index.pending_build_count().await, 0);

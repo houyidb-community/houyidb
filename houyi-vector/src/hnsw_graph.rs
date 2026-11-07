@@ -2,7 +2,7 @@
 //! 中文：标准分层可导航小世界图；与 `HotBufferIndex` 的向量存储解耦，本模块持有构图副本以便检索。
 //! EN: Standalone graph + vector map; duplicates vectors from main index for O(1) distance during search.
 
-use crate::distance::cosine_distance_prenormalized;
+use crate::distance::{self, cosine_distance_prenormalized};
 use crate::{l2_distance, DistanceMetric, VectorId};
 use ahash::{AHashMap, AHashSet};
 use rand::rngs::StdRng;
@@ -235,6 +235,11 @@ fn metric_pair(metric: DistanceMetric, a: &[f32], b: &[f32]) -> f32 {
         // Cosine 路径约定输入已单位化；委托 `distance::cosine_distance_prenormalized`（分块点积）。
         // EN: Normalized inputs; delegate to `distance` for chunked dot (hot path).
         DistanceMetric::Cosine => cosine_distance_prenormalized(a, b),
+        // IP 取负点积、L1 取曼哈顿原值：图排序只依赖全序，不依赖具体量纲。
+        // EN: IP negates the dot and L1 uses the raw Manhattan sum; the graph
+        // only relies on the ordering, not on the scale.
+        DistanceMetric::InnerProduct => distance::inner_product_distance(a, b),
+        DistanceMetric::L1 => distance::l1_distance(a, b),
     }
 }
 

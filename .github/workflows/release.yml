@@ -76,7 +76,12 @@ jobs:
   docker:
     name: Container images
     runs-on: ubuntu-24.04
-    timeout-minutes: 60
+    # 双架构构建的 arm64 走 QEMU：冷缓存时 beta.7 实测超过 60 分钟被取消，
+    # 而 beta.6 热缓存约 44 分钟。留足余量，避免发版镜像偶发超时缺失。
+    # EN: arm64 builds under QEMU; the beta.7 release exceeded the old 60-minute
+    # limit on a cold cache (beta.6 took ~44 min warm). Keep headroom so a
+    # release never ships without its container image.
+    timeout-minutes: 120
     permissions:
       contents: read
       packages: write # GHCR 推送

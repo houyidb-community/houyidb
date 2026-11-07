@@ -1,3 +1,23 @@
+/// 测试用集群控制句柄（只读打开，不落盘）。 EN: Test-only cluster handle.
+fn test_cluster() -> std::sync::Arc<houyi_server::cluster::ClusterControl> {
+    // 每次调用独占目录（时间戳可能同纳秒重复，加原子序号）。
+    // EN: per-call directory (timestamps can collide; add an atomic counter).
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let dir = std::env::temp_dir().join(format!(
+        "houyi-bin-test-cluster-{}-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos(),
+        SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
+    std::sync::Arc::new(
+        houyi_server::cluster::ClusterControl::open(&dir.join("test.wal"), false)
+            .expect("cluster control"),
+    )
+}
+
 use super::{run_pgwire_listener, run_pgwire_listener_with_metrics};
 use houyi_core::{HouyiPage, ScalarPredicate, ScalarValue};
 use houyi_query::pgwire::BindParamValue;
@@ -683,8 +703,12 @@ async fn pgwire_vector_search_returns_id_rows() {
         wal: None,
         collections_wal: None,
         role: houyi_server::types::RoleState::default(),
+        cluster: test_cluster(),
+        query_log: None,
     });
-    let addr = run_pgwire_listener("127.0.0.1:0", Some(pg)).await.unwrap();
+    let addr = run_pgwire_listener("127.0.0.1:0", Some(pg.clone()))
+        .await
+        .unwrap();
     let mut stream = TcpStream::connect(addr).await.unwrap();
 
     let mut payload = Vec::new();
@@ -765,8 +789,12 @@ async fn pgwire_extended_bind_one_param_for_vector_search() {
         wal: None,
         collections_wal: None,
         role: houyi_server::types::RoleState::default(),
+        cluster: test_cluster(),
+        query_log: None,
     });
-    let addr = run_pgwire_listener("127.0.0.1:0", Some(pg)).await.unwrap();
+    let addr = run_pgwire_listener("127.0.0.1:0", Some(pg.clone()))
+        .await
+        .unwrap();
     let mut stream = TcpStream::connect(addr).await.unwrap();
 
     let mut payload = Vec::new();
@@ -880,8 +908,12 @@ async fn pgwire_extended_bind_one_binary_int4_param_for_vector_search() {
         wal: None,
         collections_wal: None,
         role: houyi_server::types::RoleState::default(),
+        cluster: test_cluster(),
+        query_log: None,
     });
-    let addr = run_pgwire_listener("127.0.0.1:0", Some(pg)).await.unwrap();
+    let addr = run_pgwire_listener("127.0.0.1:0", Some(pg.clone()))
+        .await
+        .unwrap();
     let mut stream = TcpStream::connect(addr).await.unwrap();
 
     let mut payload = Vec::new();
@@ -998,8 +1030,12 @@ async fn pgwire_extended_bind_binary_float4_array_for_vector_directive() {
         wal: None,
         collections_wal: None,
         role: houyi_server::types::RoleState::default(),
+        cluster: test_cluster(),
+        query_log: None,
     });
-    let addr = run_pgwire_listener("127.0.0.1:0", Some(pg)).await.unwrap();
+    let addr = run_pgwire_listener("127.0.0.1:0", Some(pg.clone()))
+        .await
+        .unwrap();
     let mut stream = TcpStream::connect(addr).await.unwrap();
 
     let mut payload = Vec::new();
@@ -1117,8 +1153,12 @@ async fn pgwire_extended_bind_binary_bytea_for_vector_directive() {
         wal: None,
         collections_wal: None,
         role: houyi_server::types::RoleState::default(),
+        cluster: test_cluster(),
+        query_log: None,
     });
-    let addr = run_pgwire_listener("127.0.0.1:0", Some(pg)).await.unwrap();
+    let addr = run_pgwire_listener("127.0.0.1:0", Some(pg.clone()))
+        .await
+        .unwrap();
     let mut stream = startup_pgwire_test_conn(addr).await;
 
     let parse_sql =
@@ -1191,8 +1231,12 @@ async fn pgwire_extended_bind_two_params_for_vector_search() {
         wal: None,
         collections_wal: None,
         role: houyi_server::types::RoleState::default(),
+        cluster: test_cluster(),
+        query_log: None,
     });
-    let addr = run_pgwire_listener("127.0.0.1:0", Some(pg)).await.unwrap();
+    let addr = run_pgwire_listener("127.0.0.1:0", Some(pg.clone()))
+        .await
+        .unwrap();
     let mut stream = TcpStream::connect(addr).await.unwrap();
 
     let mut payload = Vec::new();
@@ -1300,8 +1344,12 @@ async fn pgwire_execute_with_max_rows_emits_portal_suspended() {
         wal: None,
         collections_wal: None,
         role: houyi_server::types::RoleState::default(),
+        cluster: test_cluster(),
+        query_log: None,
     });
-    let addr = run_pgwire_listener("127.0.0.1:0", Some(pg)).await.unwrap();
+    let addr = run_pgwire_listener("127.0.0.1:0", Some(pg.clone()))
+        .await
+        .unwrap();
     let mut stream = TcpStream::connect(addr).await.unwrap();
 
     let mut payload = Vec::new();
@@ -1430,8 +1478,12 @@ async fn pgwire_sync_clears_pending_portal_state() {
         wal: None,
         collections_wal: None,
         role: houyi_server::types::RoleState::default(),
+        cluster: test_cluster(),
+        query_log: None,
     });
-    let addr = run_pgwire_listener("127.0.0.1:0", Some(pg)).await.unwrap();
+    let addr = run_pgwire_listener("127.0.0.1:0", Some(pg.clone()))
+        .await
+        .unwrap();
     let mut stream = TcpStream::connect(addr).await.unwrap();
 
     let mut payload = Vec::new();
@@ -1567,8 +1619,12 @@ async fn pgwire_describe_portal_works_before_and_after_portal_suspended() {
         wal: None,
         collections_wal: None,
         role: houyi_server::types::RoleState::default(),
+        cluster: test_cluster(),
+        query_log: None,
     });
-    let addr = run_pgwire_listener("127.0.0.1:0", Some(pg)).await.unwrap();
+    let addr = run_pgwire_listener("127.0.0.1:0", Some(pg.clone()))
+        .await
+        .unwrap();
     let mut stream = TcpStream::connect(addr).await.unwrap();
 
     let mut payload = Vec::new();
@@ -1721,7 +1777,12 @@ async fn wal_checkpoint_http_truncates_to_applied_sidecar() {
                 houyi_server::recovery::GraphSnapshotMetrics::default(),
             ),
             role: houyi_server::types::RoleState::default(),
+            cluster: test_cluster(),
+            query_log: None,
             replication_metrics: houyi_server::types::shared_replication_metrics(None),
+            lifecycle: std::sync::Arc::new(
+                houyi_server::collection_lifecycle::CollectionLifecycleState::for_test(),
+            ),
         });
 
     let req = Request::builder()
@@ -2079,6 +2140,8 @@ async fn pgwire_bind_multiple_result_formats_returns_feature_not_supported() {
             wal: None,
             collections_wal: None,
             role: houyi_server::types::RoleState::default(),
+            cluster: test_cluster(),
+            query_log: None,
         })),
     )
     .await
@@ -2162,8 +2225,12 @@ async fn pgwire_execute_binary_result_format_returns_int8_payload() {
         wal: None,
         collections_wal: None,
         role: houyi_server::types::RoleState::default(),
+        cluster: test_cluster(),
+        query_log: None,
     });
-    let addr = run_pgwire_listener("127.0.0.1:0", Some(pg)).await.unwrap();
+    let addr = run_pgwire_listener("127.0.0.1:0", Some(pg.clone()))
+        .await
+        .unwrap();
     let mut stream = TcpStream::connect(addr).await.unwrap();
 
     let mut payload = Vec::new();
@@ -2610,8 +2677,12 @@ async fn tokio_postgres_prepare_query_bytea_vector_param_smoke() {
         wal: None,
         collections_wal: None,
         role: houyi_server::types::RoleState::default(),
+        cluster: test_cluster(),
+        query_log: None,
     });
-    let addr = run_pgwire_listener("127.0.0.1:0", Some(pg)).await.unwrap();
+    let addr = run_pgwire_listener("127.0.0.1:0", Some(pg.clone()))
+        .await
+        .unwrap();
     let client = connect_tokio_postgres_client(addr).await;
 
     let stmt = client
@@ -2637,8 +2708,12 @@ async fn tokio_postgres_prepare_query_bytea_upsert_batch_smoke() {
         wal: None,
         collections_wal: None,
         role: houyi_server::types::RoleState::default(),
+        cluster: test_cluster(),
+        query_log: None,
     });
-    let addr = run_pgwire_listener("127.0.0.1:0", Some(pg)).await.unwrap();
+    let addr = run_pgwire_listener("127.0.0.1:0", Some(pg.clone()))
+        .await
+        .unwrap();
     let client = connect_tokio_postgres_client(addr).await;
 
     let upsert_stmt = client
@@ -2690,8 +2765,12 @@ async fn pgwire_upsert_batch_follower_rejects_with_25006() {
         wal: None,
         collections_wal: None,
         role: houyi_server::types::RoleState::new(houyi_server::types::ReplicationRole::Follower),
+        cluster: test_cluster(),
+        query_log: None,
     });
-    let addr = run_pgwire_listener("127.0.0.1:0", Some(pg)).await.unwrap();
+    let addr = run_pgwire_listener("127.0.0.1:0", Some(pg.clone()))
+        .await
+        .unwrap();
     let client = connect_tokio_postgres_client(addr).await;
 
     let upsert_stmt = client
@@ -2746,8 +2825,12 @@ async fn pgwire_upsert_batch_collection_follower_rejects_with_25006() {
         wal: None,
         collections_wal: None,
         role: houyi_server::types::RoleState::new(houyi_server::types::ReplicationRole::Follower),
+        cluster: test_cluster(),
+        query_log: None,
     });
-    let addr = run_pgwire_listener("127.0.0.1:0", Some(pg)).await.unwrap();
+    let addr = run_pgwire_listener("127.0.0.1:0", Some(pg.clone()))
+        .await
+        .unwrap();
     let client = connect_tokio_postgres_client(addr).await;
 
     let upsert_stmt = client
@@ -2813,6 +2896,8 @@ async fn pgwire_upsert_batch_execute_increments_metrics() {
         wal: None,
         collections_wal: None,
         role: houyi_server::types::RoleState::default(),
+        cluster: test_cluster(),
+        query_log: None,
     });
     let addr = run_pgwire_listener_with_metrics("127.0.0.1:0", Some(pg), Arc::clone(&metrics))
         .await
@@ -2932,8 +3017,12 @@ async fn pgwire_upsert_batch_persists_to_wals() {
         wal: Some(Arc::new(wal)),
         collections_wal: Some(Arc::new(collections_wal)),
         role: houyi_server::types::RoleState::default(),
+        cluster: test_cluster(),
+        query_log: None,
     });
-    let addr = run_pgwire_listener("127.0.0.1:0", Some(pg)).await.unwrap();
+    let addr = run_pgwire_listener("127.0.0.1:0", Some(pg.clone()))
+        .await
+        .unwrap();
     let client = connect_tokio_postgres_client(addr).await;
 
     // 无指令批次 → 主 WAL。
@@ -2990,12 +3079,37 @@ async fn pgwire_upsert_batch_persists_to_wals() {
         houyi_persistence::collection_wal::decode_collection_wal_payload(&coll_entries[1].payload)
             .unwrap();
     use houyi_persistence::collection_wal::CollectionWalRecord;
+    // 隐式创建也记录**生效**的度量与 HNSW 参数：重放时按记录精确重建，而不是
+    // 由 index_type 推断（否则未来默认度量变化会让历史集合静默漂移）。
+    // EN: Implicit creation also logs the **effective** metric and HNSW params so
+    // replay reconstructs exactly what was serving, rather than inferring from
+    // index_type (a future default change would silently drift old collections).
+    //
+    // 期望值取创建后集合的实际参数，而不是写死 16/400/256：这些值由
+    // `VectorConfig/HnswConfig::from_env()` 推导，`HOUYI_VECTOR_AUTO_HNSW`,
+    // `HOUYI_VECTOR_RECALL_OPTIMIZED` 等环境变量会改变默认，写死会让测试因
+    // 无关配置偶发失败（OCR #41）。
+    // EN: Expect the created collection's effective params instead of literals
+    // 16/400/256: those derive from `VectorConfig/HnswConfig::from_env()`, so
+    // `HOUYI_VECTOR_AUTO_HNSW`, `HOUYI_VECTOR_RECALL_OPTIMIZED` etc. shift the
+    // defaults and literals fail for unrelated config reasons (OCR #41).
+    let col = pg
+        .collections
+        .get("pgw")
+        .expect("implicit create must register pgw");
+    let params = col.hnsw_params();
     assert_eq!(
         first,
         Some(CollectionWalRecord::Create {
             name: "pgw".to_string(),
             dims: 4,
             index_type: "hnsw".to_string(),
+            options: houyi_persistence::collection_wal::CollectionCreateOptions {
+                metric: Some(col.metric().as_str().to_string()),
+                hnsw_m: Some(params.m),
+                hnsw_ef_construction: Some(params.ef_construction),
+                hnsw_ef_search: Some(params.ef_search),
+            },
         })
     );
     match second {
@@ -3393,7 +3507,12 @@ async fn benchmark_pgwire_status_reports_simple_query_traffic() {
                 houyi_server::recovery::GraphSnapshotMetrics::default(),
             ),
             role: houyi_server::types::RoleState::default(),
+            cluster: test_cluster(),
+            query_log: None,
             replication_metrics: houyi_server::types::shared_replication_metrics(None),
+            lifecycle: std::sync::Arc::new(
+                houyi_server::collection_lifecycle::CollectionLifecycleState::for_test(),
+            ),
         });
     let req = Request::builder()
         .method("GET")
@@ -3590,7 +3709,11 @@ struct TempFileCleanup(Vec<std::path::PathBuf>);
 impl Drop for TempFileCleanup {
     fn drop(&mut self) {
         for path in &self.0 {
-            let _ = std::fs::remove_file(path);
+            if path.is_dir() {
+                let _ = std::fs::remove_dir_all(path);
+            } else {
+                let _ = std::fs::remove_file(path);
+            }
         }
     }
 }
@@ -3623,12 +3746,19 @@ fn collection_test_state_full(
         .unwrap()
         .as_nanos();
     let seq = SEQ.fetch_add(1, Ordering::Relaxed);
-    let wal_path = std::env::temp_dir().join(format!(
-        "houyidb-coll-test-{}-{}-{}.wal",
+    // 每个测试独立目录：snapshots/ 由 WAL 所在父目录派生，共用 /tmp 会让
+    // 并行测试互相看到对方的 manifest（P5.0.3 status 测试暴露的隔离缺陷）。
+    // EN: One directory per test: snapshots/ derives from the WAL parent, so a
+    // shared /tmp lets parallel tests see each other's manifests (isolation bug
+    // exposed by the P5.0.3 status test).
+    let dir = std::env::temp_dir().join(format!(
+        "houyidb-coll-test-{}-{}-{}",
         std::process::id(),
         nanos,
         seq
     ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let wal_path = dir.join("bench.wal");
     let sidecar = wal_path.with_extension("applied");
     let wal = Arc::new(WalHandle::open(&wal_path, WalWriteMode::Async).unwrap().0);
     let collections_wal_path =
@@ -3660,12 +3790,14 @@ fn collection_test_state_full(
         http_inflight: Arc::new(InflightWatermark::new(DEFAULT_MAX_HTTP_INFLIGHT as u64)),
         graph_snapshot_metrics: Arc::new(houyi_server::recovery::GraphSnapshotMetrics::default()),
         role: houyi_server::types::RoleState::default(),
+        cluster: test_cluster(),
+        query_log: None,
         replication_metrics: houyi_server::types::shared_replication_metrics(None),
+        lifecycle: std::sync::Arc::new(
+            houyi_server::collection_lifecycle::CollectionLifecycleState::for_test(),
+        ),
     };
-    (
-        state,
-        TempFileCleanup(vec![wal_path, sidecar, collections_wal_path]),
-    )
+    (state, TempFileCleanup(vec![dir]))
 }
 
 fn json_payload(v: serde_json::Value) -> serde_json::Map<String, serde_json::Value> {
@@ -3726,11 +3858,16 @@ async fn collection_hybrid(
             })
             .collect(),
     };
-    handle_collection_hybrid_search(State(state.clone()), Path(name.to_string()), Json(req))
-        .await
-        .expect("hybrid search should succeed")
-        .0
-        .ids
+    handle_collection_hybrid_search(
+        State(state.clone()),
+        Path(name.to_string()),
+        None,
+        Json(req),
+    )
+    .await
+    .expect("hybrid search should succeed")
+    .0
+    .ids
 }
 
 /// 与 [`collection_hybrid`] 相同，但保留 Result 以便断言 400/404。
@@ -3758,9 +3895,14 @@ async fn collection_hybrid_result(
             })
             .collect(),
     };
-    handle_collection_hybrid_search(State(state.clone()), Path(name.to_string()), Json(req))
-        .await
-        .map(|Json(resp)| resp)
+    handle_collection_hybrid_search(
+        State(state.clone()),
+        Path(name.to_string()),
+        None,
+        Json(req),
+    )
+    .await
+    .map(|Json(resp)| resp)
 }
 
 // ── collection 删除 / include_payload ───────────────────
@@ -3813,10 +3955,15 @@ async fn collection_search_with_payload(
         filter_label: None,
         include_payload,
     };
-    handle_collection_search(State(state.clone()), Path(name.to_string()), Json(req))
-        .await
-        .expect("collection search should succeed")
-        .0
+    handle_collection_search(
+        State(state.clone()),
+        Path(name.to_string()),
+        None,
+        Json(req),
+    )
+    .await
+    .expect("collection search should succeed")
+    .0
 }
 
 fn three_docs() -> Vec<houyi_server::types::UpsertVector> {
@@ -3988,7 +4135,12 @@ async fn collections_restart_recovers_vectors_payloads_and_deletes() {
         http_inflight: Arc::new(InflightWatermark::new(DEFAULT_MAX_HTTP_INFLIGHT as u64)),
         graph_snapshot_metrics: Arc::new(houyi_server::recovery::GraphSnapshotMetrics::default()),
         role: houyi_server::types::RoleState::default(),
+        cluster: test_cluster(),
+        query_log: None,
         replication_metrics: houyi_server::types::shared_replication_metrics(None),
+        lifecycle: std::sync::Arc::new(
+            houyi_server::collection_lifecycle::CollectionLifecycleState::for_test(),
+        ),
     };
     let resp =
         collection_search_with_payload(&state2, "restart", vec![1.0, 0.0, 0.0, 0.0], 5, true).await;
@@ -4101,11 +4253,15 @@ async fn collection_hybrid_include_payload_and_delete_tombstone() {
             value: serde_json::json!(1),
         }],
     };
-    let resp =
-        handle_collection_hybrid_search(State(state.clone()), Path("c".to_string()), Json(req))
-            .await
-            .expect("hybrid search should succeed")
-            .0;
+    let resp = handle_collection_hybrid_search(
+        State(state.clone()),
+        Path("c".to_string()),
+        None,
+        Json(req),
+    )
+    .await
+    .expect("hybrid search should succeed")
+    .0;
     assert!(!resp.ids.contains(&1));
     let payloads = resp.payloads.expect("payloads present");
     assert!(!payloads.contains_key("1"), "deleted id must not read back");
@@ -4337,7 +4493,12 @@ async fn concurrent_upsert_delete_replay_converges_to_memory_state() {
         http_inflight: Arc::new(InflightWatermark::new(DEFAULT_MAX_HTTP_INFLIGHT as u64)),
         graph_snapshot_metrics: Arc::new(houyi_server::recovery::GraphSnapshotMetrics::default()),
         role: houyi_server::types::RoleState::default(),
+        cluster: test_cluster(),
+        query_log: None,
         replication_metrics: houyi_server::types::shared_replication_metrics(None),
+        lifecycle: std::sync::Arc::new(
+            houyi_server::collection_lifecycle::CollectionLifecycleState::for_test(),
+        ),
     };
     let replayed =
         collection_search_with_payload(&state2, "cc", vec![1.0, 0.0, 0.0, 0.0], 5, true).await;
@@ -5108,10 +5269,8 @@ async fn collection_hybrid_reupsert_same_id_dedupes_results() {
         "same vector id must appear at most once, got {ids:?}"
     );
 
-    // v1 已知限制（append-only，无墓碑）：red 的旧行仍在页内，改值后旧值依旧命中；
-    // 此断言钉住当前语义——行版本/墓碑机制落地时应翻转为 stale 为空。
-    // EN: Pins the documented v1 limitation — stale rows still match after a
-    // re-upsert. When row versions/tombstones land, flip this to assert empty.
+    // 压实前：append-only 旧行仍在页内，red 的旧值依旧命中。
+    // EN: Before compaction the append-only stale row still matches red.
     let stale = collection_hybrid(
         &state,
         "c7",
@@ -5123,8 +5282,94 @@ async fn collection_hybrid_reupsert_same_id_dedupes_results() {
     assert_eq!(
         stale,
         vec![1],
-        "v1 append-only: superseded value still matches (documented limitation)"
+        "pre-compaction: superseded value still matches (documented behavior)"
     );
+
+    // 压实后：只保留最后一行，旧值不再命中。
+    // EN: After compaction only the last row remains; the stale value no longer matches.
+    let col = state.collections.get("c7").expect("collection exists");
+    col.compact_scalars(true, 0.5)
+        .await
+        .expect("compaction must succeed");
+    let red_after = collection_hybrid(
+        &state,
+        "c7",
+        vec![1.0, 0.0, 0.0, 0.0],
+        10,
+        vec![("color", "eq", serde_json::json!("red"))],
+    )
+    .await;
+    assert!(
+        red_after.is_empty(),
+        "post-compaction: superseded value must not match, got {red_after:?}"
+    );
+    let blue_after = collection_hybrid(
+        &state,
+        "c7",
+        vec![1.0, 0.0, 0.0, 0.0],
+        10,
+        vec![("color", "eq", serde_json::json!("blue"))],
+    )
+    .await;
+    assert_eq!(blue_after, vec![1], "latest value must still match");
+}
+
+/// P5.0.1：status 暴露物理/可见/stale 行与 applied_lsn；管理端点压实后只剩最后一行。
+/// EN: P5.0.1 — status exposes physical/live/stale rows and applied_lsn; the
+/// admin compaction endpoint keeps only the last row per id.
+#[tokio::test]
+async fn collection_scalar_compaction_endpoint_and_status() {
+    use houyi_server::http_handler::{
+        handle_collection_compact, handle_collection_status, ScalarCompactRequest,
+    };
+    use houyi_server::types::UpsertVector;
+    let (state, _cleanup) = collection_test_state(4);
+    for color in ["red", "blue"] {
+        collection_upsert(
+            &state,
+            "compact1",
+            vec![UpsertVector {
+                id: 1,
+                values: vec![1.0, 0.0, 0.0, 0.0],
+                label: None,
+                payload: Some(json_payload(serde_json::json!({"color": color}))),
+            }],
+        )
+        .await;
+    }
+
+    let status = handle_collection_status(State(state.clone()), Path("compact1".to_string()))
+        .await
+        .unwrap()
+        .0;
+    assert_eq!(status["scalar_physical_rows"], 2);
+    assert_eq!(status["scalar_live_rows"], 1);
+    assert_eq!(status["scalar_stale_rows"], 1);
+    assert_eq!(status["scalar_tombstone_ids"], 0);
+    assert_eq!(
+        status["applied_lsn"], 2,
+        "create LSN 0 + two upsert LSNs 1/2 → applied 2"
+    );
+
+    let resp = handle_collection_compact(
+        State(state.clone()),
+        Path("compact1".to_string()),
+        Json(ScalarCompactRequest { force: true }),
+    )
+    .await
+    .unwrap()
+    .0;
+    assert_eq!(resp["dropped_rows"], 1);
+    assert_eq!(resp["physical_after"], 1);
+
+    let status = handle_collection_status(State(state), Path("compact1".to_string()))
+        .await
+        .unwrap()
+        .0;
+    assert_eq!(status["scalar_physical_rows"], 1);
+    assert_eq!(status["scalar_live_rows"], 1);
+    assert_eq!(status["scalar_stale_rows"], 0);
+    assert!(status["last_compaction_unix"].as_u64().unwrap() > 0);
 }
 
 #[tokio::test]
@@ -5626,10 +5871,15 @@ async fn collection_search(
         filter_label: None,
         include_payload: false,
     };
-    handle_collection_search(State(state.clone()), Path(name.to_string()), Json(req))
-        .await
-        .expect("collection search should succeed")
-        .0
+    handle_collection_search(
+        State(state.clone()),
+        Path(name.to_string()),
+        None,
+        Json(req),
+    )
+    .await
+    .expect("collection search should succeed")
+    .0
 }
 
 /// 直调 benchmark `/v1/vectors/search` handler。
@@ -5639,7 +5889,7 @@ async fn benchmark_search_call(
     req: houyi_server::types::SearchRequest,
 ) -> houyi_server::types::SearchResponse {
     use houyi_server::http_handler::benchmark_search;
-    benchmark_search(State(state.clone()), Json(req))
+    benchmark_search(State(state.clone()), None, Json(req))
         .await
         .expect("benchmark search should succeed")
         .0
@@ -6136,6 +6386,7 @@ async fn benchmark_search_rejects_non_finite_query() {
     for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
         let err = benchmark_search(
             State(state.clone()),
+            None,
             Json(SearchRequest {
                 vector: vec![1.0, bad, 0.0, 0.0],
                 k: 5,
@@ -6156,6 +6407,7 @@ async fn benchmark_search_rejects_non_finite_query() {
 
     let dim_err = benchmark_search(
         State(state.clone()),
+        None,
         Json(SearchRequest {
             vector: vec![1.0, 0.0, 0.0],
             k: 5,
@@ -6179,6 +6431,7 @@ async fn benchmark_search_rejects_non_finite_query() {
     ] {
         let err = benchmark_search(
             State(state.clone()),
+            None,
             Json(SearchRequest {
                 vector: bad_vector,
                 k: 0,
@@ -6196,6 +6449,7 @@ async fn benchmark_search_rejects_non_finite_query() {
     // EN: Control: a valid k=0 query stays 200-empty.
     let ok_zero = benchmark_search(
         State(state.clone()),
+        None,
         Json(SearchRequest {
             vector: vec![1.0, 0.0, 0.0, 0.0],
             k: 0,
@@ -6213,6 +6467,7 @@ async fn benchmark_search_rejects_non_finite_query() {
     // EN: A valid query still works.
     let ok = benchmark_search(
         State(state.clone()),
+        None,
         Json(SearchRequest {
             vector: vec![1.0, 0.0, 0.0, 0.0],
             k: 1,
@@ -6264,6 +6519,7 @@ async fn benchmark_search_drops_poisoned_hit_before_truncate_and_backfills() {
     // The id filter triggers 4k over-fetch (20); k=5 exceeds the finite-row count.
     let resp = benchmark_search(
         State(state.clone()),
+        None,
         Json(SearchRequest {
             vector: vec![1.0, 0.0, 0.0, 0.0],
             k: 5,
@@ -6311,6 +6567,7 @@ async fn collection_search_rejects_non_finite_query() {
         let err = handle_collection_search(
             State(state.clone()),
             Path("c-q".to_string()),
+            None,
             Json(SearchRequest {
                 vector: vec![1.0, bad, 0.0, 0.0],
                 k: 5,
@@ -6502,6 +6759,7 @@ async fn benchmark_search_unfiltered_drops_poisoned_hit() {
     }
     let resp = benchmark_search(
         State(state.clone()),
+        None,
         Json(SearchRequest {
             vector: vec![1.0, 0.0, 0.0, 0.0],
             k: 5,
@@ -6564,6 +6822,7 @@ async fn collection_hnsw_upsert_becomes_searchable_via_builder_worker() {
         handle_collection_search(
             State(state),
             Path("c-w".to_string()),
+            None,
             Json(SearchRequest {
                 vector: vec![1.0, 0.0, 0.0, 0.0],
                 k: 1,
@@ -6834,6 +7093,16 @@ fn openapi_spec_is_valid_json_and_covers_core_routes() {
         "/v1/collections/{name}/status",
         "/v1/index/status",
         "/v1/embeddings",
+        // Sentinel 控制面（EE M1）。 EN: Sentinel control plane (EE M1).
+        "/v1/version",
+        "/v1/admin/lease",
+        "/v1/admin/promote",
+        "/v1/admin/demote",
+        "/v1/admin/replication/status",
+        "/v1/admin/whoami",
+        "/v1/admin/diagnostics",
+        "/v1/admin/query-log",
+        "/v1/admin/query-stats",
     ] {
         assert!(
             spec["paths"].get(path).is_some(),
@@ -7188,7 +7457,12 @@ async fn memory_watermark_guards_http_upsert_path() {
                 houyi_server::recovery::GraphSnapshotMetrics::default(),
             ),
             role: houyi_server::types::RoleState::default(),
+            cluster: test_cluster(),
+            query_log: None,
             replication_metrics: houyi_server::types::shared_replication_metrics(None),
+            lifecycle: std::sync::Arc::new(
+                houyi_server::collection_lifecycle::CollectionLifecycleState::for_test(),
+            ),
         });
 
     let body = serde_json::json!({
@@ -7262,6 +7536,8 @@ max_memory_bytes = 1073741824
 slow_query_ms = 250
 snapshot_interval_secs = 120
 snapshot_wal_threshold_bytes = 1048576
+collections_scalar_compact_interval_secs = 42
+collections_scalar_compact_stale_ratio = 0.25
 tls_cert_path = "/etc/houyi/cert.pem"
 tls_key_path = "/etc/houyi/key.pem"
 auth_token = "file-token"
@@ -7284,6 +7560,8 @@ index_type = "hii-l0"
     assert_eq!(cfg.slow_query_ms, 250);
     assert_eq!(cfg.snapshot_interval_secs, 120);
     assert_eq!(cfg.snapshot_wal_threshold_bytes, 1048576);
+    assert_eq!(cfg.collections_scalar_compact_interval_secs, 42);
+    assert_eq!(cfg.collections_scalar_compact_stale_ratio, 0.25);
     assert_eq!(cfg.tls_cert_path.as_deref(), Some("/etc/houyi/cert.pem"));
     assert_eq!(cfg.tls_key_path.as_deref(), Some("/etc/houyi/key.pem"));
     assert_eq!(cfg.auth_token.as_deref(), Some("file-token"));
@@ -7307,6 +7585,8 @@ fn snapshot_trigger_defaults_are_on() {
     let cfg = super::ServerConfig::default();
     assert_eq!(cfg.snapshot_interval_secs, 600);
     assert_eq!(cfg.snapshot_wal_threshold_bytes, 268_435_456);
+    assert_eq!(cfg.collections_scalar_compact_interval_secs, 600);
+    assert_eq!(cfg.collections_scalar_compact_stale_ratio, 0.5);
 }
 
 // ── 复制配置（P4.4.1）────────────────────────────────────
@@ -8450,4 +8730,78 @@ async fn tlp_empty_in_literal_yields_empty_result() {
     )
     .await;
     assert!(ids.is_empty(), "empty `in` must match nothing, got {ids:?}");
+}
+
+/// P5.0.3：管理员 compact 端点提交 manifest、设置租约，并返回保留结果。
+/// EN: P5.0.3 — the admin compact endpoint commits a manifest, sets the lease,
+/// and returns the retention result.
+#[tokio::test]
+async fn collections_compact_endpoint_commits_manifest_and_sets_lease() {
+    use houyi_server::http_handler::{benchmark_wal_status, handle_admin_collections_compact};
+    use houyi_server::types::{CollectionsCompactRequest, UpsertVector};
+
+    let (state, _cleanup) = collection_test_state(4);
+    collection_upsert(
+        &state,
+        "docs",
+        vec![UpsertVector {
+            id: 1,
+            values: vec![1.0, 0.0, 0.0, 0.0],
+            label: Some("a".to_string()),
+            payload: None,
+        }],
+    )
+    .await;
+
+    // 先确认 status 的 collections 视图存在且未提交 manifest。
+    // EN: First confirm the status collections view exists and has no manifest.
+    let before = benchmark_wal_status(State(state.clone())).await.unwrap().0;
+    assert!(!before.collections.manifest_present);
+    assert_eq!(before.collections.archived_segments, 0);
+
+    let Json(resp) = handle_admin_collections_compact(
+        State(state.clone()),
+        Json(CollectionsCompactRequest {
+            rotate: false,
+            hold_retention_secs: Some(120),
+        }),
+    )
+    .await
+    .unwrap();
+    assert!(resp.manifest_committed);
+    assert!(resp.manifest_seq.is_some());
+    assert!(resp.retention.lease_until_unix > 0);
+    // 测试态 max_segments=0：保留明确报告为 disabled。
+    // EN: Test state uses max_segments=0, so retention reports disabled.
+    assert_eq!(
+        resp.retention.blocked_reason.as_deref(),
+        Some("retention_disabled")
+    );
+
+    let after = benchmark_wal_status(State(state)).await.unwrap().0;
+    assert!(after.collections.manifest_present);
+    assert_eq!(after.collections.manifest_seq, resp.manifest_seq);
+    assert_eq!(
+        after.collections.safe_checkpoint_lsn,
+        resp.safe_checkpoint_lsn
+    );
+    assert!(after.collections.retention_lease_until_unix > 0);
+}
+
+/// P5.0.3：follower 的管理员 compact 必须 503（本地周期任务另行执行）。
+/// EN: P5.0.3 — the admin compact endpoint returns 503 on followers (the local
+/// periodic task runs separately).
+#[tokio::test]
+async fn collections_compact_endpoint_rejects_followers() {
+    use houyi_server::http_handler::handle_admin_collections_compact;
+    use houyi_server::types::{CollectionsCompactRequest, ReplicationRole};
+
+    let (mut state, _cleanup) = collection_test_state(4);
+    state.role = houyi_server::types::RoleState::new(ReplicationRole::Follower);
+    let err =
+        handle_admin_collections_compact(State(state), Json(CollectionsCompactRequest::default()))
+            .await
+            .unwrap_err();
+    assert_eq!(err.0, StatusCode::SERVICE_UNAVAILABLE);
+    assert!(err.1.contains("read_only"));
 }

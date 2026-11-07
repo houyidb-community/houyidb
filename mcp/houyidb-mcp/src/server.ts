@@ -49,6 +49,9 @@ export function createHouyidbServer(
   const client = new HouyiClient({
     baseUrl: config.baseUrl,
     ...(config.authToken === undefined ? {} : { authToken: config.authToken }),
+    ...(config.adminToken === undefined
+      ? {}
+      : { adminToken: config.adminToken }),
     ...(options.fetchImpl === undefined
       ? {}
       : { fetchImpl: options.fetchImpl }),

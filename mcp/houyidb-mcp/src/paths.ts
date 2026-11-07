@@ -39,3 +39,20 @@ export function collectionPath(
 ): string {
   return `/v1/collections/${encodePathSegment(collection)}/${route}`;
 }
+
+/**
+ * 返回 `/v1/collections/{name}`（PUT 显式建集合）。
+ * EN: Returns `/v1/collections/{name}` (PUT explicit creation).
+ */
+export function collectionRootPath(collection: string): string {
+  return `/v1/collections/${encodePathSegment(collection)}`;
+}
+
+/**
+ * 返回管理端点 `/v1/admin/collections/{name}`（DELETE 删除整个 collection）。
+ * EN: Returns the admin endpoint `/v1/admin/collections/{name}` (DELETE drops
+ * the whole collection).
+ */
+export function adminCollectionPath(collection: string): string {
+  return `/v1/admin/collections/${encodePathSegment(collection)}`;
+}

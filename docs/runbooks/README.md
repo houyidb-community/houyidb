@@ -22,6 +22,7 @@
 |-------------|--------|------|
 | 复制日志分歧（diverged） / follower_ahead | Critical | [replication-divergence.md](replication-divergence.md) |
 | 复制滞后、慢 follower 被踢 | Warning | [replication-lag.md](replication-lag.md) |
+| follower 落后于保留范围（BEHIND_RETAINED） | Critical | [collections-retention-resync.md](collections-retention-resync.md) |
 | WAL 中毒（写入失败后拒绝写） | Critical | [wal-poison.md](wal-poison.md) |
 | 加密快照/WAL 缺密钥导致启动失败 | Critical | [encryption-key-missing.md](encryption-key-missing.md) |
 | 审计链校验失败 / 审计写错误 | Critical | [audit-chain-broken.md](audit-chain-broken.md) |

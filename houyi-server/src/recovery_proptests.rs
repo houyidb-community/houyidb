@@ -14,8 +14,13 @@
 //!   `lsn ≤ checkpoint` 的记录跳过后端向量写但标量行/墓碑全量重建。
 
 use crate::collection::CollectionManager;
-use crate::recovery::replay_collections_wal_into_manager;
+use crate::collection_lifecycle::{load_collection_snapshots, write_collection_snapshots};
+use crate::recovery::{
+    replay_collections_wal_into_manager, replay_collections_wal_into_manager_with_mode,
+    GraphSnapshotMetrics,
+};
 use crate::scalar_json::build_collection_scalar_row;
+use crate::types::{WalHandle, WalWriteMode};
 use houyi_core::ScalarValue;
 use houyi_persistence::collection_wal::{
     encode_collection_create, encode_collection_delete, encode_collection_set_ha_level,
@@ -28,6 +33,7 @@ use proptest_state_machine::{prop_state_machine, ReferenceStateMachine, StateMac
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::PathBuf;
 use std::sync::atomic::Ordering;
+use std::sync::Arc;
 
 /// 状态机维度：4 维足够触发编解码/重放全路径，又保持 HNSW 构图廉价。
 /// EN: State-machine dimensions: 4 exercises full codec/replay paths while
@@ -908,6 +914,100 @@ proptest! {
             &checkpoints,
         ))
         .expect("checkpoint replay");
+
+        assert_managers_equivalent(&manager_full, &manager_snap, &rt);
+    }
+
+    /// P5.0.2：collection 快照（HNSW 图 + 标量物理视图 + 墓碑 + HA）加尾段重放，
+    /// 必须与全量重放逐字段等价；与上面的 legacy 图快照属性互补。
+    /// EN: P5.0.2 — collection snapshots (HNSW graph + physical scalars +
+    /// tombstones + HA) plus tail replay must equal full replay field-by-field;
+    /// complements the legacy graph-snapshot property above.
+    #[test]
+    fn collection_snapshot_plus_tail_replay_equals_full_replay(
+        ops in prop::collection::vec(arb_coll_op(), 2..24),
+        cp_seed in any::<proptest::sample::Index>(),
+    ) {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("tokio runtime");
+        let dir = unique_temp_dir("houyidb-collection-snapshot-prop");
+        let _dir_guard = TempDirGuard(dir.clone());
+        let wal_path = dir.join("houyidb.collections.wal");
+
+        let mut records = vec![encode_collection_create("c", DIMS, "hnsw").expect("encode create")];
+        records.extend(ops.iter().map(encode_coll_op));
+        {
+            let (mut wal, _) = FileWal::open(&wal_path).expect("open wal");
+            for r in &records {
+                wal.append_no_flush(r.clone()).expect("append");
+            }
+            wal.sync_data().expect("sync");
+        }
+        let (_, entries) = FileWal::open(&wal_path).expect("reopen wal");
+        assert_eq!(entries.len(), records.len());
+
+        let cp_ops = 1 + cp_seed.index(ops.len() - 1);
+        let checkpoint_lsn = cp_ops as u64;
+
+        // 路径 A：全量重放。
+        // EN: Path A — full replay.
+        let manager_full = Arc::new(CollectionManager::new(DIMS, "hnsw"));
+        rt.block_on(replay_collections_wal_into_manager(
+            &entries,
+            &manager_full,
+            &HashMap::new(),
+        ))
+        .expect("full replay");
+
+        // 路径 B：前缀重放 → collection 快照 + manifest → 新 manager 恢复 → 尾段重放。
+        // EN: Path B — prefix replay -> collection snapshot + manifest -> fresh
+        // manager restore -> tail replay.
+        let manager_prefix = Arc::new(CollectionManager::new(DIMS, "hnsw"));
+        rt.block_on(replay_collections_wal_into_manager(
+            &entries[..=checkpoint_lsn as usize],
+            &manager_prefix,
+            &HashMap::new(),
+        ))
+        .expect("prefix replay");
+        let (wal, _) = WalHandle::open(&wal_path, WalWriteMode::Sync).expect("open wal handle");
+        let metrics = Arc::new(GraphSnapshotMetrics::default());
+        let outcome = rt.block_on(write_collection_snapshots(
+            &manager_prefix,
+            &Arc::new(wal),
+            &wal_path,
+            None,
+            &metrics,
+            // 属性测试模拟 leader/单机语义（同步 apply），允许空 manifest。
+            // EN: The proptest models leader/standalone semantics (synchronous
+            // apply), so empty manifests are allowed.
+            true,
+        ));
+        let manifest = outcome
+            .manifest
+            .expect("collection snapshots must commit for hnsw");
+        assert_eq!(manifest.collections[0].checkpoint_lsn, checkpoint_lsn);
+
+        let manager_snap = Arc::new(CollectionManager::new(DIMS, "hnsw"));
+        let loaded = rt
+            .block_on(load_collection_snapshots(
+                &manager_snap,
+                &wal_path,
+                0,
+                None,
+                &metrics,
+            ))
+            .expect("load collection snapshots")
+            .expect("manifest must load");
+        rt.block_on(replay_collections_wal_into_manager_with_mode(
+            &entries,
+            &manager_snap,
+            &loaded.checkpoints,
+            true,
+        ))
+        .expect("manifest checkpoint replay");
 
         assert_managers_equivalent(&manager_full, &manager_snap, &rt);
     }

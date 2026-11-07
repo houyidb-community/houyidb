@@ -2,8 +2,8 @@ apiVersion: v2
 name: houyidb
 description: HouyiDB vector database (single-writer stateful node; leader/follower via two releases)
 type: application
-version: 0.1.0
-appVersion: "0.2.0-beta.5"
+version: 0.1.2
+appVersion: "0.2.0-beta.8"
 keywords:
   - vectordb
   - hnsw
@@ -13,3 +13,12 @@ sources:
   - https://github.com/houyidb-community/houyidb
 maintainers:
   - name: HouyiDB Contributors
+annotations:
+  # Artifact Hub 显式声明扫描镜像；GHCR 包已设为 public。
+  # EN: Pin the scanned image explicitly for Artifact Hub; the GHCR package is public.
+  artifacthub.io/images: |
+    - name: houyidb
+      image: ghcr.io/houyidb-community/houyidb:v0.2.0-beta.8
+  artifacthub.io/changes: |
+    - kind: changed
+      description: "Track the v0.2.0-beta.8 app image (collection delete/create/metrics)."

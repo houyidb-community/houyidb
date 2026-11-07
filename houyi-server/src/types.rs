@@ -74,10 +74,28 @@ impl WalHandle {
         ship: Option<Arc<houyi_persistence::replication_leader::ShipHub>>,
         encryption: Option<Arc<houyi_persistence::encryption::Encryption>>,
     ) -> std::io::Result<(Self, Vec<houyi_persistence::WalEntry>)> {
+        Self::open_with_config(
+            path,
+            mode,
+            ship,
+            encryption,
+            houyi_persistence::wal_async::WalOpenConfig::default(),
+        )
+    }
+
+    /// `open_with_ship_and_encryption` + 分段配置（P5.0.2）。
+    /// EN: shipping/encryption plus segment config (P5.0.2).
+    pub fn open_with_config(
+        path: &std::path::Path,
+        mode: WalWriteMode,
+        ship: Option<Arc<houyi_persistence::replication_leader::ShipHub>>,
+        encryption: Option<Arc<houyi_persistence::encryption::Encryption>>,
+        config: houyi_persistence::wal_async::WalOpenConfig,
+    ) -> std::io::Result<(Self, Vec<houyi_persistence::WalEntry>)> {
         match mode {
             WalWriteMode::Async => {
                 let (h, entries) =
-                    WalAsyncHandle::open_with_ship_and_encryption(path, ship, encryption)?;
+                    WalAsyncHandle::open_with_config(path, ship, encryption, config)?;
                 Ok((WalHandle::Async(h), entries))
             }
             WalWriteMode::Sync => {
@@ -87,7 +105,8 @@ impl WalHandle {
                         "replication requires wal_write_mode=async",
                     ));
                 }
-                let (w, entries) = FileWal::open_with_encryption(path, encryption)?;
+                let (mut w, entries) = FileWal::open_with_encryption(path, encryption)?;
+                w.set_segment_bytes(config.segment_bytes);
                 Ok((WalHandle::Sync(Mutex::new(w)), entries))
             }
         }
@@ -150,6 +169,51 @@ impl WalHandle {
                 .lock()
                 .expect("wal mutex poisoned")
                 .archived_segment_count(),
+        }
+    }
+
+    /// 最早可读 LSN（P5.0.2）。
+    /// EN: Earliest readable LSN (P5.0.2).
+    pub fn first_available_lsn(&self) -> std::io::Result<u64> {
+        match self {
+            WalHandle::Async(h) => h.first_available_lsn(),
+            WalHandle::Sync(m) => Ok(m.lock().expect("wal mutex poisoned").first_available_lsn()),
+        }
+    }
+
+    /// 全量本地 WAL 条目（promote 尾部补齐，P5.0.4）。
+    /// EN: Every local WAL entry (promote tail replay, P5.0.4).
+    pub fn replay_entries(&self) -> std::io::Result<Vec<houyi_persistence::WalEntry>> {
+        match self {
+            WalHandle::Async(h) => h.replay_entries(),
+            WalHandle::Sync(m) => m.lock().expect("wal mutex poisoned").replay_all(),
+        }
+    }
+
+    /// 段统计（P5.0.2）。
+    /// EN: Segment statistics (P5.0.2).
+    pub fn segment_stats(&self) -> std::io::Result<houyi_persistence::SegmentStats> {
+        match self {
+            WalHandle::Async(h) => h.segment_stats(),
+            WalHandle::Sync(m) => Ok(m.lock().expect("wal mutex poisoned").segment_stats()),
+        }
+    }
+
+    /// 按整段保留（P5.0.2）。
+    /// EN: Whole-segment retention (P5.0.2).
+    pub fn retain_segments(
+        &self,
+        safe_floor: u64,
+        max_segments: usize,
+        max_deletes: usize,
+    ) -> std::io::Result<houyi_persistence::RetentionOutcome> {
+        match self {
+            WalHandle::Async(h) => h.retain_segments(safe_floor, max_segments, max_deletes),
+            WalHandle::Sync(m) => m.lock().expect("wal mutex poisoned").retain_segments(
+                safe_floor,
+                max_segments,
+                max_deletes,
+            ),
         }
     }
 
@@ -263,6 +327,11 @@ pub enum ReplicationMetricsView {
         /// all replication state through this one slot (and promote swaps it
         /// atomically with the role).
         sync_timeout: std::time::Duration,
+        /// sync 等待的 follower quorum（0 = 现行「任一 ACK」）。挂在视图上
+        /// 与 timeout 同理：promote 换视图时同步生效。
+        /// EN: follower quorum for sync waits (0 = legacy "any ACK"), carried
+        /// on the view so promote swaps it atomically with the role.
+        sync_quorum: usize,
     },
     Follower {
         metrics: Arc<houyi_persistence::replication_follower::FollowerMetrics>,
@@ -326,6 +395,15 @@ pub struct PromoteContext {
     pub collections_wal: Arc<WalHandle>,
     pub queue_batches: usize,
     pub sync_timeout: std::time::Duration,
+    /// sync 等待的 follower quorum（0 = 任一 ACK，M1 新增）。
+    /// EN: follower quorum for sync waits (0 = any ACK; added in M1).
+    pub sync_quorum: usize,
+    /// promote 后的 follower 重连宽限期与租约入口（P5.0.4）：新 leader 必须
+    /// 先留出窗口，旧 follower 才来得及握手。
+    /// EN: reconnect grace and lease handle after promote (P5.0.4); the new
+    /// leader must hold retention long enough for old followers to handshake.
+    pub lifecycle: Arc<crate::collection_lifecycle::CollectionLifecycleState>,
+    pub follower_grace_secs: u64,
     /// 复制认证共享秘密（P4.6.3；OCR 批次二十八 HIGH）：promote 重建
     /// LeaderSessionConfig 时必须沿用启动时的 token，否则新 leader 静默
     /// 变为无认证——任何 TCP 客户端都能拉走全量日志。
@@ -341,6 +419,19 @@ pub struct PromoteContext {
     /// EN: local WAL encryption handle for the promoted leader; the wire stays
     /// plaintext and each node encrypts at rest with its own keyring.
     pub encryption: Option<Arc<houyi_persistence::encryption::Encryption>>,
+    /// 运行时 demote→follower 转换所需的句柄（M3）：demote 后旧 leader
+    /// 直接以 follower 身份连回新主，无需重启。
+    /// EN: handles for runtime demote→follower conversion (M3) so a demoted
+    /// leader can rejoin as a follower without a restart.
+    pub collections: Arc<CollectionManager>,
+    /// 本节点稳定的复制 follower 身份；demote 转换沿用它参加握手。
+    /// EN: stable replication follower identity for this node; the demote
+    /// conversion reuses it in the handshake.
+    pub follower_id: [u8; 16],
+    /// 最近已提交 manifest 的 checkpoint；follower 握手用它协商补洞起点。
+    /// EN: checkpoint of the latest committed manifest; the follower handshake
+    /// uses it to negotiate where replay starts.
+    pub snapshot_checkpoint: Arc<dyn Fn() -> u64 + Send + Sync>,
 }
 
 /// `POST /v1/admin/promote` 响应。
@@ -351,6 +442,11 @@ pub struct PromoteResponse {
     /// promote 完成时 collections.wal 的下一条 LSN（复制进度校验用）。
     /// EN: collections.wal next LSN at promote time (replication progress check).
     pub next_lsn: u64,
+    /// promote 后的持久化 term（EE M1）。 EN: Persisted term after promote (EE M1).
+    pub term: u64,
+    /// 本次授予的租约；bodyless 手动 promote 为 null。
+    /// EN: lease granted by this promote; null for bodyless manual promotes.
+    pub lease: Option<crate::cluster::LeaseGrant>,
 }
 
 // ── 服务配置 ────────────────────────────────────────────────
@@ -416,6 +512,22 @@ pub struct ServerConfig {
     /// WAL-bytes-since-last-snapshot threshold triggering a graph snapshot.
     /// 0 = disabled.
     pub snapshot_wal_threshold_bytes: u64,
+    /// 标量页自动压实间隔秒数（P5.0.1）：0 = 关闭自动压实。
+    /// EN: Scalar-page auto-compaction interval in seconds; 0 disables it.
+    pub collections_scalar_compact_interval_secs: u64,
+    /// 触发自动压实的 stale 行占比（0..=1）。
+    /// EN: Stale-row ratio that triggers auto-compaction (0..=1).
+    pub collections_scalar_compact_stale_ratio: f64,
+    /// collections WAL 自动轮转阈值字节（P5.0.2；0 = 只手动轮转）。
+    /// EN: collections WAL auto-rotation threshold (P5.0.2; 0 = manual only).
+    pub collections_wal_segment_bytes: u64,
+    /// collections WAL 保留段数（P5.0.3；0 = 关闭删除）。
+    /// EN: collections WAL retained segment count (P5.0.3; 0 disables deletion).
+    pub collections_wal_max_segments: usize,
+    /// leader 断连 follower 进度保留秒数 / 启动与 promote 宽限（P5.0.4）。
+    /// EN: leader grace for disconnected follower progress and startup/promote
+    /// (P5.0.4).
+    pub collections_wal_follower_grace_secs: u64,
     /// 复制角色（P4.4.1）：默认 disabled（单机）。
     /// Replication role; disabled (standalone) by default.
     pub role: ReplicationRole,
@@ -476,6 +588,33 @@ pub struct ServerConfig {
     /// `encryption_key_id`；缺省取 keyring 内的 `active=` 或唯一键）。
     /// EN: active key id for new writes; defaults to the keyring's `active=`.
     pub encryption_key_id: Option<String>,
+    /// Sentinel 专用共享秘密（M1；ENV `HOUYI_SERVER_SENTINEL_TOKEN` / TOML
+    /// `sentinel_token`）。与 `auth_token` 同属敏感项：不接 CLI 旗标，空白值
+    /// 启动期报错。设置后 `sentinel` 角色只能访问 lease/demote/promote/
+    /// replication-status（admin 仍隐含全部权限）。
+    /// EN: dedicated sentinel shared secret (M1; ENV/TOML only, never a CLI
+    /// flag). Grants the `sentinel` role its control endpoints; admin keeps
+    /// everything.
+    pub sentinel_token: Option<String>,
+    /// 写 fencing（M1；ENV `HOUYI_SERVER_REQUIRE_LEADER_LEASE` / TOML
+    /// `require_leader_lease`，CLI `--require-leader-lease`）。开启后 leader
+    /// 必须持有未过期租约才可写；默认 false 与手动 promote 逐字节兼容。
+    /// EN: require a valid leader lease for writes; off by default so manual
+    /// promote stays byte-for-byte compatible.
+    pub require_leader_lease: bool,
+    /// 租约 TTL 上限（毫秒，M1；默认 60000，硬上限同为 60000）。
+    /// EN: lease TTL cap in milliseconds (hard cap is the same constant).
+    pub leader_lease_max_ttl_ms: u64,
+    /// sync 等待的 follower quorum（M1；0 = 任一 ACK）。
+    /// EN: follower quorum for sync waits (0 = any ACK).
+    pub replication_sync_quorum: usize,
+    /// 查询日志容量（M1；0 = 关闭，默认）。有界 ring buffer，只记元数据。
+    /// EN: query-log capacity (0 = disabled, the default); a bounded ring
+    /// buffer that records metadata only.
+    pub query_log_capacity: usize,
+    /// 查询日志采样：每 N 条记录 1 条（默认 1 = 全量）。
+    /// EN: query-log sampling — record 1 in N queries (default 1 = all).
+    pub query_log_sample_every: u32,
 }
 
 impl Default for ServerConfig {
@@ -505,6 +644,12 @@ impl Default for ServerConfig {
             slow_query_ms: 0,
             snapshot_interval_secs: DEFAULT_SNAPSHOT_INTERVAL_SECS,
             snapshot_wal_threshold_bytes: DEFAULT_SNAPSHOT_WAL_THRESHOLD_BYTES,
+            collections_scalar_compact_interval_secs:
+                DEFAULT_COLLECTIONS_SCALAR_COMPACT_INTERVAL_SECS,
+            collections_scalar_compact_stale_ratio: DEFAULT_COLLECTIONS_SCALAR_COMPACT_STALE_RATIO,
+            collections_wal_segment_bytes: DEFAULT_COLLECTIONS_WAL_SEGMENT_BYTES,
+            collections_wal_max_segments: DEFAULT_COLLECTIONS_WAL_MAX_SEGMENTS,
+            collections_wal_follower_grace_secs: DEFAULT_COLLECTIONS_WAL_FOLLOWER_GRACE_SECS,
             role: ReplicationRole::default(),
             replication_listen_addr: DEFAULT_REPLICATION_LISTEN_ADDR.to_string(),
             replication_leader_addr: None,
@@ -518,6 +663,12 @@ impl Default for ServerConfig {
             auth_principals: Vec::new(),
             encryption_key_file: None,
             encryption_key_id: None,
+            sentinel_token: None,
+            require_leader_lease: false,
+            leader_lease_max_ttl_ms: crate::cluster::MAX_LEASE_TTL_MS,
+            replication_sync_quorum: 0,
+            query_log_capacity: 0,
+            query_log_sample_every: 1,
         }
     }
 }
@@ -557,6 +708,11 @@ pub struct ServerConfigFile {
     pub slow_query_ms: Option<u64>,
     pub snapshot_interval_secs: Option<u64>,
     pub snapshot_wal_threshold_bytes: Option<u64>,
+    pub collections_scalar_compact_interval_secs: Option<u64>,
+    pub collections_scalar_compact_stale_ratio: Option<f64>,
+    pub collections_wal_segment_bytes: Option<u64>,
+    pub collections_wal_max_segments: Option<usize>,
+    pub collections_wal_follower_grace_secs: Option<u64>,
     pub role: Option<String>,
     pub replication_listen_addr: Option<String>,
     pub replication_leader_addr: Option<String>,
@@ -569,6 +725,12 @@ pub struct ServerConfigFile {
     pub audit_max_bytes: Option<u64>,
     pub encryption_key_file: Option<String>,
     pub encryption_key_id: Option<String>,
+    pub sentinel_token: Option<String>,
+    pub require_leader_lease: Option<bool>,
+    pub leader_lease_max_ttl_ms: Option<u64>,
+    pub replication_sync_quorum: Option<usize>,
+    pub query_log_capacity: Option<usize>,
+    pub query_log_sample_every: Option<u32>,
     /// `[[auth_principals]]` 数组；缺省为空。
     /// RBAC principals; absent means empty.
     #[serde(default)]
@@ -708,6 +870,21 @@ impl ServerConfigFile {
         if let Some(v) = self.snapshot_wal_threshold_bytes {
             cfg.snapshot_wal_threshold_bytes = v;
         }
+        if let Some(v) = self.collections_scalar_compact_interval_secs {
+            cfg.collections_scalar_compact_interval_secs = v;
+        }
+        if let Some(v) = self.collections_scalar_compact_stale_ratio {
+            cfg.collections_scalar_compact_stale_ratio = v;
+        }
+        if let Some(v) = self.collections_wal_segment_bytes {
+            cfg.collections_wal_segment_bytes = v;
+        }
+        if let Some(v) = self.collections_wal_max_segments {
+            cfg.collections_wal_max_segments = v;
+        }
+        if let Some(v) = self.collections_wal_follower_grace_secs {
+            cfg.collections_wal_follower_grace_secs = v;
+        }
         if let Some(v) = self.role {
             cfg.role = parse_replication_role(&v)?;
         }
@@ -789,6 +966,36 @@ impl ServerConfigFile {
             }
             cfg.encryption_key_id = Some(trimmed.to_string());
         }
+        if let Some(v) = self.sentinel_token {
+            // 与 auth_token 同规（fail-closed）：空白 = 运维以为 sentinel 控制面
+            // 已启用；静默降级 None 会让租约/降级端点落到普通认证面。
+            // EN: same fail-closed rule as auth_token — a blank sentinel token
+            // looks enabled but would silently drop the control-plane credential.
+            let trimmed = v.trim();
+            if trimmed.is_empty() {
+                return Err(
+                    "config file sentinel_token is blank; remove the key to disable the \
+                     sentinel control plane explicitly"
+                        .to_string(),
+                );
+            }
+            cfg.sentinel_token = Some(trimmed.to_string());
+        }
+        if let Some(v) = self.require_leader_lease {
+            cfg.require_leader_lease = v;
+        }
+        if let Some(v) = self.leader_lease_max_ttl_ms {
+            cfg.leader_lease_max_ttl_ms = v;
+        }
+        if let Some(v) = self.replication_sync_quorum {
+            cfg.replication_sync_quorum = v;
+        }
+        if let Some(v) = self.query_log_capacity {
+            cfg.query_log_capacity = v;
+        }
+        if let Some(v) = self.query_log_sample_every {
+            cfg.query_log_sample_every = v;
+        }
         if !self.auth_principals.is_empty() {
             cfg.auth_principals = self.auth_principals;
         }
@@ -834,6 +1041,12 @@ pub struct PgWireSharedState {
     /// EN: Shared replication slot so pgwire collection writes get the same
     /// P4.4.2 sync-wait semantics (and promote swaps the view live).
     pub replication_metrics: SharedReplicationMetrics,
+    /// 集群控制原语（M1）：pgwire 写路径与 HTTP 共用同一租约句柄。
+    /// EN: cluster primitives (M1) shared with the HTTP write path.
+    pub cluster: Arc<crate::cluster::ClusterControl>,
+    /// 查询日志（M1）：与 HTTP 共用同一个有界缓冲区。
+    /// EN: query log (M1) shared with the HTTP side.
+    pub query_log: Option<Arc<crate::query_log::QueryLog>>,
 }
 
 #[derive(Clone)]
@@ -891,6 +1104,21 @@ pub const DEFAULT_SNAPSHOT_INTERVAL_SECS: u64 = 600;
 /// 图快照 WAL 增量阈值默认值字节（256MB，P4.4.0e）。
 /// Default WAL-delta snapshot threshold (256 MiB).
 pub const DEFAULT_SNAPSHOT_WAL_THRESHOLD_BYTES: u64 = 268_435_456;
+/// 标量页自动压实默认间隔秒（P5.0.1）。
+/// EN: Default scalar-page auto-compaction interval.
+pub const DEFAULT_COLLECTIONS_SCALAR_COMPACT_INTERVAL_SECS: u64 = 600;
+/// 标量页自动压实默认 stale 比例（P5.0.1）。
+/// EN: Default stale-row ratio for scalar auto-compaction.
+pub const DEFAULT_COLLECTIONS_SCALAR_COMPACT_STALE_RATIO: f64 = 0.5;
+/// collections WAL 默认段大小（64 MiB，P5.0.2）。
+/// EN: Default collections WAL segment size (64 MiB, P5.0.2).
+pub const DEFAULT_COLLECTIONS_WAL_SEGMENT_BYTES: u64 = 64 * 1024 * 1024;
+/// collections WAL 默认保留段数（P5.0.3）。
+/// EN: Default retained collections WAL segment count (P5.0.3).
+pub const DEFAULT_COLLECTIONS_WAL_MAX_SEGMENTS: usize = 16;
+/// leader 断连/启动/promote 默认宽限秒数（P5.0.4）。
+/// EN: Default leader grace seconds for disconnects/startup/promote (P5.0.4).
+pub const DEFAULT_COLLECTIONS_WAL_FOLLOWER_GRACE_SECS: u64 = 60;
 /// 复制 leader 默认监听地址（P4.4.1）。
 /// EN: Default replication listen address.
 pub const DEFAULT_REPLICATION_LISTEN_ADDR: &str = "0.0.0.0:9876";
@@ -1206,6 +1434,9 @@ pub struct BenchmarkHttpState {
     /// EN: Dedicated collections WAL (separate from the main WAL — see
     /// houyi_persistence::collection_wal for the rationale).
     pub collections_wal: Arc<WalHandle>,
+    /// P5.0.3：快照/保留协调状态（锁、段上限、租约、计数器）。
+    /// EN: P5.0.3 snapshot/retention coordination (lock, segment cap, lease, counters).
+    pub lifecycle: Arc<crate::collection_lifecycle::CollectionLifecycleState>,
     pub vector_dim: usize,
     pub pgwire_metrics: Arc<PgWireMetrics>,
     pub applied_sidecar: PathBuf,
@@ -1242,6 +1473,14 @@ pub struct BenchmarkHttpState {
     /// 静态加密句柄（P4.7.3）：旧 JSON 向量快照写入时据此加密。
     /// EN: at-rest encryption handle; the legacy JSON snapshot writer uses it.
     pub encryption: Option<Arc<houyi_persistence::encryption::Encryption>>,
+    /// 集群控制原语（M1）：term 持久化 + leader 租约，写路径 fencing 与
+    /// lease/demote 端点共用同一句柄。
+    /// EN: cluster primitives (M1) — persisted term + leader lease shared by
+    /// write fencing and the lease/demote endpoints.
+    pub cluster: Arc<crate::cluster::ClusterControl>,
+    /// 查询日志（M1）：None = 关闭（默认），关闭时写路径零开销。
+    /// EN: query log (M1); None = disabled (default), zero cost on write paths.
+    pub query_log: Option<Arc<crate::query_log::QueryLog>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1351,6 +1590,77 @@ pub struct DeleteResponse {
     pub deleted: usize,
 }
 
+/// 整库删除响应（`DELETE /v1/admin/collections/{name}`）。
+/// EN: Whole-collection drop response.
+#[derive(Debug, Serialize)]
+pub struct DropCollectionResponse {
+    /// 固定为 true：目标不存在时返回 404，不会出现 `deleted:false` 的 200。
+    /// EN: Always true — an absent target yields 404, never a 200 with `false`.
+    pub deleted: bool,
+    pub collection: String,
+}
+
+/// 显式建集合请求（`PUT /v1/collections/{name}`）。
+///
+/// `metric` 缺省 Cosine（与历史隐式创建一致）；`index_type` 缺省服务端默认后端；
+/// HNSW 三项必须全给或全不给（半套 400）。后端与度量的兼容矩阵由
+/// `IndexBackend::metric_supported` 裁决：pq-flat 仅 L2、hii-l0 仅 Cosine，
+/// 其余后端四种都支持。
+/// EN: Explicit collection-creation request. `metric` defaults to Cosine (same as
+/// legacy implicit creation); `index_type` defaults to the server's backend; the
+/// three HNSW parameters must be all-present or all-absent. Backend/metric
+/// compatibility is decided by `IndexBackend::metric_supported`: pq-flat is L2-only,
+/// hii-l0 is Cosine-only, all other backends accept all four metrics.
+#[derive(Debug, Deserialize)]
+pub struct CreateCollectionRequest {
+    /// 向量维度，必须 > 0（0 维度后端不可构造 → 400）。
+    /// EN: Vector dimension; must be > 0 (a zero-dim backend cannot be built → 400).
+    pub dims: usize,
+    /// `l2` / `cosine` / `ip` / `l1`（大小写不敏感；常用别名见 DistanceMetric::parse_str）。
+    /// EN: One of l2/cosine/ip/l1 (case-insensitive aliases accepted).
+    #[serde(default)]
+    pub metric: Option<String>,
+    /// 后端类型：hnsw / pq-flat / flat / clustered / flat-clustered / hii-l0。
+    /// EN: Backend kind: hnsw / pq-flat / flat / clustered / flat-clustered / hii-l0.
+    #[serde(default)]
+    pub index_type: Option<String>,
+    #[serde(default)]
+    pub hnsw_m: Option<usize>,
+    #[serde(default)]
+    pub hnsw_ef_construction: Option<usize>,
+    #[serde(default)]
+    pub hnsw_ef_search: Option<usize>,
+}
+
+/// 建集合时生效的 HNSW 参数（响应与状态端点共用）。
+/// EN: Effective HNSW parameters at creation (shared by responses and status).
+#[derive(Debug, Serialize, PartialEq, Eq)]
+pub struct HnswParamsResponse {
+    pub m: usize,
+    pub ef_construction: usize,
+    pub ef_search: usize,
+}
+
+/// 显式建集合响应：回显实际生效的度量/后端/HNSW 参数（缺省值已展开）。
+/// EN: Explicit-creation response echoing the effective metric/backend/HNSW
+/// parameters (defaults already resolved).
+#[derive(Debug, Serialize)]
+pub struct CreateCollectionResponse {
+    /// 固定 true：同名已存在返回 409，不会有 `created:false` 的 200。
+    /// EN: Always true — an existing name yields 409, never 200 with `false`.
+    pub created: bool,
+    pub collection: String,
+    pub dims: usize,
+    /// 规范度量串（l2|cosine|ip|l1），与实际计分口径一致。
+    /// EN: Canonical metric string matching the actual scoring metric.
+    pub metric: String,
+    pub index_type: String,
+    /// 仅 `index_type=hnsw` 时存在；其他后端不序列化此字段。
+    /// EN: Present only for `index_type=hnsw`; omitted for other backends.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hnsw: Option<HnswParamsResponse>,
+}
+
 /// 设置 Collection HA 级别请求（P4.4.2）/ Set a collection's HA level.
 ///
 /// 取值 `async` / `semi_sync` / `full_sync`（大小写与连字符变体均可，
@@ -1376,34 +1686,34 @@ pub struct SetHaLevelResponse {
 /// Vector search response: `ids[i]` and `scores[i]` are aligned by index and ordered
 /// by descending similarity.
 ///
-/// `scores` 的语义按后端 `index_type` 区分（由后端返回的距离在 HTTP 边界一次性换算）：
-/// Score semantics depend on the backend's `index_type` (distance → score converted
-/// once at the HTTP edge):
+/// `scores` 的语义按 collection 的**度量**（`metric`，创建时定型）区分，由后端返回
+/// 的距离在 HTTP 边界一次性换算（内核各后端统一「距离越小越近」）：
+/// Score semantics depend on the collection's **metric** (fixed at creation); the
+/// backend distance is converted once at the HTTP edge (the kernel is uniformly
+/// "smaller distance = closer"):
 ///
-/// - `hnsw` / `flat` / `clustered` / `flat-clustered` / `hii-l0`：余弦相似度
-///   cosine similarity，`score = 1.0 - cosine_distance`，取值 `[-1, 1]`，值越大越相似。
-///   注意单位范数只保证上界 `[-1, 1]`；要进一步落在 `[0, 1]` 还需向量元素全部非负。
-///   HTTP 边缘会把 f32 舍入导致的轻微越界（相同向量点积略 > 1）钳制回 `[-1, 1]`。
+/// - `cosine`：余弦相似度 `score = 1.0 - cosine_distance`，取值 `[-1, 1]`，值越大
+///   越相似。注意单位范数只保证上界 `[-1, 1]`；要进一步落在 `[0, 1]` 还需向量
+///   元素全部非负。HTTP 边缘会把 f32 舍入导致的轻微越界钳制回 `[-1, 1]`。
 ///   EN: cosine similarity, range [-1,1], larger = closer; unit norm alone only
 ///   guarantees [-1,1] (non-negative elements are required for [0,1]); rounding
 ///   overshoot is clamped back to [-1,1] at the edge.
-/// - `pq-flat`：距离始终是平方 L2 口径——**有 mmap** 时是 Phase-2 对原始向量的
-///   精确重排距离（L2²）；**无 mmap（或重排文件打开失败）** 时是 Phase-1 PQ 子空间
-///   查表距离之和（各段平方 L2 求和），不会执行重排。两种情况下
-///   `score = 1.0 - distance` 都**不保证落在 `[-1, 1]`**；对模长不同的向量，排序也
-///   可能与余弦不同。已知限制（TODO/后续 issue：pq-flat 重排改为按 Cosine 度量计算，
-///   或在响应中显式透出每后端的分数类型，例如机器可读的 `score_semantics` 字段）。
-///   同一个未来字段还应承载「因 NaN/±Inf 距离被丢弃的命中数」——目前该计数只打到
-///   服务端 stderr，客户端无法区分「本来就少于 k 条命中」与「服务端丢弃了毒行」。
-///   EN: distances are squared-L2 in both cases — Phase-2 exact L2² rerank against
-///   raw vectors with mmap; Phase-1 PQ subspace table-sum without mmap (or when the
-///   rerank file fails to open). `1 - distance` is NOT bounded to [-1,1] in either
-///   case, and ranking can differ from cosine for vectors of differing magnitude.
-///   Known limitation (TODO: rerank by cosine, or expose the score type — e.g. a
-///   machine-readable `score_semantics` field). That same future field should carry the
-///   count of hits dropped for NaN/±Inf distance (currently logged to server stderr
-///   only, so clients cannot tell "fewer than k matches exist" from "poisoned hits were
-///   discarded").
+/// - `l2`：距离是平方欧氏距离（L2²）；`score = 1.0 - L2²`，**不保证有界**（越负越远）。
+///   对模长不同的向量，排序与余弦不同（这是度量语义的直接结果）。
+///   EN: squared Euclidean distance; `score = 1.0 - L2²`, unbounded (more negative =
+///   farther). Ranking differs from cosine for differing magnitudes by design.
+/// - `l1`：距离是曼哈顿距离 Σ|a-b|；`score = 1.0 - L1`，**不保证有界**。
+///   EN: Manhattan distance Σ|a-b|; `score = 1.0 - L1`, unbounded.
+/// - `ip`：内核距离为 `-dot`，因此 `score = -distance = dot(a, b)`，即原始内积，
+///   **不保证有界**（越大越相似，与 Milvus 的 IP 语义一致）。
+///   EN: kernel distance is `-dot`, so `score = -distance = dot(a, b)` — the raw inner
+///   product, unbounded (larger = closer, matching Milvus IP semantics).
+///
+/// 非有限距离（NaN/±Inf，可由 pg_wire binary float4/float8 写入）会在边缘成对丢弃，
+/// 因此结果可能少于 k；目前该计数只打到服务端 stderr（后续可用机器可读字段透出）。
+/// EN: non-finite distances (NaN/±Inf, storable via pg_wire binary floats) are dropped
+/// pairwise at the edge, so results may number fewer than k; the count is currently
+/// logged server-side only (a machine-readable field is a follow-up).
 ///
 /// 空结果时 `ids` 与 `scores` 均为空数组。换算只在 HTTP 边缘做一次，内核各层始终
 /// 保持「距离越小越近」的统一语义（WHY: 避免距离/相似度两种约定在内核里混用导致
@@ -1412,11 +1722,11 @@ pub struct SetHaLevelResponse {
 pub struct SearchResponse {
     pub ids: Vec<u64>,
     /// 相似度分数，与 `ids` 等长对齐，非递增（单调不增）排列（越大越相似）。
-    /// 语义按后端区分：余弦后端为 `1 - cosine_distance` ∈ `[-1,1]`（边缘钳制）；
-    /// pq-flat 为 `1 - L2²`，不保证有界。详见结构体文档。
+    /// 换算按 collection 度量：cosine → `1-d` 且钳制 `[-1,1]`；l2/l1 → `1-d`；
+    /// ip → `-d`（原始内积）。后三者不保证有界。详见结构体文档。
     /// Similarity scores aligned with `ids`, ordered non-increasing (larger = closer).
-    /// Cosine backends: `1 - cosine_distance` in [-1,1] (edge-clamped); pq-flat:
-    /// `1 - L2²`, unbounded. See the struct docs for details.
+    /// By metric: cosine → `1-d` clamped to [-1,1]; l2/l1 → `1-d`; ip → `-d`
+    /// (raw inner product). The latter three are unbounded. See the struct docs.
     pub scores: Vec<f32>,
     /// 每命中的 payload（label + payload 键值），键为 `ids` 元素的字符串形式。
     /// 仅当请求 `include_payload=true` 且为 collection 路径时存在；命中行无标量
@@ -1428,6 +1738,12 @@ pub struct SearchResponse {
     /// serialization entirely (benchmark responses stay byte-identical).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub payloads: Option<std::collections::HashMap<String, serde_json::Value>>,
+    /// 本次检索所用度量（l2|cosine|ip|l1），collection/hybrid 路径返回；benchmark
+    /// 路径省略该字段以保持响应形状与旧版逐字节一致。
+    /// EN: the metric used for this search (l2|cosine|ip|l1) on the collection/hybrid
+    /// paths; the benchmark path omits it to keep responses byte-identical.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub metric: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -1447,6 +1763,13 @@ pub(crate) struct IndexStatusResponse {
     pub total_flushed_items: usize,
     pub max_pending_queue: usize,
     pub last_flush_items: usize,
+    // 生效的索引配置：客户端（如 VectorDBBench）在测量前核对，避免把
+    // 服务端实际参数与请求参数不一致的跑分当成功。
+    // EN: Effective index configuration so clients (e.g. VectorDBBench) can
+    // verify the graph they are about to measure instead of trusting labels.
+    pub distance_metric: String,
+    pub hnsw_m: usize,
+    pub hnsw_ef_construction: usize,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1469,11 +1792,60 @@ pub(crate) struct WalRotateResponse {
 }
 
 #[derive(Debug, Serialize)]
-pub(crate) struct WalStatusResponse {
+pub struct WalStatusResponse {
     pub next_lsn: u64,
     pub applied_lsn: u64,
     pub active_bytes: u64,
     pub archived_segments: usize,
+    /// P5.0.3：collections WAL 的段/快照/保留视图。
+    /// EN: P5.0.3 collections WAL segment/snapshot/retention view.
+    pub collections: CollectionsWalStatus,
+}
+
+#[derive(Debug, Serialize)]
+pub struct CollectionsWalStatus {
+    pub first_available_lsn: u64,
+    pub next_lsn: u64,
+    pub active_bytes: u64,
+    pub archived_segments: usize,
+    pub archived_bytes: u64,
+    pub oldest_archive_first_lsn: Option<u64>,
+    pub newest_archive_last_lsn: Option<u64>,
+    pub manifest_present: bool,
+    pub manifest_seq: Option<u64>,
+    pub safe_checkpoint_lsn: Option<u64>,
+    pub retention_safe_floor_lsn: Option<u64>,
+    pub retention_blocked_reason: Option<String>,
+    pub retention_lease_until_unix: u64,
+    pub segments_deleted_total: u64,
+    pub bytes_freed_total: u64,
+}
+
+#[derive(Debug, serde::Deserialize, Default)]
+pub struct CollectionsCompactRequest {
+    #[serde(default)]
+    pub rotate: bool,
+    #[serde(default)]
+    pub hold_retention_secs: Option<u64>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct CollectionsCompactResponse {
+    pub manifest_committed: bool,
+    pub manifest_seq: Option<u64>,
+    pub safe_checkpoint_lsn: Option<u64>,
+    pub blocked_reason: Option<String>,
+    pub rotated: bool,
+    pub retention: RetentionResponse,
+}
+
+#[derive(Debug, Serialize)]
+pub struct RetentionResponse {
+    pub deleted_segments: usize,
+    pub bytes_freed: u64,
+    pub first_available_lsn: u64,
+    pub blocked_reason: Option<String>,
+    pub lease_until_unix: u64,
 }
 
 #[derive(Debug, Serialize)]

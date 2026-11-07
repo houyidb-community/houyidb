@@ -2,7 +2,7 @@
 
 > [English](DEPLOYMENT_GUIDE.en.md)
 
-> 适用版本：v0.2.0-beta.5。HouyiDB 是**单机、内存优先**的向量数据库；
+> 适用版本：v0.2.0-beta.8。HouyiDB 是**单机、内存优先**的向量数据库；
 > 高可用为 leader/follower 手动 promote，不做自动选主。beta 阶段建议先用于
 > 功能验证与非关键业务。
 >
@@ -157,7 +157,7 @@ helm install houyi ./deploy/helm/houyidb -n houyidb --create-namespace \
   --set persistence.size=100Gi
 ```
 
-默认镜像为 `ghcr.io/houyidb-community/houyidb:v0.2.0-beta.5`；自建镜像时
+默认镜像为 `ghcr.io/houyidb-community/houyidb:v0.2.0-beta.8`；自建镜像时
 覆盖 `image.repository` / `image.tag`。
 
 主备是**两个 release**（v1 无自动选主，`replicaCount` 调大只会得到多个独立
@@ -246,8 +246,9 @@ sudo tar czf houyidb-backup-$(date +%F).tgz \
 sudo systemctl start houyidb
 ```
 
-- 目录必须包含 WAL、`*.collections.wal`、旁路文件、`snapshots/` 和
-  keyring（如启用加密）；
+- 目录必须包含 WAL、`*.collections.wal` 及其 `*.wal.archived.*` 归档段、
+  `*.wal.next_lsn`、`snapshots/`（含 `collections.manifest`）、follower 的
+  `replication.follower_id` 和 keyring（如启用加密）；
 - 运行中 WAL 与快照文件仍在变化，热拷贝**不能保证跨文件一致**；关键数据
   请用停写备份，或走主备（follower 追平后在其上做备份/promote）；
 - 恢复：把备份解到原路径、权限归 `houyidb`，启动后自动重放 WAL 与图快照；
@@ -288,6 +289,45 @@ curl -fsS -X POST http://<follower>:7000/v1/admin/promote \
   failover 后新主没有该路径数据。生产数据请走 Collections API；
 - v1 没有自动选主/quorum：监控复制滞后，人工判断后再 promote。
 
+### 10.1 Sentinel 控制面原语（EE 前置，默认关闭）
+
+自动选主本身在企业版，但 **term/租约/写 fencing 等安全原语在社区版**（不设
+付费墙——没有它们，被分区的旧 leader 会继续写而丢数据）：
+
+```bash
+# 1. 开启写 fencing（leader 必须有有效租约才可写）
+houyi-server --role follower --require-leader-lease \
+  --replication-sync-quorum 1 ...     # quorum 可选，0 = 任一 ACK
+
+# 2. sentinel 专用秘密只经 ENV/TOML 注入（不上 CLI），并需同时配置
+#    HOUYI_AUTH_TOKEN 或 [[auth_principals]]，否则数据面无主体可用
+export HOUYI_SERVER_SENTINEL_TOKEN=...
+
+# 3. 授予租约（term 只增）+ 带租约 promote
+curl -X POST http://<follower>:7000/v1/admin/lease \
+  -H "Authorization: Bearer $SENTINEL_TOKEN" \
+  -H "Content-Type: application/json" -d '{"term":7,"ttl_ms":10000}'
+curl -X POST http://<follower>:7000/v1/admin/promote \
+  -H "Authorization: Bearer $SENTINEL_TOKEN" \
+  -H "Content-Type: application/json" -d '{"term":7,"ttl_ms":10000}'
+
+# 4. 旧 leader 降级；带 follower_of 时运行时转回 follower（推荐）
+curl -X POST http://<old-leader>:7000/v1/admin/demote \
+  -H "Authorization: Bearer $SENTINEL_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"term":7,"follower_of":"<new-leader>:9876"}'
+#    不带 follower_of 则保持只读 detached，需重启为 follower 才能重新加入。
+```
+
+- term 持久化在 WAL 目录的 `cluster_state.json`（原子写 + fsync）；
+  文件损坏时**启动失败**，不带着未知 term 继续写；
+- 租约过期不会自动翻角色，写路径返回 503 `lease_expired`（pgwire 25006）；
+  sentinel 或运维显式 demote，避免与续租竞争；
+- `GET /v1/admin/replication/status` 返回 role/term/lease/follower 进度/
+  quorum；`GET /v1/version` 供客户端探测能力；
+- demote 带 `follower_of`（新主复制地址）时节点运行时转回 follower 并自动追平；
+  不带时是 `detached_readonly`，需以 follower 角色重启才能重新加入。
+
 ## 11. 可观测性
 
 | 端点 | 用途 |
@@ -298,6 +338,10 @@ curl -fsS -X POST http://<follower>:7000/v1/admin/promote \
 | `GET /v1/index/status` | 主索引状态 |
 | `GET /v1/collections/{name}/status` | 单个 collection 状态 |
 | `GET /v1/pgwire/status` | pgwire 会话统计 |
+| `GET /v1/admin/replication/status` | 角色/term/租约/follower 进度 |
+| `GET /v1/admin/diagnostics` | 诊断包结构化状态（无密钥/向量） |
+| `GET /v1/admin/query-log` | 最近查询元数据（需开启查询日志） |
+| `GET /v1/admin/query-stats` | 按 collection 的 p50/p95/p99 |
 
 - 告警规则：`deploy/prometheus/houyidb-alerts.yml`，每条告警带 runbook 链接
   （`docs/runbooks/`）；
@@ -309,11 +353,13 @@ curl -fsS -X POST http://<follower>:7000/v1/admin/promote \
 
 1. 先备份数据目录（见 §9）；
 2. 单机：停服 → 替换二进制/镜像 → 启动 → 验证 `/v1/health` 与抽样检索；
-3. 主备：先升级 follower 并确认追平 → promote → 升级旧 leader → 清空后
-   以 follower 重连；
+3. 主备：复制协议 **v6 不与 v5 滚动兼容**，不能“先升 follower”。先静默写入
+   （或停写），**同时升级所有副本**，再按 leader → follower 顺序启动；
+   升级前建议先 `POST /v1/admin/collections/compact {"rotate":true}` 提交完整
+   快照，缩短首次启动的 WAL 重放。
 4. 升级后首次启动会按需重放 WAL/图快照，耗时随数据量增长；
-5. **不承诺降级兼容**：回滚前先恢复升级前的备份，不要直接旧二进制打开新
-   格式数据。
+5. **不承诺降级兼容**：首次截断 collections WAL 后旧二进制无法安全打开新数据；
+   回滚前先恢复升级前的备份，或用 `scripts/collections_resync.sh` 重建基线。
 
 ## 13. 故障排查
 

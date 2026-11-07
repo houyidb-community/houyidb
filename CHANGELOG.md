@@ -2,6 +2,109 @@
 
 > [English](CHANGELOG.en.md)
 
+## v0.2.0-beta.8 (2026-11-07)
+
+### Added
+- **`DELETE /v1/admin/collections/{name}`**：无条件删除整个 collection
+  （管理员 `Action::Admin`，审计自动记录）。删除走 WAL-first：先追加
+  `collection_drop` 记录再移除内存对象，崩溃重放与 follower 实时 apply 都会
+  收敛到「已删除」；同名重建得到全新的空 collection，旧向量不会复活。
+  响应 `{"deleted":true,"collection":"<name>"}`；不存在/重复删除 404，
+  并发删除竞争 409，follower/只读 503。`/v1/version` 增加
+  `collection_delete` 能力标记。
+- **六语言 SDK + MCP**：Rust/Go/Python/TypeScript/.NET/Java 客户端新增可选
+  admin token（仅附加在 `/v1/admin/*` 请求）与 `delete_collection` /
+  `DeleteCollection` API；`houyidb-mcp` 新增 `delete_collection` 工具
+  （仅在读写模式注册，要求 `HOUYI_ADMIN_TOKEN`，仍受白名单约束）。
+- **`PUT /v1/collections/{name}` 显式建集合**（普通写权限
+  `Action::Write`）：一次定型 `dims` / `metric` / `index_type` / HNSW 三元组，
+  参数在落 WAL 前统一校验；同名已存在 409，度量与后端创建后不可变。
+  `/v1/version` 增加 `collection_create` / `collection_metric` 能力标记。
+- **collection 级距离度量**：`l2` / `cosine` / `ip` / `l1`（内核统一
+  「越小越近」，HTTP 分数在唯一出口换算：cosine `1-d` 钳制 [-1,1]，
+  l2/l1 `1-d` 不截断，ip 为原始点积）。支持矩阵：hnsw / flat / clustered /
+  flat-clustered 支持全部四种；pq-flat 仅 l2；hii-l0 仅 cosine。集合/混合
+  检索响应新增 `metric` 字段（benchmark 路径保持字节不变）。
+- **六语言 SDK + MCP 建集合接口**：`create_collection` / `createCollection` /
+  `CreateCollection` / `CreateCollectionAsync`，支持 metric/后端/HNSW 选项并
+  回显服务端实际生效参数；MCP 新增 `create_collection` 工具，走普通
+  `HOUYI_AUTH_TOKEN`，绝不使用 admin token。
+
+### Changed
+- **复制协议 v8**：在 v7（`collection_drop`）之上补齐 `collection_create` 的
+  度量/HNSW 语义（线格式不变）。版本门 fail-fast 隔离 v8 与旧版本混跑——旧
+  二进制会静默跳过未知 op 并按 cosine 重建创建记录（已删集合复活 + 度量静默
+  漂移），升级需全集群协调。
+- **collection 快照 v2**：携带 `metric` 与可选 HNSW 参数；v1 解码按后端默认
+  度量。图快照带度量，不匹配拒绝加载；`collection_create` WAL 记录同样携带
+  度量/HNSW，冷重放不会把历史集合重置为 cosine。
+- **快照/保留**：删除中的 collection 不再中止本轮快照（跳过即可）；全部删除
+  后写空 manifest，`safe_checkpoint_lsn = global_barrier_lsn` 以允许 WAL
+  截断；barrier 之后新建 collection 的 Create LSN 严格更大，截断安全。
+  follower 不写空名单 manifest（append 先于 apply，barrier 可能越过未应用
+  记录），保留旧 manifest 直到有新 collection 落地或被 promote。
+
+### Upgrade
+- 复制协议 **v8 不与 v7 及更早版本（beta.7 = v6）滚动兼容**：先停复制，
+  全量升级所有副本，再恢复。
+- **禁止降级**：v8 WAL 不得交给 v7 二进制冷重放——旧二进制会跳过
+  `collection_drop` 并忽略创建记录的度量字段，把已删 collection 复活且按
+  cosine 静默漂移。回退路径是备份或删除后重建（重建需重新指定度量）。
+
+## v0.2.0-beta.7 (2026-11-02)
+
+### Added
+- `GET /v1/collections/{name}/export`：流式 NDJSON 逻辑导出（header + 按 id
+  升序的记录 + footer），向量共享 `Arc` 不复制主表；payload 取最后写入值并
+  跳过墓碑。`/v1/version` 增加 `collection_export` 能力标记。
+- collection 列表/状态暴露只读 `ha_level`（变更仍走
+  `POST /v1/collections/{name}/ha_level`，WAL-first）。
+
+### Fixed
+- 并发构建回归用例改为自适应等待队列排空，消除高负载 Linux CI 的偶发红灯。
+
+## v0.2.0-beta.6 (2026-10-30) — P5.0 存储生命周期
+
+### Added
+- **collections 快照 + manifest**：HOUYISNAP/HOUYIMAN 格式，冷启动按
+  checkpoint 跳过已覆盖记录；manifest 缺失且历史已截断时启动失败（禁止带洞重放）。
+- **WAL 分段与有界保留**：默认 16 段 × 64 MiB，整段删除；`/v1/wal/status`、
+  `/metrics`、`POST /v1/admin/collections/compact` 暴露保留状态与手动快照/轮转。
+- **复制协议 v6**：握手携带本地最早可读 LSN / manifest checkpoint / 稳定
+  follower_id；ANCHOR/HNDA 锚点协商；`BEHIND_RETAINED` + 全量重同步 runbook；
+  保留 floor 跟随活跃 follower 的 durable LSN（断连 grace 可配）。
+- **标量页内存压实**：默认每 10 分钟检查、stale ≥50% 时压实；status 暴露
+  physical/live/stale/tombstone；`POST /v1/collections/{name}/compact` 手动触发。
+- promote 前按 collection `applied_lsn` 补齐本地 WAL 尾部，失败拒绝 promote。
+- **Sentinel 控制面原语（EE 前置，非付费墙）**：`cluster_state.json` 持久化
+  term（只增、损坏 fail-closed）；leader 租约与写 fencing（
+  `--require-leader-lease`，过期 503 `lease_expired` / pgwire 25006）；
+  `POST/DELETE/GET /v1/admin/lease`、`POST /v1/admin/demote`、
+  `GET /v1/admin/replication/status`、`GET /v1/version`、
+  `GET /v1/admin/whoami`、`GET /v1/admin/diagnostics`；
+  promote 可选 `{term, ttl_ms}` 原子授租；demote 可选 `follower_of`
+  （新主复制地址）在运行时把旧 leader 转回 follower 并自动追平，无需重启。
+  默认全关时行为与手动 promote 一致。
+- **复制 quorum 等待**：`--replication-sync-quorum N`（默认 0 = 任一 ACK）；
+  N>0 时 sync 写等待 N 个活跃 follower 的 DURABLE ≥ 写入 LSN（K-th 大）。
+- **查询日志与统计**：`--query-log-capacity` / `--query-log-sample-every`
+  （默认关闭）；有界 ring buffer 只记元数据（不记向量/payload/SQL）；
+  `GET /v1/admin/query-log`、`GET /v1/admin/query-stats`（p50/p95/p99）。
+- **sentinel RBAC 角色**：专用 `sentinel_token`（ENV/TOML，不上 CLI）
+  仅可访问 lease/demote/promote/replication-status；admin 隐含。
+- fuzz 目标 `collection_snapshot_decode`。
+
+### Changed
+- **行为变更（过滤）**：压实后过滤只命中每个 id 的最后一行；此前 append-only
+  页会让旧行也命中。
+- `drop_old`/基准客户端：启动自检探针改用保留 ID 并清理，`/v1/index/status`
+  报告生效的 `distance_metric` / `hnsw_m` / `hnsw_ef_construction`。
+
+### Upgrade
+- 复制协议 **v6 不与 v5 滚动兼容**：所有副本一起升级。
+- 首次截断 WAL 后不可降级到旧二进制；回退路径是备份或全量重同步。
+- 启动前建议先做一次 `POST /v1/admin/collections/compact`，让旧历史被快照覆盖。
+
 ## v0.2.0-beta.5 (2026-10-25)
 
 ### Added

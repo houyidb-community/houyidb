@@ -56,6 +56,12 @@ export type FetchLike = (
 export interface HouyiClientOptions {
   readonly baseUrl: string;
   readonly authToken?: string;
+  /**
+   * 可选管理 token：只附在管理请求（删除整个 collection）上，普通读写不带。
+   * EN: Optional admin token: attached only to admin requests (dropping a
+   * collection), never to normal read/write calls.
+   */
+  readonly adminToken?: string;
   readonly fetchImpl?: FetchLike;
   readonly timeoutMs?: number;
 }
@@ -97,12 +103,14 @@ function resolveFetch(fetchImpl?: FetchLike): FetchLike {
 export class HouyiClient {
   readonly #baseUrl: string;
   readonly #authToken?: string;
+  readonly #adminToken?: string;
   readonly #fetch: FetchLike;
   readonly #timeoutMs: number;
 
   constructor(options: HouyiClientOptions) {
     this.#baseUrl = options.baseUrl.replace(/\/+$/, "");
     this.#authToken = options.authToken;
+    this.#adminToken = options.adminToken;
     this.#fetch = resolveFetch(options.fetchImpl);
     this.#timeoutMs = options.timeoutMs ?? REQUEST_TIMEOUT_MS;
   }
@@ -124,20 +132,40 @@ export class HouyiClient {
   }
 
   /**
+   * PUT JSON 到指定端点（普通写路径，使用 auth token；绝不携带 admin token）。
+   * EN: PUT JSON to an endpoint (normal write path using the auth token; never
+   * the admin token).
+   */
+  async put(path: string, payload: unknown): Promise<unknown> {
+    return this.#request("PUT", path, payload);
+  }
+
+  /**
+   * DELETE 一个管理端点（使用 admin token；普通 token 绝不上报）。
+   * EN: DELETE an admin endpoint (uses the admin token; the normal token is
+   * never sent).
+   */
+  async deleteAdmin(path: string): Promise<unknown> {
+    return this.#request("DELETE", path, undefined, true);
+  }
+
+  /**
    * 统一请求路径：超时、鉴权、错误映射与正文脱敏只在这里实现一次。
    * EN: Shared request path: timeout, auth, error mapping, and body redaction
    * are implemented exactly once here.
    */
   async #request(
-    method: "GET" | "POST",
+    method: "GET" | "POST" | "PUT" | "DELETE",
     path: string,
     payload?: unknown,
+    admin = false,
   ): Promise<unknown> {
     const headers: Record<string, string> = {
       Accept: "application/json",
     };
-    if (this.#authToken !== undefined) {
-      headers.Authorization = `Bearer ${this.#authToken}`;
+    const token = admin ? this.#adminToken : this.#authToken;
+    if (token !== undefined) {
+      headers.Authorization = `Bearer ${token}`;
     }
 
     let body: string | undefined;
@@ -216,7 +244,12 @@ export class HouyiClient {
    * accidentally reflects credentials cannot leak them.
    */
   #redact(text: string): string {
-    if (this.#authToken === undefined || this.#authToken === "") return text;
-    return text.split(this.#authToken).join("[REDACTED]");
+    let out = text;
+    for (const token of [this.#authToken, this.#adminToken]) {
+      if (token !== undefined && token !== "") {
+        out = out.split(token).join("[REDACTED]");
+      }
+    }
+    return out;
   }
 }

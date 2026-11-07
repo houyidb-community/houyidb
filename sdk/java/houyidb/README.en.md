@@ -8,7 +8,7 @@ The official Java client for the HouyiDB vector database (collections HTTP API).
 
 ```groovy
 dependencies {
-    implementation 'top.houyidb:houyidb-client:0.2.0-beta.5'
+    implementation 'top.houyidb:houyidb-client:0.2.0-beta.8'
 }
 ```
 
@@ -27,7 +27,7 @@ col.upsert(List.of(new Vector(
         embedding, // double[]
         Map.of("text", "...", "category", "fruit"))));
 
-// Search (score is similarity = 1 - cosine_distance; higher means more similar)
+// Search (scores are metric-derived; higher means more similar — see "Explicit Creation" below)
 SearchResult result = col.search(queryEmbedding, 5,
         new SearchOptions().includePayload(true));
 
@@ -38,6 +38,42 @@ SearchResult filtered = col.hybridSearch(queryEmbedding, 5,
 
 // Delete (by id and/or filter conditions, idempotent; the two are unioned)
 col.delete(List.of(StableId.of("doc-1")), null);
+```
+
+## Explicit Creation (Dims/Metric/Backend/HNSW Fixed Up Front)
+
+`PUT /v1/collections/{name}` is a normal write path (write permission, no admin
+token). Explicit creation locks dimensionality and metric: an existing name
+yields `HouyiException(409)`; metric/backend are immutable afterwards, and
+omitted fields take server defaults (`cosine` + `hnsw`).
+
+```java
+var created = client.createCollection("docs", 768,
+        new CreateCollectionOptions()
+                .metric("ip")        // l2 / cosine / ip / l1
+                .indexType("hnsw")   // hnsw / flat / clustered / flat-clustered / pq-flat / hii-l0
+                .hnsw(new HnswParams(16, 100, 64)));
+// created.metric == "ip"; the server echoes the effective parameters
+```
+
+Metric support matrix: `hnsw` / `flat` / `clustered` / `flat-clustered`
+support all four; `pq-flat` supports `l2` only; `hii-l0` supports `cosine`
+only.
+
+Search scores are metric-derived (higher means more similar): `cosine` →
+`1 - distance` in [-1, 1]; `l2` / `l1` → `1 - distance` (unclamped); `ip` →
+the raw dot product.
+
+## Admin Operation: Dropping a Whole Collection (Irreversible)
+
+Requires server admin permission (RBAC `Action::Admin`). WAL-first, so crash
+replay and follower replication converge to "gone". **Irreversible**; export
+first. A same-name recreate starts empty and never resurrects old vectors. The
+admin token is attached only to `/v1/admin/*` requests.
+
+```java
+HouyiClient admin = HouyiClient.withAdminToken(baseUrl, adminToken);
+admin.deleteCollection("docs"); // unknown → HouyiException(404)
 ```
 
 ## Mapping to Other Language SDKs

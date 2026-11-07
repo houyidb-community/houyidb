@@ -8,7 +8,7 @@
 ## 安装（单机）
 
 ```bash
-# 默认镜像：ghcr.io/houyidb-community/houyidb:v0.2.0-beta.5
+# 默认镜像：ghcr.io/houyidb-community/houyidb:v0.2.0-beta.8
 helm install houyi ./deploy/helm/houyidb \
   --namespace houyidb --create-namespace \
   --set persistence.size=100Gi
@@ -17,11 +17,11 @@ helm install houyi ./deploy/helm/houyidb \
 使用自建镜像时覆盖 `image.repository` / `image.tag`：
 
 ```bash
-docker build -t registry.example.com/houyidb:v0.2.0-beta.5 .
-docker push registry.example.com/houyidb:v0.2.0-beta.5
+docker build -t registry.example.com/houyidb:v0.2.0-beta.8 .
+docker push registry.example.com/houyidb:v0.2.0-beta.8
 helm install houyi ./deploy/helm/houyidb -n houyidb \
   --set image.repository=registry.example.com/houyidb \
-  --set image.tag=v0.2.0-beta.5
+  --set image.tag=v0.2.0-beta.8
 ```
 
 ## 主备（手动 failover）

@@ -13,6 +13,12 @@ import { CollectionNotAllowedError, HouyidbMcpError } from "./errors.js";
 export interface HouyidbMcpConfig {
   readonly baseUrl: string;
   readonly authToken?: string;
+  /**
+   * 可选管理 token：只用于管理工具（删除整个 collection），绝不用于普通读写。
+   * EN: Optional admin token: used by admin tools only (dropping a collection),
+   * never by normal read/write calls.
+   */
+  readonly adminToken?: string;
   readonly readOnly: boolean;
   readonly collections: ReadonlySet<string>;
 }
@@ -93,10 +99,12 @@ export function loadConfig(
       .filter((name) => name.length > 0),
   );
   const token = (env.HOUYI_AUTH_TOKEN ?? "").trim();
+  const adminToken = (env.HOUYI_ADMIN_TOKEN ?? "").trim();
 
   return {
     baseUrl: parseBaseUrl(env.HOUYIDB_URL),
     ...(token === "" ? {} : { authToken: token }),
+    ...(adminToken === "" ? {} : { adminToken }),
     readOnly: parseReadOnly(env.HOUYIDB_MCP_READ_ONLY),
     collections,
   };

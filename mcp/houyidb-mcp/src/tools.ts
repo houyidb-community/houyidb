@@ -11,11 +11,26 @@ import {
   isCollectionAllowed,
   type HouyidbMcpConfig,
 } from "./config.js";
-import { MAX_ERROR_BODY_CHARS, MAX_SEARCH_EF, MAX_SEARCH_K } from "./constants.js";
+import {
+  BACKEND_METRIC_CONSTRAINTS,
+  INDEX_TYPES,
+  MAX_ERROR_BODY_CHARS,
+  MAX_HNSW_EF,
+  MAX_HNSW_M,
+  MAX_SEARCH_EF,
+  MAX_SEARCH_K,
+  METRICS,
+  MIN_HNSW_EF,
+  MIN_HNSW_M,
+} from "./constants.js";
 import { HouyiResponseError, HouyidbMcpError } from "./errors.js";
 import type { HouyiClient } from "./houyi-client.js";
 import { truncateBody } from "./houyi-client.js";
-import { collectionPath } from "./paths.js";
+import {
+  adminCollectionPath,
+  collectionPath,
+  collectionRootPath,
+} from "./paths.js";
 
 /**
  * collection 名称本身不能为空；白名单校验在处理器里执行。
@@ -115,6 +130,39 @@ const upsertVectorSchema = z.object({
 });
 
 /**
+ * 建集合的 HNSW 参数三元组（与服务端边界一致；三个字段必须一起给）。
+ * EN: HNSW parameter triple for explicit creation (bounds match the server;
+ * the three fields must be supplied together).
+ */
+const hnswSchema = z
+  .object({
+    m: z
+      .number()
+      .int()
+      .min(MIN_HNSW_M)
+      .max(MAX_HNSW_M)
+      .describe(`HNSW m, ${MIN_HNSW_M}..${MAX_HNSW_M} / 邻居数`),
+    ef_construction: z
+      .number()
+      .int()
+      .min(MIN_HNSW_EF)
+      .max(MAX_HNSW_EF)
+      .describe(`HNSW ef_construction, ${MIN_HNSW_EF}..${MAX_HNSW_EF} / 构图束宽`),
+    ef_search: z
+      .number()
+      .int()
+      .min(MIN_HNSW_EF)
+      .max(MAX_HNSW_EF)
+      .describe(
+        `HNSW ef_search, ${MIN_HNSW_EF}..${MAX_HNSW_EF} at creation ` +
+          `(search-time requests cap at ${MAX_SEARCH_EF}) / 创建期 ef_search ` +
+          `（检索请求上限为 ${MAX_SEARCH_EF}）`,
+      ),
+  })
+  .optional()
+  .describe("Optional HNSW parameters (hnsw backend only) / 可选 HNSW 参数");
+
+/**
  * 把任意成功返回值包装成 MCP 文本结果。
  * EN: Wraps any successful value as an MCP text result.
  */
@@ -192,8 +240,8 @@ async function listAllowedCollections(
 }
 
 /**
- * 注册六类工具；只读模式只注册前四类，写工具根本不出现在 tools/list 中。
- * EN: Registers six tools; read-only mode registers only the first four, so
+ * 注册八类工具；只读模式只注册前四类，写工具根本不出现在 tools/list 中。
+ * EN: Registers eight tools; read-only mode registers only the first four, so
  * write tools never appear in tools/list at all.
  */
 export function registerTools(
@@ -340,6 +388,109 @@ export function registerTools(
       }),
   );
 
+  // 显式建集合：普通写路径（HOUYI_AUTH_TOKEN），不占用 HOUYI_ADMIN_TOKEN。
+  // 显式存在同名 collection 时服务端 409；metric/后端创建后不可变。
+  // EN: Explicit creation is a normal write path (HOUYI_AUTH_TOKEN) and does not
+  // consume HOUYI_ADMIN_TOKEN. The server returns 409 when the name exists;
+  // metric/backend are immutable after creation.
+  server.registerTool(
+    "create_collection",
+    {
+      title: "Create collection / 创建 collection",
+      description:
+        "Explicitly create a collection with fixed dims/metric/backend/HNSW " +
+        "parameters. Metric and backend are immutable afterwards; an existing " +
+        "name fails with 409. 显式创建 collection，一次定型维度、度量、后端与 " +
+        "HNSW 参数；度量与后端创建后不可变，同名已存在返回 409。",
+      inputSchema: {
+        collection: collectionSchema,
+        dims: z
+          .number()
+          .int()
+          .min(1)
+          .describe("Vector dimension / 向量维度"),
+        metric: z
+          .enum(METRICS)
+          .optional()
+          .describe(
+            "Distance metric (default cosine; pq-flat=l2, hii-l0=cosine) / " +
+              "距离度量（默认余弦；pq-flat=l2，hii-l0=cosine）",
+          ),
+        index_type: z
+          .enum(INDEX_TYPES)
+          .optional()
+          .describe("Index backend / 索引后端"),
+        hnsw: hnswSchema,
+      },
+      annotations: {
+        readOnlyHint: false,
+        destructiveHint: false,
+        idempotentHint: false,
+        openWorldHint: true,
+      },
+    },
+    ({ collection, dims, metric, index_type, hnsw }) =>
+      runTool(async () => {
+        assertCollectionAllowed(config, collection);
+        // 显式给出 index_type 时，本地先拒绝必然 400 的组合（服务端
+        // validate_create 同口径）：HNSW 参数只属于 hnsw 后端；pq-flat 仅
+        // L2、hii-l0 仅 Cosine（省略 metric 时按后端补默认）。省略
+        // index_type 但带 hnsw 参数时不推断、也不本地拒绝：把参数原样转发，
+        // 由服务端按部署的 default_index_type 解析（默认后端为 hnsw 时正常
+        // 创建，否则服务端自行 400），本地校验因此不会严于服务端契约
+        //（OCR 195e6be #02、cf1d19f #00）。本地拒绝统一用 HouyidbMcpError，
+        // 与模块其他预期失败保持同一分类（OCR 195e6be #03）。
+        // EN: When index_type is explicit, reject locally the combinations the
+        // server's validate_create would reject with 400: HNSW parameters
+        // belong to the hnsw backend only; pq-flat is L2-only and hii-l0 is
+        // Cosine-only (the backend default fills an omitted metric). When
+        // index_type is omitted but hnsw parameters are present, neither infer
+        // nor reject locally: forward them as-is and let the server resolve the
+        // deployment's default_index_type (normal creation when the default is
+        // hnsw, a server-side 400 otherwise), so local validation is never
+        // stricter than the server contract (OCR 195e6be #02, cf1d19f #00).
+        // Local rejections use HouyidbMcpError so expected failures share the
+        // module's taxonomy (OCR 195e6be #03).
+        if (
+          hnsw !== undefined &&
+          index_type !== undefined &&
+          index_type !== "hnsw"
+        ) {
+          throw new HouyidbMcpError(
+            `hnsw parameters are only supported for index_type "hnsw" (got "${index_type}") / ` +
+              `hnsw 参数只适用于 index_type "hnsw"（当前为 "${index_type}"）`,
+          );
+        }
+        const constrainedMetric =
+          index_type !== undefined
+            ? BACKEND_METRIC_CONSTRAINTS[index_type]
+            : undefined;
+        if (
+          constrainedMetric !== undefined &&
+          metric !== undefined &&
+          metric !== constrainedMetric
+        ) {
+          throw new HouyidbMcpError(
+            `index_type "${index_type}" only supports metric ` +
+              `"${constrainedMetric}" (got "${metric}") / 后端 ` +
+              `"${index_type}" 仅支持度量 "${constrainedMetric}"`,
+          );
+        }
+        const payload: Record<string, unknown> = { dims };
+        const effectiveMetric = metric ?? constrainedMetric;
+        if (effectiveMetric !== undefined) payload.metric = effectiveMetric;
+        if (index_type !== undefined) {
+          payload.index_type = index_type;
+        }
+        if (hnsw !== undefined) {
+          payload.hnsw_m = hnsw.m;
+          payload.hnsw_ef_construction = hnsw.ef_construction;
+          payload.hnsw_ef_search = hnsw.ef_search;
+        }
+        return client.put(collectionRootPath(collection), payload);
+      }),
+  );
+
   server.registerTool(
     "delete",
     {
@@ -380,6 +531,39 @@ export function registerTools(
           ids: idList,
           filters: filterList,
         });
+      }),
+  );
+
+  // 整库删除：不可逆，必须显式配置 HOUYI_ADMIN_TOKEN；仍受 collection 白名单约束。
+  // EN: Whole-collection drop: irreversible, requires HOUYI_ADMIN_TOKEN, and
+  // remains constrained by the collection allowlist.
+  server.registerTool(
+    "delete_collection",
+    {
+      title: "Delete collection / 删除整个 collection",
+      description:
+        "Drop an entire collection irreversibly (requires HOUYI_ADMIN_TOKEN). " +
+        "不可逆地删除整个 collection（需要 HOUYI_ADMIN_TOKEN）。",
+      inputSchema: {
+        collection: collectionSchema,
+      },
+      annotations: {
+        readOnlyHint: false,
+        destructiveHint: true,
+        idempotentHint: false,
+        openWorldHint: true,
+      },
+    },
+    ({ collection }) =>
+      runTool(async () => {
+        assertCollectionAllowed(config, collection);
+        if (config.adminToken === undefined) {
+          throw new HouyidbMcpError(
+            "delete_collection requires HOUYI_ADMIN_TOKEN to be configured. " +
+              "delete_collection 需要配置 HOUYI_ADMIN_TOKEN。",
+          );
+        }
+        return client.deleteAdmin(adminCollectionPath(collection));
       }),
   );
 }

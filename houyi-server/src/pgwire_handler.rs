@@ -981,12 +981,55 @@ async fn pgwire_collect_rows(
     }
 }
 
+/// SQLSTATE → 查询日志状态码：客户端错误类记 400，其余记 500。
+/// EN: SQLSTATE → query-log status: client-fault classes are 400, else 500.
+fn pgwire_log_status(sqlstate: &str) -> u16 {
+    match sqlstate.get(0..2) {
+        Some("0A" | "22" | "25" | "26" | "34" | "42") => 400,
+        _ => 500,
+    }
+}
+
+/// 记录一条 pgwire 查询（含主体、k、过滤标志）。关闭时零开销。
+/// EN: record one pgwire query (principal, k, filter flag); free when disabled.
+#[allow(clippy::too_many_arguments)]
+fn record_pgwire_query(
+    pg: Option<&PgWireSharedState>,
+    principal: Option<&crate::rbac::Principal>,
+    sql: &str,
+    status: u16,
+    latency_ms: f64,
+    result_count: usize,
+) {
+    let Some(log) = pg.as_ref().and_then(|pg| pg.query_log.as_ref()) else {
+        return;
+    };
+    log.record(crate::query_log::QueryLogEntry {
+        ts_ms: crate::query_log::now_ms(),
+        request_id: 0,
+        principal: principal
+            .map(|p| p.name.clone())
+            .unwrap_or_else(|| "-".to_string()),
+        route: "pgwire",
+        collection: houyi_query::extract_collection_directive(sql),
+        k: houyi_query::extract_limit_k(sql).unwrap_or(10),
+        status,
+        latency_ms,
+        result_count,
+        // 与规划器一致：任何 WHERE 都按过滤路径处理（含不可下推的谓词）。
+        // EN: mirrors the planner: any WHERE is treated as filtered, including
+        // non-pushdownable predicates.
+        filtered: sql.to_ascii_uppercase().contains("WHERE"),
+    });
+}
+
 /// 执行一条 SQL（Simple Query 与 Extended Execute 共用）。
 /// Execute one SQL statement (shared by Simple Query and extended Execute).
 async fn pgwire_dispatch_sql<S>(
     stream: &mut S,
     pg: Option<&PgWireSharedState>,
     sql: &str,
+    principal: Option<&crate::rbac::Principal>,
 ) -> std::io::Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -997,7 +1040,19 @@ where
     if let Some(tag) = pgwire_noop_command(sql) {
         return stream.write_all(&encode_command_complete(tag)).await;
     }
-    match pgwire_collect_rows(pg, sql).await {
+    // 查询日志（EE M1）：只记元数据，主体/K/过滤标志取自会话与 SQL。
+    // EN: query log (EE M1), metadata only; principal, k and the filter flag
+    // come from the session and the SQL.
+    let t0 = std::time::Instant::now();
+    let outcome = pgwire_collect_rows(pg, sql).await;
+    let latency_ms = t0.elapsed().as_secs_f64() * 1000.0;
+    match &outcome {
+        Ok((_, rows)) => record_pgwire_query(pg, principal, sql, 200, latency_ms, rows.len()),
+        Err((code, _)) => {
+            record_pgwire_query(pg, principal, sql, pgwire_log_status(code), latency_ms, 0)
+        }
+    }
+    match outcome {
         Ok((columns, rows)) => {
             let formats = vec![0; columns.len()];
             let row_description = encode_row_description_columns(&columns, &formats)
@@ -1549,7 +1604,7 @@ where
                     }
                 }
                 let t0 = std::time::Instant::now();
-                pgwire_dispatch_sql(stream, pg_ref, &sql).await?;
+                pgwire_dispatch_sql(stream, pg_ref, &sql, principal.as_ref()).await?;
                 let elapsed_ms = t0.elapsed().as_millis() as u64;
                 let threshold = metrics.slow_query_ms.load(Ordering::Relaxed);
                 if crate::types::slow_query_exceeded(elapsed_ms, threshold) {
@@ -2041,6 +2096,21 @@ where
                                 .await?;
                             continue;
                         }
+                        // 租约 fencing（EE M1）：与 HTTP 同一句柄；未开启租约要求
+                        // 时恒放行。25006 与只读副本同码——客户端语义一致。
+                        // EN: lease fencing (EE M1) shares the HTTP handle; a no-op
+                        // when leases are not required. 25006 matches follower
+                        // semantics for clients.
+                        if let Err(e) = state.cluster.check_writable() {
+                            stream
+                                .write_all(&encode_error_response(
+                                    "ERROR",
+                                    "25006",
+                                    &format!("read_only: {e}"),
+                                ))
+                                .await?;
+                            continue;
+                        }
                         // 路由：有 Collection 指令时走 Collection，否则走默认 index（向后兼容）
                         // EN: Routing: use a Collection when the directive is present, else the
                         // default index (backward compatible).
@@ -2055,16 +2125,32 @@ where
                         // under the write lock, last WAL LSN) for the post-lock sync
                         // wait; the main-index path is not replicated.
                         let coll_sync: Option<CollSyncWait> = if let Some(ref name) = coll_name {
-                            let (col, created) = state
+                            let col = state
                                 .collections
-                                .get_or_create_flagged(name, Some(batch.dim))
+                                .get_or_create(name, Some(batch.dim))
                                 .map_err(std::io::Error::other)?;
                             // 写互斥（与 HTTP 路径同纪律）：WAL append 与 insert_batch
                             // 同序，避免并发同 id 批次的 WAL/内存顺序分叉。
                             // EN: Write mutex, same discipline as the HTTP path — the
                             // WAL append and insert_batch share one order so
                             // concurrent same-id batches cannot diverge.
-                            let _write = col.write_lock.lock().await;
+                            // 删除竞态：SQLSTATE 40001（serialization_failure）——
+                            // 客户端可安全重试；与 HTTP 边界 409 同语义。
+                            // EN: Deletion race — SQLSTATE 40001 (serialization_failure),
+                            // safely retryable client-side; same semantics as HTTP 409.
+                            let _write = match col.begin_write().await {
+                                Ok(guard) => guard,
+                                Err(_) => {
+                                    stream
+                                        .write_all(&encode_error_response(
+                                            "ERROR",
+                                            "40001",
+                                            &format!("collection '{name}' is being deleted"),
+                                        ))
+                                        .await?;
+                                    continue;
+                                }
+                            };
                             // WAL-first（与 HTTP collection upsert 同纪律）：pgwire 批量
                             // 不携带 label/payload，items 只有 id+values。测试装配
                             // （collections_wal=None）跳过落盘。
@@ -2073,15 +2159,13 @@ where
                             // (collections_wal=None) skip persistence.
                             let mut last_wal_lsn = None;
                             if let Some(ref cw) = state.collections_wal {
-                                if created {
-                                    let payload = houyi_persistence::collection_wal::encode_collection_create(
-                                        name,
-                                        col.dims,
-                                        &col.index_type,
-                                    )
+                                // 建集合记录先于本批 upsert 落盘（首个写锁持有者负责，
+                                // 参数取自 collection 自身；详见 ensure_create_logged）。
+                                // EN: the create record precedes this upsert batch — the
+                                // first write-lock holder logs it from the collection's own
+                                // parameters (see ensure_create_logged).
+                                crate::collection::ensure_create_logged(cw, name, &col)
                                     .map_err(std::io::Error::other)?;
-                                    cw.append(payload)?;
-                                }
                                 let wal_items: Vec<
                                     houyi_persistence::collection_wal::CollectionWalItem,
                                 > = batch
@@ -2122,6 +2206,9 @@ where
                                 .insert_batch(batch.items)
                                 .await
                                 .map_err(std::io::Error::other)?;
+                            if let Some(lsn) = last_wal_lsn {
+                                col.note_applied_lsn(lsn);
+                            }
                             // 级别在 _write 锁内捕获（与 HTTP 同纪律）：定格在本写
                             // WAL LSN 处的在效级别，防并发 set_ha_level 降级抢语义。
                             // EN: Level captured inside the _write lock (same discipline as HTTP):
@@ -2238,6 +2325,14 @@ where
                     if conn.pending_portal.is_none() {
                         match pgwire_collect_rows(pg_ref, sql).await {
                             Ok((columns, rows)) => {
+                                record_pgwire_query(
+                                    pg_ref,
+                                    principal.as_ref(),
+                                    sql,
+                                    200,
+                                    t0.elapsed().as_secs_f64() * 1000.0,
+                                    rows.len(),
+                                );
                                 let elapsed_ms = t0.elapsed().as_millis() as u64;
                                 let threshold = metrics.slow_query_ms.load(Ordering::Relaxed);
                                 if crate::types::slow_query_exceeded(elapsed_ms, threshold) {
@@ -2288,6 +2383,14 @@ where
                                 });
                             }
                             Err((code, msg)) => {
+                                record_pgwire_query(
+                                    pg_ref,
+                                    principal.as_ref(),
+                                    sql,
+                                    pgwire_log_status(&code),
+                                    t0.elapsed().as_secs_f64() * 1000.0,
+                                    0,
+                                );
                                 stream
                                     .write_all(&encode_error_response("ERROR", &code, &msg))
                                     .await?;
@@ -2471,6 +2574,28 @@ mod search_limit_edge_tests {
             wal: None,
             collections_wal: None,
             role: crate::types::RoleState::default(),
+            cluster: std::sync::Arc::new(
+                crate::cluster::ClusterControl::open(
+                    &std::env::temp_dir()
+                        .join(format!(
+                            "houyi-pgwire-test-cluster-{}-{}-{}",
+                            std::process::id(),
+                            std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .unwrap()
+                                .as_nanos(),
+                            {
+                                static SEQ: std::sync::atomic::AtomicU64 =
+                                    std::sync::atomic::AtomicU64::new(0);
+                                SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                            }
+                        ))
+                        .join("test.wal"),
+                    false,
+                )
+                .expect("cluster control"),
+            ),
+            query_log: None,
         })
     }
 
@@ -2552,6 +2677,28 @@ mod quota_tests {
             wal: None,
             collections_wal: None,
             role: crate::types::RoleState::default(),
+            cluster: std::sync::Arc::new(
+                crate::cluster::ClusterControl::open(
+                    &std::env::temp_dir()
+                        .join(format!(
+                            "houyi-pgwire-test-cluster-{}-{}-{}",
+                            std::process::id(),
+                            std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .unwrap()
+                                .as_nanos(),
+                            {
+                                static SEQ: std::sync::atomic::AtomicU64 =
+                                    std::sync::atomic::AtomicU64::new(0);
+                                SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                            }
+                        ))
+                        .join("test.wal"),
+                    false,
+                )
+                .expect("cluster control"),
+            ),
+            query_log: None,
         })
     }
 

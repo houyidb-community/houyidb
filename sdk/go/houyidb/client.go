@@ -20,6 +20,9 @@ import (
 type Client struct {
 	baseURL    string
 	httpClient *http.Client
+	// adminToken 可选管理 token：只附在 /v1/admin/* 请求上。
+	// EN: adminToken is an optional admin token attached only to /v1/admin/* requests.
+	adminToken string
 }
 
 // ClientOption 客户端可选配置。
@@ -36,6 +39,18 @@ func WithTimeout(d time.Duration) ClientOption {
 // EN: WithHTTPClient injects a custom http.Client (proxy/transport customization).
 func WithHTTPClient(hc *http.Client) ClientOption {
 	return func(c *Client) { c.httpClient = hc }
+}
+
+// WithAdminToken 附加管理 token（空串等价于不配置）。
+//
+// token 只用于管理端点（如删除整个 collection）；未配置时管理请求照常发出，
+// 由服务端 401/403 决定，不在客户端 fail-fast（服务端可能未启用鉴权）。
+// EN: WithAdminToken attaches an admin token (empty means unset). It is used
+// only by admin endpoints (e.g. dropping a collection); when unset the request
+// still goes out and the server decides 401/403 — no client-side fail-fast,
+// since the server may run without auth.
+func WithAdminToken(token string) ClientOption {
+	return func(c *Client) { c.adminToken = token }
 }
 
 // NewClient 构造客户端；baseURL 缺省 "http://127.0.0.1:7000"。
@@ -99,6 +114,103 @@ func (c *Client) IndexStatus(ctx context.Context) (map[string]interface{}, error
 	return out, err
 }
 
+// HnswConfig 建集合时的 HNSW 参数三元组（必须三个全给，否则服务端 400）。
+// EN: HnswConfig is the HNSW parameter triple for explicit creation (all three
+// are required or the server returns 400).
+type HnswConfig struct {
+	M              int `json:"m"`
+	EFConstruction int `json:"ef_construction"`
+	EFSearch       int `json:"ef_search"`
+}
+
+// CreateCollectionOptions 显式建集合的选项（零值等价服务端默认：余弦 +
+// 默认后端 + 默认 HNSW）。metric 与后端创建后不可变，改参数只能删除重建。
+// EN: CreateCollectionOptions configures explicit creation (the zero value
+// equals server defaults: cosine, default backend, default HNSW). Metric and
+// backend are immutable after creation; changing them requires
+// drop-and-recreate.
+type CreateCollectionOptions struct {
+	// Metric l2 / cosine / ip / l1（大小写不敏感，服务端接受常用别名）。
+	// EN: l2/cosine/ip/l1 (case-insensitive; common aliases accepted).
+	Metric string
+	// IndexType 后端类型：hnsw / pq-flat / flat / clustered / flat-clustered / hii-l0。
+	// EN: IndexType is the backend kind: hnsw / pq-flat / flat / clustered /
+	// flat-clustered / hii-l0.
+	IndexType string
+	Hnsw      *HnswConfig
+}
+
+// CreateCollectionResult 建集合响应：服务端回显实际生效的参数。
+// EN: CreateCollectionResult is the creation response echoing the effective
+// parameters.
+type CreateCollectionResult struct {
+	Created    bool   `json:"created"`
+	Collection string `json:"collection"`
+	Dims       int    `json:"dims"`
+	Metric     string `json:"metric"`
+	IndexType  string `json:"index_type"`
+	// Hnsw 仅 IndexType == "hnsw" 时存在。
+	// EN: Hnsw is present only when IndexType == "hnsw".
+	Hnsw *HnswConfig `json:"hnsw,omitempty"`
+}
+
+// CreateCollection 显式创建 collection（可指定度量/后端/HNSW 参数；需要写权限）。
+//
+// 与隐式创建（首次 upsert）不同，dims、metric、后端与 HNSW 参数在这里一次
+// 定型并由服务端回显。普通写路径不携带管理 token；同名已存在 409、参数非法
+// 400、follower/只读 503。
+// EN: CreateCollection explicitly creates a collection (metric/backend/HNSW
+// parameters are settable; requires write permission). Unlike implicit
+// creation (first upsert), dims, metric, backend and HNSW parameters are fixed
+// here and echoed back. This is the normal write path and does not carry the
+// admin token; an existing name yields 409, invalid parameters 400, and
+// followers/read-only nodes 503.
+func (c *Client) CreateCollection(
+	ctx context.Context, name string, dims int, opts *CreateCollectionOptions,
+) (*CreateCollectionResult, error) {
+	payload := map[string]interface{}{"dims": dims}
+	if opts != nil {
+		if opts.Metric != "" {
+			payload["metric"] = opts.Metric
+		}
+		if opts.IndexType != "" {
+			payload["index_type"] = opts.IndexType
+		}
+		if opts.Hnsw != nil {
+			payload["hnsw_m"] = opts.Hnsw.M
+			payload["hnsw_ef_construction"] = opts.Hnsw.EFConstruction
+			payload["hnsw_ef_search"] = opts.Hnsw.EFSearch
+		}
+	}
+	var out CreateCollectionResult
+	err := c.put(ctx, "/v1/collections/"+url.PathEscape(name), payload, &out)
+	if err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
+// DeleteCollection 删除整个 collection（不可逆；需要 admin 权限）。
+//
+// 服务端 WAL-first：记录先落盘，崩溃重放与 follower 复制都收敛到「已删除」；
+// 不存在或已删除的 collection 返回 404。
+// EN: DeleteCollection drops an entire collection (irreversible; admin required).
+// The server is WAL-first, so crash replay and follower replication converge to
+// "gone"; an unknown/already-dropped collection yields 404.
+func (c *Client) DeleteCollection(ctx context.Context, name string) error {
+	path := "/v1/admin/collections/" + url.PathEscape(name)
+	req, err := http.NewRequestWithContext(ctx, http.MethodDelete, c.baseURL+path, nil)
+	if err != nil {
+		return err
+	}
+	// 管理请求才携带 Authorization；普通读写请求绝不上报 admin token。
+	// EN: only admin requests carry Authorization; normal calls never do.
+	if c.adminToken != "" {
+		req.Header.Set("Authorization", "Bearer "+c.adminToken)
+	}
+	return c.do(req, &struct{}{})
+}
+
 // ── 内部传输 ──────────────────────────────────────────
 // EN: Internal transport.
 
@@ -111,12 +223,22 @@ func (c *Client) get(ctx context.Context, path string, out interface{}) error {
 }
 
 func (c *Client) post(ctx context.Context, path string, payload, out interface{}) error {
+	return c.send(ctx, http.MethodPost, path, payload, out)
+}
+
+func (c *Client) put(ctx context.Context, path string, payload, out interface{}) error {
+	return c.send(ctx, http.MethodPut, path, payload, out)
+}
+
+func (c *Client) send(
+	ctx context.Context, method, path string, payload, out interface{},
+) error {
 	body, err := json.Marshal(payload)
 	if err != nil {
 		return err
 	}
 	req, err := http.NewRequestWithContext(
-		ctx, http.MethodPost, c.baseURL+path, bytes.NewReader(body),
+		ctx, method, c.baseURL+path, bytes.NewReader(body),
 	)
 	if err != nil {
 		return err

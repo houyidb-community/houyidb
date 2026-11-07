@@ -262,3 +262,102 @@ func TestDeleteRequiresIDsOrFilters(t *testing.T) {
 		t.Fatal("empty delete must fail")
 	}
 }
+
+// TestCreateCollectionMetricAndHnsw 显式建集合回显度量与 HNSW 三元组；同名再建 409。
+// EN: TestCreateCollectionMetricAndHnsw verifies the explicit-create echo of the
+// metric and HNSW triple, and that a second create of the same name yields 409.
+func TestCreateCollectionMetricAndHnsw(t *testing.T) {
+	client := newTestClient(t)
+	ctx := context.Background()
+	const name = "go_it_create_metric"
+	// 清理只容忍 404（从未创建）；其他错误直接失败。
+	// EN: Cleanup tolerates only 404 (never created); anything else fails.
+	var cleanupErr *HouyiError
+	if err := client.DeleteCollection(ctx, name); err != nil &&
+		(!errors.As(err, &cleanupErr) || cleanupErr.StatusCode != 404) {
+		t.Fatalf("cleanup delete: %v", err)
+	}
+
+	created, err := client.CreateCollection(ctx, name, testDims, &CreateCollectionOptions{
+		Metric:    "ip",
+		IndexType: "hnsw",
+		Hnsw:      &HnswConfig{M: 16, EFConstruction: 100, EFSearch: 32},
+	})
+	if err != nil {
+		t.Fatalf("create collection: %v", err)
+	}
+	if !created.Created || created.Collection != name || created.Dims != testDims {
+		t.Errorf("create echo = %+v, want created/%s/dims=%d", created, name, testDims)
+	}
+	if created.Metric != "ip" || created.IndexType != "hnsw" {
+		t.Errorf("metric/index_type = %q/%q, want ip/hnsw", created.Metric, created.IndexType)
+	}
+	if created.Hnsw == nil ||
+		created.Hnsw.M != 16 ||
+		created.Hnsw.EFConstruction != 100 ||
+		created.Hnsw.EFSearch != 32 {
+		t.Errorf("hnsw echo = %+v, want m=16 ef_construction=100 ef_search=32", created.Hnsw)
+	}
+
+	var conflictErr *HouyiError
+	if _, err := client.CreateCollection(ctx, name, testDims, nil); !errors.As(err, &conflictErr) {
+		t.Errorf("second create must fail with HouyiError, got %v", err)
+	} else if conflictErr.StatusCode != 409 {
+		t.Errorf("status = %d, want 409", conflictErr.StatusCode)
+	}
+}
+
+// TestDeleteCollectionAndRecreate 删除整库后 404；同名重建得到空 collection。
+// EN: TestDeleteCollectionAndRecreate drops a whole collection (404 afterwards)
+// and expects a same-name recreate to start empty.
+func TestDeleteCollectionAndRecreate(t *testing.T) {
+	client := newTestClient(t)
+	ctx := context.Background()
+	const name = "go_it_admin_drop"
+	col := client.Collection(name)
+	if _, err := col.Upsert(ctx, []Vector{
+		{ID: 7, Values: fakeEmbed("drop me"), Payload: map[string]interface{}{"tag": "drop"}},
+	}); err != nil {
+		t.Fatalf("upsert: %v", err)
+	}
+
+	if err := client.DeleteCollection(ctx, name); err != nil {
+		t.Fatalf("delete collection: %v", err)
+	}
+
+	var houyiErr *HouyiError
+	if _, err := col.Status(ctx); !errors.As(err, &houyiErr) {
+		t.Fatalf("expected HouyiError after drop, got %v", err)
+	} else if houyiErr.StatusCode != 404 {
+		t.Errorf("status = %d, want 404", houyiErr.StatusCode)
+	}
+
+	// 同名重建：首次写入隐式创建，旧向量不得复活。
+	// EN: recreate by name: the first write implicitly creates it and the old
+	// vectors must not reappear.
+	if _, err := col.Upsert(ctx, []Vector{{ID: 8, Values: fakeEmbed("fresh")}}); err != nil {
+		t.Fatalf("recreate: %v", err)
+	}
+	waitFlushed(t, ctx, col)
+	status, err := col.Status(ctx)
+	if err != nil {
+		t.Fatalf("status after recreate: %v", err)
+	}
+	if indexed, _ := status["indexed_count"].(float64); indexed != 1 {
+		t.Errorf("indexed_count = %v, want 1", status["indexed_count"])
+	}
+}
+
+// TestDeleteMissingCollection404 删除不存在的 collection 返回上游 404。
+// EN: TestDeleteMissingCollection404 expects the upstream 404 for an unknown
+// collection.
+func TestDeleteMissingCollection404(t *testing.T) {
+	client := newTestClient(t)
+	var houyiErr *HouyiError
+	err := client.DeleteCollection(context.Background(), "go_it_admin_never_created")
+	if !errors.As(err, &houyiErr) {
+		t.Fatalf("expected HouyiError, got %v", err)
+	} else if houyiErr.StatusCode != 404 {
+		t.Errorf("status = %d, want 404", houyiErr.StatusCode)
+	}
+}

@@ -1,4 +1,4 @@
-# HouyiDB Trial Manual (v0.2.0-beta.5)
+# HouyiDB Trial Manual (v0.2.0-beta.8)
 
 > [中文](USER_MANUAL.md)
 
@@ -19,8 +19,8 @@
 Prebuilt packages (macOS; one each for Apple Silicon and Intel):
 
 ```
-houyidb-0.2.0-beta.5-<date>-darwin-arm64/     # Apple Silicon (M1/M2/M3/M4)
-houyidb-0.2.0-beta.5-<date>-darwin-x86_64/    # Intel Mac
+houyidb-0.2.0-beta.8-<date>-darwin-arm64/     # Apple Silicon (M1/M2/M3/M4)
+houyidb-0.2.0-beta.8-<date>-darwin-x86_64/    # Intel Mac
 ├── bin/houyi-server          # 主服务（约 10MB，无外部 C 依赖）
 ├── scripts/trial_start.sh    # 一键启动（默认 17000/15432）
 ├── scripts/trial_smoke.sh    # 自检：写入/检索/过滤/删除
@@ -33,7 +33,7 @@ houyidb-0.2.0-beta.5-<date>-darwin-x86_64/    # Intel Mac
 └── sdk/python/               # Python 客户端 + LangChain/LlamaIndex 适配器
 ```
 
-Source package: `houyidb-0.2.0-beta.5-src.tar.gz` (any platform; includes the
+Source package: `houyidb-0.2.0-beta.8-src.tar.gz` (any platform; includes the
 Dockerfile and all SDKs).
 
 > Choose the prebuilt package by CPU architecture (`uname -m`: use the arm64
@@ -50,8 +50,8 @@ Use `darwin-arm64` on Apple Silicon (M series) and `darwin-x86_64` on Intel Macs
 
 ```bash
 uname -m        # arm64 → darwin-arm64；x86_64 → darwin-x86_64
-tar xzf houyidb-0.2.0-beta.5-*-darwin-<arch>.tar.gz
-cd houyidb-0.2.0-beta.5-*-darwin-<arch>
+tar xzf houyidb-0.2.0-beta.8-*-darwin-<arch>.tar.gz
+cd houyidb-0.2.0-beta.8-*-darwin-<arch>
 
 # If the binary was quarantined by Gatekeeper after network transfer, remove the quarantine first (a common issue with unsigned beta builds):
 xattr -dr com.apple.quarantine . 2>/dev/null || true
@@ -70,8 +70,8 @@ Once you see `HTTP : http://127.0.0.1:17000`, open another terminal:
 After extracting the source package:
 
 ```bash
-tar xzf houyidb-0.2.0-beta.5-src.tar.gz
-cd houyidb-0.2.0-beta.5-src
+tar xzf houyidb-0.2.0-beta.8-src.tar.gz
+cd houyidb-0.2.0-beta.8-src
 docker compose up -d --build        # 首次会编译 Rust，约 5–15 分钟
 curl http://127.0.0.1:7000/v1/health
 ```
@@ -92,8 +92,8 @@ curl http://127.0.0.1:7000/v1/health
 ### 1.3 Build from Source (requires Rust 1.87+)
 
 ```bash
-tar xzf houyidb-0.2.0-beta.5-src.tar.gz
-cd houyidb-0.2.0-beta.5-src
+tar xzf houyidb-0.2.0-beta.8-src.tar.gz
+cd houyidb-0.2.0-beta.8-src
 cargo build --release -p houyi-server
 ./scripts/trial_start.sh
 ```
@@ -118,7 +118,8 @@ HOUYI_TRIAL_PGWIRE_ADDR=127.0.0.1:16432 \
 ## 2. Five-Minute Quick Start (HTTP API)
 
 Data model: a **Collection** (similar to a table; created automatically on the
-first write, with dimensionality determined by the first batch of vectors)
+first write, with dimensionality determined by the first batch of vectors; it
+can also be created explicitly with `PUT` to fix dims/metric/backend up front)
 → each Collection holds `id + vector + label + payload`. `id` is `u64`;
 string ids can be deterministically hashed to u64 by the SDK.
 
@@ -143,6 +144,35 @@ curl -sS --noproxy '*' -X POST http://127.0.0.1:17000/v1/collections/goods/upser
   column `label`; a `label` key inside `payload` is rejected (400).
 - Single request body limit is 64MB; larger batches yield better throughput.
 
+### 2.1.1 Explicit Collection Creation (Optional)
+
+Implicit creation uses the server's default backend and metric (hnsw → cosine).
+When L2 / inner product / L1 or custom HNSW parameters are needed, fix everything
+at once with `PUT /v1/collections/{name}` (write permission, no admin token):
+
+```bash
+curl -sS --noproxy '*' -X PUT http://127.0.0.1:17000/v1/collections/goods \
+  -H 'Content-Type: application/json' -d '{
+  "dims": 8,
+  "metric": "ip",
+  "index_type": "hnsw",
+  "hnsw_m": 16, "hnsw_ef_construction": 100, "hnsw_ef_search": 64
+}'
+# 201 {"created":true,"collection":"goods","dims":8,"metric":"ip",
+#      "index_type":"hnsw","hnsw":{"m":16,"ef_construction":100,"ef_search":64}}
+```
+
+- `metric`: `l2` / `cosine` / `ip` / `l1`; omitted means the backend default.
+  **Immutable after creation**—changing it requires drop-and-recreate.
+- `index_type`: `hnsw` / `flat` / `clustered` / `flat-clustered` / `pq-flat` /
+  `hii-l0`; omitted means the server default. Support matrix: the first four
+  support all four metrics; `pq-flat` supports `l2` only; `hii-l0` supports
+  `cosine` only.
+- The three HNSW parameters must be supplied together (`m` 1..1024,
+  `ef_construction` / `ef_search` 1..65536) and only matter for the hnsw backend.
+- An existing name yields 409 (even with identical parameters); invalid
+  parameters 400; follower/read-only 503.
+
 ### 2.2 Vector Search
 
 ```bash
@@ -155,8 +185,11 @@ curl -sS --noproxy '*' -X POST http://127.0.0.1:17000/v1/collections/goods/searc
 # {"ids":[1,3,2],"scores":[...],"payloads":{"1":{...},"3":{...},"2":{...}}}
 ```
 
-- `scores` has the same length as `ids`; higher means more similar (the COSINE
-  backend returns `1 - cosine_distance`, clamped to `[-1,1]`).
+- `scores` has the same length as `ids`; higher means more similar, and the
+  conversion depends on the collection's `metric`: `cosine` → `1 -
+  cosine_distance` (clamped to `[-1,1]`); `l2` / `l1` → `1 - distance`
+  (unclamped); `ip` → the raw dot product (higher is more relevant). The
+  response also echoes the `metric` field.
 - `ef_search` is optional; higher values increase recall and latency.
 
 ### 2.3 Vector + Scalar Filtering (Hybrid Search)
@@ -191,6 +224,27 @@ curl -sS --noproxy '*' http://127.0.0.1:17000/v1/collections/goods/status
 Delete also supports `{"filters":[...]}` (delete by condition, unioned with
 explicit ids).
 
+### 2.4.1 Dropping a Whole Collection (admin, irreversible)
+
+```bash
+# With RBAC enabled use an admin token; omit Authorization when auth is off
+curl -sS --noproxy '*' -X DELETE \
+  -H "Authorization: Bearer $HOUYI_ADMIN_TOKEN" \
+  http://127.0.0.1:17000/v1/admin/collections/goods
+# {"deleted":true,"collection":"goods"}
+```
+
+- **Irreversible**: unconditional (no empty-collection requirement and no
+  second-confirmation flag). Export a backup first with
+  `GET /v1/collections/{name}/export`.
+- **Permission**: the path lives under `/v1/admin/*` and requires an admin
+  principal (`Action::Admin`); the audit log records actor/route/status.
+- **Durability and replication**: WAL-first (`collection_drop`), so crash replay
+  and followers converge to "gone"; a same-name upsert afterwards creates a
+  brand-new empty collection.
+- **Status codes**: unknown/already-dropped 404; delete races 409;
+  follower/read-only 503.
+
 ### 2.5 Other Common Endpoints
 
 | Endpoint | Purpose |
@@ -199,6 +253,9 @@ explicit ids).
 | `GET /readyz` | Readiness check (authentication exempt) |
 | `GET /v1/openapi.json` | OpenAPI document (can be pasted into Swagger UI) |
 | `GET /v1/collections` | List Collections |
+| `PUT /v1/collections/{name}` | Explicitly create a collection (write permission; fixes dims/metric/backend/HNSW in one shot) |
+| `GET /v1/collections/{name}/export` | Streaming NDJSON logical export (header/records/footer; backup/migration) |
+| `DELETE /v1/admin/collections/{name}` | Drop a whole collection (admin, irreversible, WAL-first) |
 | `GET /metrics` | Prometheus metrics (authentication exempt) |
 | `GET /v1/index/status` | Primary index (/v1/vectors path) status |
 | `POST /v1/optimize` | Drain the build queue / trigger compaction |
@@ -332,9 +389,11 @@ SELECT id FROM goods WHERE id IN (1, 3) LIMIT 3;
   written on shutdown (`HOUYI_SHUTDOWN_SNAPSHOT=0` disables it).
 - **Resetting trial data** (data will be lost): stop the service, then
   `rm -rf data/`.
-- Known limitation: the collections WAL **only grows and never shrinks**; there
-  is no compaction/truncation yet, so sustained heavy writes make the file grow
-  continuously (reset periodically during the trial phase).
+- The collections WAL uses **bounded retention** (P5.0): by default the oldest
+  whole segments are removed beyond 16 × 64 MiB, starting from the manifest's
+  safe checkpoint; followers pin the floor through their durable LSN. With a
+  clustered / flat-clustered / pq-flat collection present, retention stops at
+  the last floor and reports `blocked_reason` in `/v1/wal/status`.
 
 ---
 
@@ -417,12 +476,20 @@ HOUYI_TRIAL_HTTP_ADDR=0.0.0.0:17000 \
 
 - Single-node architecture, no sharding; high availability is leader/follower
   with manual promote, with no automatic leader election.
-- The collections WAL only grows and never shrinks (no compaction).
-- On repeated upserts, scalar pages are append-only and retain old rows;
-  search/filtering deduplicate by id. Array/object values in payload are treated
-  as JSON text columns, so filtering semantics are limited.
-- For the `pq-flat` backend, distances are L2 throughout the pipeline, and the
-  HTTP score is `1 − L2²` (unbounded).
+- The collections WAL has bounded retention (default 16 × 64 MiB). A follower
+  that falls behind the retained range receives `BEHIND_RETAINED` and must run
+  the full resync in `docs/runbooks/collections-retention-resync.md`; it never
+  wipes itself. Replication protocol v8 is not rolling-compatible across
+  versions, so upgrade all replicas together (see the server manual).
+- Scalar pages are checked every 10 minutes and compacted when at least 50% of
+  rows are stale; after compaction a filter matches only the last row per id
+  (previously stale rows could match too). clustered / flat-clustered / pq-flat
+  do not support snapshot compaction yet.
+- Array/object values in payload are treated as JSON text columns, so filtering
+  semantics are limited.
+- Backend/metric support matrix: hnsw / flat / clustered / flat-clustered
+  support l2/cosine/ip/l1; `pq-flat` supports `l2` only (HTTP score is
+  `1 − L2²`, unbounded); `hii-l0` supports `cosine` only.
 - HII L1 (GPU CAGRA) / L2 (NVMe DiskANN) are not implemented; `simd-avx512` is
   only a skeleton.
 - Filtered search is supported only by the hnsw / flat backends.

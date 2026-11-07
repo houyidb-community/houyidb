@@ -12,7 +12,7 @@ members = [
 resolver = "2"
 
 [workspace.package]
-version = "0.2.0-beta.5"
+version = "0.2.0-beta.8"
 edition = "2021"
 rust-version = "1.87"
 license = "Apache-2.0"
@@ -25,6 +25,9 @@ rayon = "1"
 parking_lot = "0.12"
 # 安全下限：1.54.1 修复 RUSTSEC-2026-0386（AsyncFd I/O safety）；不要只靠 lockfile。
 tokio = { version = "1.54.1", features = ["macros", "rt-multi-thread", "signal", "sync", "time", "net", "io-util"] }
+# 逻辑备份导出用 `stream::unfold` 惰性生成 NDJSON；只取 std 特性。
+# EN: lazy NDJSON streaming for logical export via `stream::unfold`; std only.
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
 axum = { version = "0.8", features = ["macros"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

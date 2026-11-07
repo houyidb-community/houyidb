@@ -27,3 +27,9 @@ obj/
 # Java/Gradle 构建产物
 .gradle/
 build/
+
+# 演练脚本共享库；全局 gitignore 默认忽略 lib/（Python 习惯），本仓库需要跟踪。
+# EN: Shared drill-script library; the global gitignore ignores lib/ (a Python
+# EN: convention), but this repository needs to track scripts/lib.
+!scripts/lib/
+!scripts/lib/**

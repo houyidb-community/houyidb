@@ -94,6 +94,10 @@ pub struct ClusteredHnsw {
     metric: DistanceMetric,
     num_clusters: usize,
     nprobe: usize,
+    /// 边界复制阈值（与构建期 `ClusterConfig::boundary_alpha` 一致；0 = 禁用）
+    /// EN: Boundary replication threshold (matches the build-time
+    /// `ClusterConfig::boundary_alpha`; 0 = disabled).
+    boundary_alpha: f32,
     centroids: Vec<f32>,
     clusters: Vec<RwLock<ClusterGraph>>,
     /// 已索引的向量总数（含边界复制）
@@ -178,6 +182,7 @@ impl ClusteredHnsw {
             metric,
             num_clusters: c,
             nprobe: config.nprobe.min(c),
+            boundary_alpha: alpha,
             centroids: km.centroids,
             clusters,
             total_indexed: AtomicUsize::new(total),
@@ -247,7 +252,15 @@ impl ClusteredHnsw {
     /// 插入单个向量（含边界检测 + 自动分裂检查）。
     /// EN: Insert one vector (with boundary detection + automatic split check).
     pub fn insert(&self, id: VectorId, vector: &[f32]) {
-        let alpha = 1.2; // default boundary alpha for insert
+        // 插入期与构建期使用同一 alpha、同一度量距离、同一判定函数：任何一侧
+        // 单独硬编码（旧插入路径曾固定 alpha=1.2 + 平方 L2 + 乘法判定）都会让
+        // IP/Cosine 下运行期写入的复制集合与构建期分叉（OCR 195e6be #04）。
+        // EN: Insert time uses the same alpha, metric-aware distances and predicate
+        // as build time; hardcoding on either side (the old insert path fixed
+        // alpha=1.2 with squared-L2 distances and the multiplicative test) makes
+        // runtime writes replicate differently from the build for IP/Cosine
+        // (OCR 195e6be #04).
+        let alpha = self.boundary_alpha;
         let (primary, secondary_opt) = boundary::find_two_nearest(
             vector,
             &self.centroids,
@@ -267,16 +280,18 @@ impl ClusteredHnsw {
 
         // 边界复制。
         // EN: Boundary replication.
-        if let (Some(sec), true) = (secondary_opt, alpha > 0.0) {
-            let d_primary = crate::distance::l2_squared(
+        if let Some(sec) = secondary_opt {
+            let d_primary = boundary::dist_fn(
+                self.metric,
                 vector,
                 &self.centroids[primary * self.dims..(primary + 1) * self.dims],
             );
-            let d_sec = crate::distance::l2_squared(
+            let d_sec = boundary::dist_fn(
+                self.metric,
                 vector,
                 &self.centroids[sec * self.dims..(sec + 1) * self.dims],
             );
-            if d_sec <= d_primary * alpha {
+            if boundary::is_boundary(d_primary, d_sec, alpha) {
                 let mut guard = self.clusters[sec].write();
                 guard.vector_ids.push(id);
                 guard.graph.insert(id, vector.to_vec());
@@ -439,6 +454,99 @@ mod tests {
         let avg_recall = total_recall / queries as f32;
         if avg_recall < 0.9 {
             panic!("clustered recall@{k} too low: {avg_recall:.3}");
+        }
+    }
+
+    #[test]
+    fn test_insert_boundary_replication_honors_alpha_and_metric() {
+        // 插入期必须复用构建期的 alpha/度量/判定：旧实现固定 alpha=1.2、用
+        // 平方 L2 距离和乘法判定，IP 下会漏复制或复制错聚类
+        // （OCR 195e6be #04）。
+        // EN: Insert time must reuse the build-time alpha/metric/predicate: the
+        // old implementation fixed alpha=1.2, used squared-L2 distances and the
+        // multiplicative test, so IP either missed replication or copied the
+        // wrong secondary (OCR 195e6be #04).
+        let dims = 2;
+        let make = |metric: DistanceMetric, alpha: f32| {
+            let clusters = (0..2)
+                .map(|id| {
+                    RwLock::new(ClusterGraph {
+                        id,
+                        vector_ids: Vec::new(),
+                        graph: HnswGraph::new(dims, metric, 16, 200, 128, id as u64, 10),
+                        split_threshold: usize::MAX,
+                    })
+                })
+                .collect();
+            ClusteredHnsw {
+                dims,
+                metric,
+                num_clusters: 2,
+                nprobe: 2,
+                boundary_alpha: alpha,
+                // c0=(1,0)、c1=(0.9,0.1)：v=(1,0) 时 IP 距离 d0=-1、d1=-0.9。
+                // EN: c0=(1,0), c1=(0.9,0.1): for v=(1,0), IP distances are d0=-1 and d1=-0.9.
+                centroids: vec![1.0, 0.0, 0.9, 0.1],
+                clusters,
+                total_indexed: AtomicUsize::new(0),
+                next_id: std::sync::atomic::AtomicU64::new(1),
+            }
+        };
+
+        // IP：加性余量 α=1.2 → 阈值 -0.8，d_sec=-0.9 命中，应复制到次聚类。
+        // EN: IP with the additive margin α=1.2 gives threshold -0.8; d_sec=-0.9
+        // hits it and must be replicated to the secondary cluster.
+        let ip = make(DistanceMetric::InnerProduct, 1.2);
+        ip.insert(1, &[1.0, 0.0]);
+        assert_eq!(ip.total_vectors(), 2, "IP boundary point must replicate");
+        assert!(ip.clusters[1].read().vector_ids.contains(&1));
+
+        // α=0 关闭复制：插入期必须遵循配置值，不能回退到硬编码 1.2。
+        // EN: α=0 disables replication: insert must honor the configured value
+        // instead of falling back to hardcoded 1.2.
+        let off = make(DistanceMetric::InnerProduct, 0.0);
+        off.insert(1, &[1.0, 0.0]);
+        assert_eq!(off.total_vectors(), 1);
+        assert!(off.clusters[1].read().vector_ids.is_empty());
+
+        // L2 并行性：服务端 build 的 α 恒为 0，真正走度量感知插入分支的是
+        // L2/Cosine 等非 IP 度量；断言插入期与 assign_with_boundary 的复制
+        // 判定逐例一致（OCR cf1d19f #04）。
+        // v=(0,1)：d0=2.0、d1=1.62 → 主聚类 c1。α=1.3 → 阈值 2.106 ≥ 2.0
+        // 复制；α=1.2 → 阈值 1.944 < 2.0 不复制。
+        // EN: L2 parity: the server always builds with α=0, so the only metrics
+        // that actually exercise the metric-aware insert branch are non-IP ones
+        // such as L2/Cosine; assert the insert decision matches
+        // `assign_with_boundary` case by case (OCR cf1d19f #04). For v=(0,1):
+        // d0=2.0, d1=1.62 → primary c1. α=1.3 gives threshold 2.106 ≥ 2.0
+        // (replicate); α=1.2 gives 1.944 < 2.0 (no replication).
+        for (alpha, expect_replicate) in [(1.3, true), (1.2, false)] {
+            let built = boundary::assign_with_boundary(
+                &[0.0, 1.0],
+                2,
+                &[1.0, 0.0, 0.9, 0.1],
+                alpha,
+                DistanceMetric::L2,
+            );
+            assert_eq!(built[0].primary, 1, "L2 primary must match build time");
+            let expected_secondaries: Vec<usize> = if expect_replicate {
+                vec![0]
+            } else {
+                Vec::new()
+            };
+            assert_eq!(
+                built[0].secondaries, expected_secondaries,
+                "build-time secondaries at α={alpha}"
+            );
+
+            let ch = make(DistanceMetric::L2, alpha);
+            ch.insert(1, &[0.0, 1.0]);
+            assert_eq!(
+                ch.clusters[0].read().vector_ids.contains(&1),
+                expect_replicate,
+                "insert must mirror build-time replication at α={alpha}"
+            );
+            assert_eq!(ch.total_vectors(), if expect_replicate { 2 } else { 1 });
         }
     }
 

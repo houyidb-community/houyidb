@@ -164,17 +164,17 @@ gradle publishAllPublicationsToLocalBuildRepository
 Go has no central package upload; tag the submodule after release:
 
 ```bash
-git tag sdk/go/houyidb/v0.2.0-beta.5
-git push origin sdk/go/houyidb/v0.2.0-beta.5
+git tag sdk/go/houyidb/v0.2.0-beta.8
+git push origin sdk/go/houyidb/v0.2.0-beta.8
 ```
 
 Users:
 
 ```bash
-go get github.com/houyidb-community/houyidb/sdk/go/houyidb@v0.2.0-beta.5
+go get github.com/houyidb-community/houyidb/sdk/go/houyidb@v0.2.0-beta.8
 ```
 
-> The root tag `v0.2.0-beta.5` is not the submodule version; use the
+> The root tag `v0.2.0-beta.8` is not the submodule version; use the
 > `sdk/go/houyidb/vX.Y.Z` form.
 
 ## 8. Post-Release Verification
@@ -199,7 +199,7 @@ npm install houyidb
 - Tokens live only in GitHub Secrets or local environment variables; never in
   the repository, logs, or screenshots.
 - Enable 2FA everywhere; use least-privilege tokens and rotate them.
-- Confirm version consistency before publishing: Python `0.2.0b5`,
-  npm/Java/.NET/Rust `0.2.0-beta.5`, Go tag `v0.2.0-beta.5`.
+- Confirm version consistency before publishing: Python `0.2.0b8`,
+  npm/Java/.NET/Rust `0.2.0-beta.8`, Go tag `v0.2.0-beta.8`.
 - Publishing is irreversible; run `./scripts/package_sdks.sh` and inspect
   `dist/sdk/` first.

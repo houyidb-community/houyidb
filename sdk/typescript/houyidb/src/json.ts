@@ -49,6 +49,13 @@ export function parseSearchResponse(raw: string): {
   ids?: Array<number | string>;
   scores?: number[];
   payloads?: Record<string, Record<string, unknown>>;
+  /**
+   * 本次检索使用的度量；benchmark 直连路径省略。有它调用方才能判断
+   * l2/l1/ip 的越界分数是否合法（OCR #30）。
+   * EN: Metric used by this search; omitted on the benchmark path. It lets
+   * callers judge whether out-of-range l2/l1/ip scores are legitimate (OCR #30).
+   */
+  metric?: string;
 } {
   const guarded = raw.replace(
     /("ids"\s*:\s*\[)([^\]]*)/,

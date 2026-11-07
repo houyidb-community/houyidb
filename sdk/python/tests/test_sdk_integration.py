@@ -7,7 +7,7 @@ upsert/search/hybrid/delete/include_payload.
 from __future__ import annotations
 
 import pytest
-from houyidb import Filter, HouyiClient, HouyiError, Vector, stable_id
+from houyidb import Filter, HouyiClient, HouyiError, HnswParams, Vector, stable_id
 
 from conftest import fake_embed, wait_flushed
 
@@ -134,4 +134,63 @@ def test_unknown_collection_status_404(base_url):
     c = HouyiClient(base_url).collection("no_such_collection_xyz")
     with pytest.raises(HouyiError) as exc_info:
         c.status()
+    assert exc_info.value.status_code == 404
+
+
+def test_create_collection_metric_and_hnsw(base_url):
+    """显式建集合回显度量与 HNSW 三元组；同名再建 409。
+    EN: Explicit creation echoes the metric and HNSW triple; a second create
+    of the same name yields 409.
+    """
+    client = HouyiClient(base_url)
+    name = "py_it_create_metric"
+    # 清理只容忍 404（从未创建）；其他错误直接让用例失败。
+    # EN: Cleanup tolerates only 404 (never created); anything else fails the test.
+    try:
+        client.delete_collection(name)
+    except HouyiError as exc:
+        assert exc.status_code == 404, exc
+    created = client.create_collection(
+        name,
+        16,
+        metric="ip",
+        index_type="hnsw",
+        hnsw=HnswParams(m=16, ef_construction=100, ef_search=32),
+    )
+    assert created["created"] is True
+    assert created["collection"] == name
+    assert created["metric"] == "ip"
+    assert created["index_type"] == "hnsw"
+    assert created["hnsw"] == {"m": 16, "ef_construction": 100, "ef_search": 32}
+    with pytest.raises(HouyiError) as exc_info:
+        client.create_collection(name, 16, metric="ip", index_type="hnsw")
+    assert exc_info.value.status_code == 409
+    client.delete_collection(name)
+
+
+def test_delete_collection_and_recreate(base_url):
+    """删除整库后 404；同名重建得到空 collection。
+    EN: Dropping a collection yields 404 afterwards; a same-name recreate
+    starts empty.
+    """
+    client = HouyiClient(base_url)
+    name = "py_it_admin_drop"
+    col = client.collection(name)
+    col.upsert([Vector(id=7, values=fake_embed("drop me"), payload={"tag": "drop"})])
+
+    client.delete_collection(name)
+
+    with pytest.raises(HouyiError) as exc_info:
+        col.status()
+    assert exc_info.value.status_code == 404
+
+    col.upsert([Vector(id=8, values=fake_embed("fresh"))])
+    wait_flushed(col)
+    assert col.status()["indexed_count"] == 1
+
+
+def test_delete_missing_collection_404(base_url):
+    client = HouyiClient(base_url)
+    with pytest.raises(HouyiError) as exc_info:
+        client.delete_collection("py_it_admin_never_created")
     assert exc_info.value.status_code == 404

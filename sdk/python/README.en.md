@@ -40,6 +40,33 @@ col.delete(filters=[Filter("price", "lt", 10)])                # 按条件（见
 
 LangChain / LlamaIndex usage is documented in each package's README.
 
+## Explicit Creation (Dims/Metric/Backend/HNSW Fixed Up Front)
+
+`PUT /v1/collections/{name}` is a normal write path (write permission, no admin
+token). Explicit creation locks dimensionality and metric: an existing name
+yields `HouyiError(status_code=409)`; metric/backend are immutable afterwards,
+and omitted fields take server defaults (`cosine` + `hnsw`).
+
+```python
+from houyidb import HnswParams
+
+created = client.create_collection(
+    "docs", 768,
+    metric="ip",          # l2 / cosine / ip / l1
+    index_type="hnsw",    # hnsw / flat / clustered / flat-clustered / pq-flat / hii-l0
+    hnsw=HnswParams(m=16, ef_construction=100, ef_search=64),
+)
+created["metric"]  # "ip"; the server echoes the effective parameters
+```
+
+Metric support matrix: `hnsw` / `flat` / `clustered` / `flat-clustered`
+support all four; `pq-flat` supports `l2` only; `hii-l0` supports `cosine`
+only.
+
+Search scores are metric-derived (higher means more similar): `cosine` →
+`1 - distance` in [-1, 1]; `l2` / `l1` → `1 - distance` (unclamped); `ip` →
+the raw dot product.
+
 ## Write Visibility (Dual-Speed Writes)
 
 Batch upserts first sit in the asynchronous graph-build queue (builder_queue) and become
@@ -70,6 +97,19 @@ resp = client.embeddings.create(
 resp.houyi  # {"collection": "docs", "upserted": 1} —— id = stable_id(text)，重跑幂等
 ```
 
+## Admin Operation: Dropping a Whole Collection (Irreversible)
+
+Requires server admin permission (RBAC `Action::Admin`). Deletion is WAL-first,
+so crash replay and follower replication converge to "gone". **Irreversible**;
+export via `GET /v1/collections/{name}/export` first. A same-name recreate starts
+empty and never resurrects old vectors. `admin_token` is attached only to
+`/v1/admin/*` requests; normal reads/writes never carry it.
+
+```python
+admin = HouyiClient(base_url, admin_token=admin_token)
+admin.delete_collection("docs")  # unknown → HouyiError(status_code=404)
+```
+
 ## Tests
 
 ```bash
@@ -90,4 +130,5 @@ cargo build --release -p houyi-server
 - The payload/metadata key `label` is a reserved column.
 - Filter operators are limited to `eq/gt/gte/lt/lte/in`, and multiple conditions are ANDed; only the hnsw/flat backends support
   filtering and deletion (other backends fail fast with 400).
-- delete is an in-memory operation (same semantics as scalar pages; not written to the WAL/snapshot).
+- Vector delete is an in-memory operation (same semantics as scalar pages; not written to the WAL/snapshot);
+  whole-collection `delete_collection` is an admin operation recorded in the WAL (`collection_drop`) and replicated to followers.

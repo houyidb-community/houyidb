@@ -21,7 +21,8 @@
 //! data in the hot buffer).
 
 use houyidb_client::{
-    stable_id, Client, Collection, Filter, FilterOp, HouyiError, SearchOptions, Vector,
+    stable_id, Client, Collection, CreateCollectionOptions, Filter, FilterOp, HnswConfig,
+    HouyiError, SearchOptions, Vector,
 };
 use std::collections::HashMap;
 use std::time::Duration;
@@ -353,4 +354,145 @@ fn collection_name_with_reserved_chars() {
     col.upsert(&vectors).expect("upsert to quoted collection");
     let deleted = col.delete(&[42], &[]).expect("cleanup");
     assert_eq!(deleted, 1);
+}
+
+/// 删除整个 collection：删除后 404，同名重建得到空 collection。
+/// EN: Dropping a whole collection: status becomes 404 afterwards, and a
+/// same-name recreate starts empty.
+#[test]
+fn delete_collection_and_recreate() {
+    let Some((client, col)) = connect("rust_it_admin_drop") else {
+        return;
+    };
+
+    col.upsert(&[Vector {
+        id: 7,
+        values: fake_embed("drop me"),
+        label: None,
+        payload: Some(payload(&[("tag", "drop".into())])),
+    }])
+    .expect("upsert");
+
+    client
+        .delete_collection("rust_it_admin_drop")
+        .expect("delete collection");
+
+    match col.status() {
+        Err(HouyiError::Http { status, .. }) => assert_eq!(status, 404),
+        other => panic!("expected HTTP 404 after drop, got {other:?}"),
+    }
+
+    // 同名重建：首次写入隐式创建，旧向量不得复活。
+    // EN: recreate by name: the first write implicitly creates it and the old
+    // vectors must not reappear.
+    col.upsert(&[Vector {
+        id: 8,
+        values: fake_embed("fresh"),
+        label: None,
+        payload: None,
+    }])
+    .expect("recreate");
+    wait_flushed(&col);
+    let status = col.status().expect("status after recreate");
+    assert_eq!(
+        status.get("indexed_count").and_then(|v| v.as_u64()),
+        Some(1),
+        "recreated collection must contain only the new vector"
+    );
+}
+
+/// 删除不存在的 collection 返回上游 404。
+/// EN: Dropping an unknown collection surfaces the upstream 404.
+#[test]
+fn delete_missing_collection_is_404() {
+    let Some((client, _)) = connect("rust_it_admin_missing") else {
+        return;
+    };
+    match client.delete_collection("rust_it_admin_never_created") {
+        Err(HouyiError::Http { status, .. }) => assert_eq!(status, 404),
+        other => panic!("expected HTTP 404 for unknown collection, got {other:?}"),
+    }
+}
+
+/// 显式建集合（IP 度量）：响应回显生效参数，检索分数为原始点积（越大越近）。
+/// EN: Explicit creation with the IP metric: the response echoes the effective
+/// parameters and search scores are raw dot products (larger = closer).
+#[test]
+fn create_collection_ip_metric_round_trip() {
+    let Some((client, col)) = connect("rust_it_create_ip") else {
+        return;
+    };
+
+    // 先删同名残留：同名已存在会 409，删除保证用例可重复运行。
+    // 清理只容忍 404（从未创建）；其他错误直接失败。
+    // EN: Drop any leftover same-name collection first: an existing name yields
+    // 409 on create, and deletion keeps the test rerun-safe. Cleanup tolerates
+    // only 404 (never created); anything else fails.
+    match client.delete_collection("rust_it_create_ip") {
+        Ok(()) | Err(HouyiError::Http { status: 404, .. }) => {}
+        Err(other) => panic!("cleanup delete failed: {other:?}"),
+    }
+
+    let created = client
+        .create_collection(
+            "rust_it_create_ip",
+            TEST_DIMS,
+            &CreateCollectionOptions {
+                metric: Some("ip".to_string()),
+                index_type: Some("hnsw".to_string()),
+                hnsw: Some(HnswConfig {
+                    m: 16,
+                    ef_construction: 100,
+                    ef_search: 64,
+                }),
+            },
+        )
+        .expect("explicit create");
+    assert!(created.created);
+    assert_eq!(created.collection, "rust_it_create_ip");
+    assert_eq!(created.dims, TEST_DIMS);
+    assert_eq!(created.metric, "ip");
+    assert_eq!(created.index_type, "hnsw");
+    let hnsw = created.hnsw.expect("hnsw parameters echoed");
+    assert_eq!(
+        (hnsw.m, hnsw.ef_construction, hnsw.ef_search),
+        (16, 100, 64)
+    );
+
+    // 两个共线向量：IP 分数等于原始点积，查询向量对长向量的分数更高。
+    // EN: Two collinear vectors: IP scores are the raw dot products, so the query
+    // scores higher against the longer vector.
+    let mut short = vec![0.0_f32; TEST_DIMS];
+    short[0] = 1.0;
+    let mut long = vec![0.0_f32; TEST_DIMS];
+    long[0] = 2.0;
+    col.upsert(&[
+        Vector {
+            id: 1,
+            values: short.clone(),
+            label: None,
+            payload: None,
+        },
+        Vector {
+            id: 2,
+            values: long,
+            label: None,
+            payload: None,
+        },
+    ])
+    .expect("upsert");
+    wait_flushed(&col);
+
+    let result = col
+        .search(&short, 2, &SearchOptions::default())
+        .expect("search");
+    assert_eq!(result.ids(), vec![2, 1], "IP ranks the larger dot first");
+    let scores = result.scores();
+    assert!(
+        (scores[0] - 2.0).abs() < 1e-5 && (scores[1] - 1.0).abs() < 1e-5,
+        "IP scores must be raw dot products, got {scores:?}"
+    );
+
+    let status = col.status().expect("status");
+    assert_eq!(status.get("metric").and_then(|v| v.as_str()), Some("ip"));
 }

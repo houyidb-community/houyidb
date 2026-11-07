@@ -31,7 +31,7 @@ func main() {
         Payload: map[string]interface{}{"text": "...", "category": "fruit"},
     }})
 
-    // 检索（Score 为相似度，越大越相似）
+    // 检索（Score 由度量换算、越大越相似，详见下文「显式建集合」）
     result, _ := col.Search(ctx, queryEmbedding, 5,
         &houyidb.SearchOptions{IncludePayload: true})
 
@@ -46,6 +46,44 @@ func main() {
     _, _ = col.Delete(ctx, &houyidb.DeleteOptions{IDs: []uint64{houyidb.StableID("doc-1")}})
 }
 ```
+
+## 显式建集合（维度/度量/后端/HNSW 一次定型）
+
+`PUT /v1/collections/{name}` 是普通写路径（写权限，不需要 admin token）。
+显式创建会锁定维度与度量：同名已存在返回 409，度量与后端创建后不可变；
+零值选项等价服务端默认（`cosine` + `hnsw`）。
+
+```go
+created, err := client.CreateCollection(ctx, "docs", 768, &houyidb.CreateCollectionOptions{
+    Metric:    "ip",   // l2 / cosine / ip / l1
+    IndexType: "hnsw", // hnsw / flat / clustered / flat-clustered / pq-flat / hii-l0
+    Hnsw:      &houyidb.HnswConfig{M: 16, EFConstruction: 100, EFSearch: 64},
+})
+// created.Metric == "ip"，created.Hnsw 回显实际生效的 HNSW 参数
+```
+
+度量支持矩阵：`hnsw` / `flat` / `clustered` / `flat-clustered` 支持全部四种；
+`pq-flat` 仅 `l2`；`hii-l0` 仅 `cosine`。
+
+检索分数按度量换算（越大越相似）：`cosine` → `1 - distance` ∈ [-1, 1]；
+`l2` / `l1` → `1 - distance`（不截断）；`ip` → 点积本身。
+
+## 管理操作：删除整个 collection（不可逆）
+
+需服务端管理员权限（RBAC `Action::Admin`）。删除走 WAL-first：崩溃重放与
+follower 复制都收敛到「已删除」。**不可逆**，删除前请先导出备份。同名重建
+得到全新的空 collection，旧向量不会复活。
+
+```go
+client := houyidb.NewClient(url, houyidb.WithAdminToken(adminToken))
+if err := client.DeleteCollection(ctx, "docs"); err != nil {
+    // 不存在 → *houyidb.HouyiError，StatusCode == 404
+}
+```
+
+EN: Admin-only on the server. WAL-first, so crash replay and follower
+replication converge to "gone". **Irreversible**; export first. A same-name
+recreate starts empty and never resurrects old vectors.
 
 ## 与其他语言 SDK 的对应
 

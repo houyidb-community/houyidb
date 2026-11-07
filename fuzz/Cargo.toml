@@ -70,3 +70,11 @@ path = "fuzz_targets/pgwire_message_decode.rs"
 test = false
 doc = false
 bench = false
+
+# 5) collections 快照 payload / manifest 解码（P5.0.5）
+[[bin]]
+name = "collection_snapshot_decode"
+path = "fuzz_targets/collection_snapshot_decode.rs"
+test = false
+doc = false
+bench = false

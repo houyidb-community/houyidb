@@ -3,16 +3,24 @@
   "info": {
     "title": "HouyiDB HTTP API",
     "version": "0.2.0-beta",
-    "description": "HouyiDB 向量数据库的 collections HTTP API。\n\n契约要点：\n- collection 在首次 upsert 时隐式创建，维度由首个向量定型；\n- 向量 id 为 u64 正整数键空间 [0, 2^63-1]；跨语言 SDK 的 `stable_id`（BLAKE2b-8 大端 & 2^63-1）可把任意字符串确定性映射进该空间，删除可跨 SDK 重放；\n- payload 键 `label` 为保留列，占用返回 400（请用顶层 `label` 字段）；\n- 检索响应的 `score` 是相似度（hnsw/flat/hii-l0 后端为 `1 - cosine_distance`，越大越相似）；\n- 双速写入：upsert 同步落标量页与 WAL，异步构图；检索对尚在队列中的向量不可见，`status.pending_count == 0` 后可见。\n- 错误响应为非 2xx + 纯文本诊断正文（text/plain）。",
-    "license": { "name": "Apache-2.0" }
+    "description": "HouyiDB 向量数据库的 collections HTTP API。\n\n契约要点：\n- collection 在首次 upsert 时隐式创建，维度由首个向量定型；\n- 向量 id 为 u64 正整数键空间 [0, 2^63-1]；跨语言 SDK 的 `stable_id`（BLAKE2b-8 大端 & 2^63-1）可把任意字符串确定性映射进该空间，删除可跨 SDK 重放；\n- payload 键 `label` 为保留列，占用返回 400（请用顶层 `label` 字段）；\n- collection 的度量（cosine/l2/ip/l1）在创建时定型、不可变；检索响应的 `score` 按度量换算（cosine → `1 - cosine_distance` ∈ [-1,1]；l2/l1 → `1 - distance`；ip → 原始点积；后三者为无界分数），越大越相似；\n- 双速写入：upsert 同步落标量页与 WAL，异步构图；检索对尚在队列中的向量不可见，`status.pending_count == 0` 后可见。\n- 错误响应为非 2xx + 纯文本诊断正文（text/plain）。",
+    "license": {
+      "name": "Apache-2.0"
+    }
   },
-  "servers": [{ "url": "http://127.0.0.1:7000" }],
+  "servers": [
+    {
+      "url": "http://127.0.0.1:7000"
+    }
+  ],
   "paths": {
     "/v1/health": {
       "get": {
         "operationId": "health",
         "summary": "服务健康检查",
-        "tags": ["meta"],
+        "tags": [
+          "meta"
+        ],
         "responses": {
           "200": {
             "description": "服务可用",
@@ -20,8 +28,17 @@
               "application/json": {
                 "schema": {
                   "type": "object",
-                  "properties": { "status": { "type": "string", "enum": ["ok"] } },
-                  "required": ["status"]
+                  "properties": {
+                    "status": {
+                      "type": "string",
+                      "enum": [
+                        "ok"
+                      ]
+                    }
+                  },
+                  "required": [
+                    "status"
+                  ]
                 }
               }
             }
@@ -33,13 +50,17 @@
       "get": {
         "operationId": "readyz",
         "summary": "就绪探针（与 /v1/health 存活探针分离）：索引可响应且待构图队列低于反压水位线",
-        "tags": ["meta"],
+        "tags": [
+          "meta"
+        ],
         "responses": {
           "200": {
             "description": "就绪",
             "content": {
               "application/json": {
-                "schema": { "$ref": "#/components/schemas/ReadyzResponse" }
+                "schema": {
+                  "$ref": "#/components/schemas/ReadyzResponse"
+                }
               }
             }
           },
@@ -47,7 +68,9 @@
             "description": "未就绪（待构图队列超水位线，摘流排空）",
             "content": {
               "application/json": {
-                "schema": { "$ref": "#/components/schemas/ReadyzResponse" }
+                "schema": {
+                  "$ref": "#/components/schemas/ReadyzResponse"
+                }
               }
             }
           }
@@ -58,11 +81,19 @@
       "get": {
         "operationId": "prometheusMetrics",
         "summary": "Prometheus 文本暴露端点（text/plain; version=0.0.4，8 个核心指标：hot_buffer / indexed_vectors / pending_build / flush_total / flushed_items_total / wal_active_bytes / pgwire_handshakes_total / pgwire_queries_total）",
-        "tags": ["meta"],
+        "tags": [
+          "meta"
+        ],
         "responses": {
           "200": {
             "description": "Prometheus text exposition format",
-            "content": { "text/plain": { "schema": { "type": "string" } } }
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           }
         }
       }
@@ -71,11 +102,19 @@
       "get": {
         "operationId": "openapiSpec",
         "summary": "本 OpenAPI 文档（内嵌于二进制，与版本同源）",
-        "tags": ["meta"],
+        "tags": [
+          "meta"
+        ],
         "responses": {
           "200": {
             "description": "OpenAPI 3.1 文档",
-            "content": { "application/json": { "schema": { "type": "object" } } }
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            }
           }
         }
       }
@@ -84,7 +123,9 @@
       "get": {
         "operationId": "listCollections",
         "summary": "列出全部 collection",
-        "tags": ["collections"],
+        "tags": [
+          "collections"
+        ],
         "responses": {
           "200": {
             "description": "collection 摘要数组",
@@ -92,7 +133,69 @@
               "application/json": {
                 "schema": {
                   "type": "array",
-                  "items": { "$ref": "#/components/schemas/CollectionInfo" }
+                  "items": {
+                    "$ref": "#/components/schemas/CollectionInfo"
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/collections/{name}": {
+      "put": {
+        "operationId": "createCollection",
+        "summary": "显式创建 collection（可指定度量与 HNSW 参数）",
+        "description": "度量与索引后端创建后不可变；变更需 DELETE 后重建（数据不保留）。不做「已存在则更新」：同名已存在返回 409。只读副本 503。",
+        "tags": [
+          "collections"
+        ],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/CollectionName"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateCollectionRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "创建成功",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CreateCollectionResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "409": {
+            "description": "同名 collection 已存在（collection '<name>' already exists）",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "follower/只读模式或 lease 过期，正文为纯文本诊断",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
                 }
               }
             }
@@ -104,13 +207,21 @@
       "post": {
         "operationId": "upsert",
         "summary": "写入一批向量（collection 首次写入时隐式创建）",
-        "tags": ["collections"],
-        "parameters": [{ "$ref": "#/components/parameters/CollectionName" }],
+        "tags": [
+          "collections"
+        ],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/CollectionName"
+          }
+        ],
         "requestBody": {
           "required": true,
           "content": {
             "application/json": {
-              "schema": { "$ref": "#/components/schemas/UpsertRequest" }
+              "schema": {
+                "$ref": "#/components/schemas/UpsertRequest"
+              }
             }
           }
         },
@@ -119,11 +230,15 @@
             "description": "插入条数",
             "content": {
               "application/json": {
-                "schema": { "$ref": "#/components/schemas/UpsertResponse" }
+                "schema": {
+                  "$ref": "#/components/schemas/UpsertResponse"
+                }
               }
             }
           },
-          "400": { "$ref": "#/components/responses/BadRequest" }
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          }
         }
       }
     },
@@ -131,13 +246,21 @@
       "post": {
         "operationId": "search",
         "summary": "纯向量 top-k 检索",
-        "tags": ["collections"],
-        "parameters": [{ "$ref": "#/components/parameters/CollectionName" }],
+        "tags": [
+          "collections"
+        ],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/CollectionName"
+          }
+        ],
         "requestBody": {
           "required": true,
           "content": {
             "application/json": {
-              "schema": { "$ref": "#/components/schemas/SearchRequest" }
+              "schema": {
+                "$ref": "#/components/schemas/SearchRequest"
+              }
             }
           }
         },
@@ -146,12 +269,18 @@
             "description": "按相似度从高到低排列的命中",
             "content": {
               "application/json": {
-                "schema": { "$ref": "#/components/schemas/SearchResponse" }
+                "schema": {
+                  "$ref": "#/components/schemas/SearchResponse"
+                }
               }
             }
           },
-          "400": { "$ref": "#/components/responses/BadRequest" },
-          "404": { "$ref": "#/components/responses/NotFound" }
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          }
         }
       }
     },
@@ -159,13 +288,21 @@
       "post": {
         "operationId": "hybridSearch",
         "summary": "向量 × 标量过滤的混合检索（filters 取交集，仅 hnsw/flat 后端）",
-        "tags": ["collections"],
-        "parameters": [{ "$ref": "#/components/parameters/CollectionName" }],
+        "tags": [
+          "collections"
+        ],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/CollectionName"
+          }
+        ],
         "requestBody": {
           "required": true,
           "content": {
             "application/json": {
-              "schema": { "$ref": "#/components/schemas/HybridSearchRequest" }
+              "schema": {
+                "$ref": "#/components/schemas/HybridSearchRequest"
+              }
             }
           }
         },
@@ -174,12 +311,18 @@
             "description": "按相似度从高到低排列的命中",
             "content": {
               "application/json": {
-                "schema": { "$ref": "#/components/schemas/SearchResponse" }
+                "schema": {
+                  "$ref": "#/components/schemas/SearchResponse"
+                }
               }
             }
           },
-          "400": { "$ref": "#/components/responses/BadRequest" },
-          "404": { "$ref": "#/components/responses/NotFound" }
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          }
         }
       }
     },
@@ -188,13 +331,21 @@
         "operationId": "delete",
         "summary": "按 id 和/或过滤条件删除（幂等；两者取并集）",
         "description": "按条件删除在标量页上同步求值，能命中刚写入、尚在异步构图队列中的向量——「先检索拿 id 再删」做不到这一点。",
-        "tags": ["collections"],
-        "parameters": [{ "$ref": "#/components/parameters/CollectionName" }],
+        "tags": [
+          "collections"
+        ],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/CollectionName"
+          }
+        ],
         "requestBody": {
           "required": true,
           "content": {
             "application/json": {
-              "schema": { "$ref": "#/components/schemas/DeleteRequest" }
+              "schema": {
+                "$ref": "#/components/schemas/DeleteRequest"
+              }
             }
           }
         },
@@ -203,12 +354,18 @@
             "description": "真实删除数（不存在的 id 静默跳过）",
             "content": {
               "application/json": {
-                "schema": { "$ref": "#/components/schemas/DeleteResponse" }
+                "schema": {
+                  "$ref": "#/components/schemas/DeleteResponse"
+                }
               }
             }
           },
-          "400": { "$ref": "#/components/responses/BadRequest" },
-          "404": { "$ref": "#/components/responses/NotFound" }
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          }
         }
       }
     },
@@ -216,18 +373,94 @@
       "get": {
         "operationId": "collectionStatus",
         "summary": "collection 状态",
-        "tags": ["collections"],
-        "parameters": [{ "$ref": "#/components/parameters/CollectionName" }],
+        "tags": [
+          "collections"
+        ],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/CollectionName"
+          }
+        ],
         "responses": {
           "200": {
             "description": "状态快照",
             "content": {
               "application/json": {
-                "schema": { "$ref": "#/components/schemas/CollectionStatus" }
+                "schema": {
+                  "$ref": "#/components/schemas/CollectionStatus"
+                }
               }
             }
           },
-          "404": { "$ref": "#/components/responses/NotFound" }
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          }
+        }
+      }
+    },
+    "/v1/collections/{name}/compact": {
+      "post": {
+        "operationId": "collectionCompact",
+        "summary": "标量页内存压实（管理端点；不写 WAL）",
+        "tags": [
+          "collections"
+        ],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/CollectionName"
+          }
+        ],
+        "requestBody": {
+          "required": false,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "force": {
+                    "type": "boolean",
+                    "default": false,
+                    "description": "忽略 stale 比例阈值强制压实"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "压实结果",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "collection": {
+                      "type": "string"
+                    },
+                    "physical_before": {
+                      "type": "integer"
+                    },
+                    "physical_after": {
+                      "type": "integer"
+                    },
+                    "dropped_rows": {
+                      "type": "integer"
+                    },
+                    "skipped_reason": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          }
         }
       }
     },
@@ -235,13 +468,18 @@
       "get": {
         "operationId": "indexStatus",
         "summary": "主索引双速写入指标（hot/pending/flush_count 等，可观测性用）",
-        "tags": ["meta"],
+        "tags": [
+          "meta"
+        ],
         "responses": {
           "200": {
             "description": "指标快照（字段随版本演进，按宽松 object 消费）",
             "content": {
               "application/json": {
-                "schema": { "type": "object", "additionalProperties": true }
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true
+                }
               }
             }
           }
@@ -252,13 +490,25 @@
       "get": {
         "operationId": "walStatus",
         "summary": "WAL 状态",
-        "tags": ["meta"],
+        "tags": [
+          "meta"
+        ],
         "responses": {
           "200": {
             "description": "WAL 状态快照",
             "content": {
               "application/json": {
-                "schema": { "type": "object", "additionalProperties": true }
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true,
+                  "properties": {
+                    "collections": {
+                      "type": "object",
+                      "additionalProperties": true,
+                      "description": "collections WAL 段/快照/保留视图（P5.0.3）"
+                    }
+                  }
+                }
               }
             }
           }
@@ -270,12 +520,16 @@
         "operationId": "embeddings",
         "summary": "OpenAI 兼容 embeddings 网关（代理上游 + 自动入库）",
         "description": "请求/响应形状与 OpenAI `/v1/embeddings` 一致（把 base URL 从 OpenAI 换成 HouyiDB 即可）。需以 ENV `HOUYI_OPENAI_UPSTREAM`（上游 base URL）与 `HOUYI_OPENAI_API_KEY` 配置上游；未配置返回 501。文本经 BLAKE2b-8 stable_id 定型为向量 id 后自动 upsert 进对应 collection，删除可跨 SDK 重放。",
-        "tags": ["gateway"],
+        "tags": [
+          "gateway"
+        ],
         "requestBody": {
           "required": true,
           "content": {
             "application/json": {
-              "schema": { "$ref": "#/components/schemas/EmbeddingsRequest" }
+              "schema": {
+                "$ref": "#/components/schemas/EmbeddingsRequest"
+              }
             }
           }
         },
@@ -284,12 +538,849 @@
             "description": "OpenAI embeddings 响应（原样透传上游）",
             "content": {
               "application/json": {
-                "schema": { "$ref": "#/components/schemas/EmbeddingsResponse" }
+                "schema": {
+                  "$ref": "#/components/schemas/EmbeddingsResponse"
+                }
               }
             }
           },
-          "400": { "$ref": "#/components/responses/BadRequest" },
-          "501": { "$ref": "#/components/responses/NotImplemented" }
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "501": {
+            "$ref": "#/components/responses/NotImplemented"
+          }
+        }
+      }
+    },
+    "/v1/admin/collections/compact": {
+      "post": {
+        "operationId": "adminCollectionsCompact",
+        "summary": "collections 快照周期（可选轮转）→ 段保留（管理端点）",
+        "tags": [
+          "admin"
+        ],
+        "requestBody": {
+          "required": false,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "rotate": {
+                    "type": "boolean",
+                    "default": false,
+                    "description": "manifest 提交后轮转活动段"
+                  },
+                  "hold_retention_secs": {
+                    "type": [
+                      "integer",
+                      "null"
+                    ],
+                    "description": "保留租约秒数（人工备份/重同步窗口）"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "快照/保留结果",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "follower 只读，正文为纯文本诊断",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "请求体非法（JSON 解析/反序列化失败），正文为纯文本诊断",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "operationId": "adminCollectionDropCompactNamed",
+        "summary": "删除名为 compact 的 collection（不可逆；管理员权限）",
+        "description": "静态段优先于 {name}：DELETE /v1/admin/collections/compact 删除名字恰为 compact 的 collection，语义与 adminCollectionDrop 相同（WAL-first、follower 收敛、同名重建为空）。",
+        "tags": [
+          "admin"
+        ],
+        "responses": {
+          "200": {
+            "description": "删除成功",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "deleted",
+                    "collection"
+                  ],
+                  "properties": {
+                    "deleted": {
+                      "type": "boolean",
+                      "enum": [
+                        true
+                      ]
+                    },
+                    "collection": {
+                      "type": "string",
+                      "description": "被删除的 collection 名（固定为 compact）"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "主体非 admin（RBAC 中间件拒绝）",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "description": "collection 已被并发删除（collection 'compact' is being deleted）",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "follower/只读模式，正文为纯文本诊断",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/admin/collections/{name}": {
+      "delete": {
+        "operationId": "adminCollectionDrop",
+        "summary": "无条件删除整个 collection（不可逆；管理员权限）",
+        "description": "WAL-first：先追加 collection_drop 记录再移除内存对象；崩溃重放与 follower 复制都会收敛到「已删除」。同名重建得到全新的空 collection。",
+        "tags": [
+          "admin"
+        ],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/CollectionName"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "删除成功",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "deleted",
+                    "collection"
+                  ],
+                  "properties": {
+                    "deleted": {
+                      "type": "boolean",
+                      "enum": [
+                        true
+                      ]
+                    },
+                    "collection": {
+                      "type": "string",
+                      "description": "被删除的 collection 名"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "主体非 admin（RBAC 中间件拒绝）",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "description": "collection 已被并发删除（collection '<name>' is being deleted）",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "follower/只读模式，正文为纯文本诊断",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/version": {
+      "get": {
+        "tags": [
+          "Admin"
+        ],
+        "summary": "Version and capability probe (EE clients)",
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "name": {
+                      "type": "string"
+                    },
+                    "version": {
+                      "type": "string"
+                    },
+                    "api": {
+                      "type": "string"
+                    },
+                    "capabilities": {
+                      "type": "array",
+                      "items": {
+                        "type": "string"
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/admin/lease": {
+      "get": {
+        "tags": [
+          "Admin"
+        ],
+        "summary": "Leader lease status and limits",
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "term": {
+                      "type": "integer",
+                      "format": "int64"
+                    },
+                    "lease": {
+                      "$ref": "#/components/schemas/LeaseStatus"
+                    },
+                    "require_leader_lease": {
+                      "type": "boolean"
+                    },
+                    "max_ttl_ms": {
+                      "type": "integer",
+                      "format": "int64"
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      },
+      "post": {
+        "tags": [
+          "Admin"
+        ],
+        "summary": "Grant or renew the leader lease",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "term": {
+                    "type": "integer",
+                    "format": "int64"
+                  },
+                  "ttl_ms": {
+                    "type": "integer",
+                    "format": "int64"
+                  }
+                },
+                "required": [
+                  "term",
+                  "ttl_ms"
+                ]
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/LeaseGrant"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "tags": [
+          "Admin"
+        ],
+        "summary": "Revoke the leader lease (role unchanged)",
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "revoked": {
+                      "type": "boolean"
+                    },
+                    "term": {
+                      "type": "integer",
+                      "format": "int64"
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/admin/promote": {
+      "post": {
+        "tags": [
+          "Admin"
+        ],
+        "summary": "Promote a follower to leader (optionally with a lease)",
+        "requestBody": {
+          "required": false,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "term": {
+                    "type": "integer",
+                    "format": "int64"
+                  },
+                  "ttl_ms": {
+                    "type": "integer",
+                    "format": "int64"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "promoted": {
+                      "type": "boolean"
+                    },
+                    "next_lsn": {
+                      "type": "integer",
+                      "format": "int64"
+                    },
+                    "term": {
+                      "type": "integer",
+                      "format": "int64"
+                    },
+                    "lease": {
+                      "oneOf": [
+                        {
+                          "$ref": "#/components/schemas/LeaseGrant"
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ]
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/admin/demote": {
+      "post": {
+        "tags": [
+          "Admin"
+        ],
+        "summary": "Demote the leader (read-only detached, or rejoin as a follower via follower_of)",
+        "requestBody": {
+          "required": false,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "term": {
+                    "type": "integer",
+                    "format": "int64"
+                  },
+                  "follower_of": {
+                    "type": "string",
+                    "description": "Replication address (host:port) of the new leader; when set the demoted node converts back into a follower at runtime."
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "demoted": {
+                      "type": "boolean"
+                    },
+                    "already": {
+                      "type": "boolean"
+                    },
+                    "role": {
+                      "type": "string"
+                    },
+                    "term": {
+                      "type": "integer",
+                      "format": "int64"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/admin/replication/status": {
+      "get": {
+        "tags": [
+          "Admin"
+        ],
+        "summary": "Replication status: role, term, lease, followers, lag",
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "role": {
+                      "type": "string",
+                      "enum": [
+                        "disabled",
+                        "leader",
+                        "follower"
+                      ]
+                    },
+                    "term": {
+                      "type": "integer",
+                      "format": "int64"
+                    },
+                    "lease": {
+                      "$ref": "#/components/schemas/LeaseStatus"
+                    },
+                    "next_lsn": {
+                      "type": "integer",
+                      "format": "int64"
+                    },
+                    "first_available_lsn": {
+                      "type": [
+                        "integer",
+                        "null"
+                      ],
+                      "format": "int64"
+                    },
+                    "leader": {
+                      "type": "object",
+                      "additionalProperties": true
+                    },
+                    "follower": {
+                      "type": "object",
+                      "additionalProperties": true
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/admin/whoami": {
+      "get": {
+        "tags": [
+          "Admin"
+        ],
+        "summary": "Current principal (anonymous when auth is disabled)",
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "authenticated": {
+                      "type": "boolean"
+                    },
+                    "name": {
+                      "type": "string"
+                    },
+                    "role": {
+                      "type": "string"
+                    },
+                    "collections": {
+                      "type": [
+                        "array",
+                        "null"
+                      ],
+                      "items": {
+                        "type": "string"
+                      }
+                    },
+                    "max_collections": {
+                      "type": [
+                        "integer",
+                        "null"
+                      ]
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/admin/diagnostics": {
+      "get": {
+        "tags": [
+          "Admin"
+        ],
+        "summary": "Structured diagnostics (no secrets or vectors)",
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/admin/query-log": {
+      "get": {
+        "tags": [
+          "Admin"
+        ],
+        "summary": "Recent queries (metadata only)",
+        "parameters": [
+          {
+            "name": "since",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int64"
+            }
+          },
+          {
+            "name": "collection",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "min_ms",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "number"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "enabled": {
+                      "type": "boolean"
+                    },
+                    "capacity": {
+                      "type": [
+                        "integer",
+                        "null"
+                      ]
+                    },
+                    "entries": {
+                      "type": "array",
+                      "items": {
+                        "$ref": "#/components/schemas/QueryLogEntry"
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        },
+        "description": "Completed and failed queries (metadata only). Vector/payload/SQL text is never recorded."
+      }
+    },
+    "/v1/admin/query-stats": {
+      "get": {
+        "tags": [
+          "Admin"
+        ],
+        "summary": "Per-collection query counts and latency percentiles",
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "enabled": {
+                      "type": "boolean"
+                    },
+                    "stats": {
+                      "type": "object",
+                      "additionalProperties": true
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/collections/{name}/export": {
+      "get": {
+        "operationId": "collectionExport",
+        "summary": "流式 NDJSON 逻辑导出（备份/迁移）：header + records + footer",
+        "tags": [
+          "collections"
+        ],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/CollectionName"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "NDJSON 流：header/records/footer，记录按 id 升序",
+            "content": {
+              "application/x-ndjson": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "集合不在主体作用域内"
+          },
+          "404": {
+            "description": "集合不存在"
+          },
+          "500": {
+            "description": "导出失败"
+          }
         }
       }
     }
@@ -301,21 +1392,41 @@
         "in": "path",
         "required": true,
         "description": "collection 名（URL 路径段须按 RFC 3986 转义）",
-        "schema": { "type": "string" }
+        "schema": {
+          "type": "string"
+        }
       }
     },
     "responses": {
       "BadRequest": {
         "description": "请求非法（维度不符 / k 越界 / op 白名单外 / 字面值形状错误 / 保留列占用等），正文为纯文本诊断",
-        "content": { "text/plain": { "schema": { "type": "string" } } }
+        "content": {
+          "text/plain": {
+            "schema": {
+              "type": "string"
+            }
+          }
+        }
       },
       "NotFound": {
         "description": "collection 不存在，正文为纯文本诊断",
-        "content": { "text/plain": { "schema": { "type": "string" } } }
+        "content": {
+          "text/plain": {
+            "schema": {
+              "type": "string"
+            }
+          }
+        }
       },
       "NotImplemented": {
         "description": "OpenAI 网关未配置上游（HOUYI_OPENAI_UPSTREAM 未设置）",
-        "content": { "text/plain": { "schema": { "type": "string" } } }
+        "content": {
+          "text/plain": {
+            "schema": {
+              "type": "string"
+            }
+          }
+        }
       }
     },
     "schemas": {
@@ -323,54 +1434,343 @@
         "type": "object",
         "description": "就绪探针响应：200 时 status=ready，503 时 status=not_ready（字段同形，摘流期间仍可观测积压归因）",
         "properties": {
-          "status": { "type": "string", "enum": ["ready", "not_ready"] },
-          "pending_build": { "type": "integer" },
-          "hot_buffer": { "type": "integer" },
-          "indexed": { "type": "integer" },
-          "watermark": { "type": "integer" }
+          "status": {
+            "type": "string",
+            "enum": [
+              "ready",
+              "not_ready"
+            ]
+          },
+          "pending_build": {
+            "type": "integer"
+          },
+          "hot_buffer": {
+            "type": "integer"
+          },
+          "indexed": {
+            "type": "integer"
+          },
+          "watermark": {
+            "type": "integer"
+          }
         },
-        "required": ["status", "pending_build", "hot_buffer", "indexed", "watermark"]
+        "required": [
+          "status",
+          "pending_build",
+          "hot_buffer",
+          "indexed",
+          "watermark"
+        ]
       },
       "CollectionInfo": {
         "type": "object",
         "properties": {
-          "name": { "type": "string" },
-          "dims": { "type": "integer" },
-          "index_type": { "type": "string", "example": "hnsw" },
-          "vectors": { "type": "integer" }
+          "name": {
+            "type": "string"
+          },
+          "dims": {
+            "type": "integer"
+          },
+          "index_type": {
+            "type": "string",
+            "example": "hnsw"
+          },
+          "metric": {
+            "type": "string",
+            "enum": [
+              "l2",
+              "cosine",
+              "ip",
+              "l1"
+            ],
+            "description": "创建时定型的距离度量（不可变）"
+          },
+          "hnsw": {
+            "type": "object",
+            "description": "仅 hnsw 后端返回的创建时参数（不可变）；其余后端省略",
+            "properties": {
+              "m": {
+                "type": "integer"
+              },
+              "ef_construction": {
+                "type": "integer"
+              },
+              "ef_search": {
+                "type": "integer"
+              }
+            },
+            "required": [
+              "m",
+              "ef_construction",
+              "ef_search"
+            ]
+          },
+          "vectors": {
+            "type": "integer"
+          },
+          "ha_level": {
+            "type": "string",
+            "enum": [
+              "async",
+              "semi_sync",
+              "full_sync"
+            ],
+            "description": "只读展示的复制级别；变更走 POST /v1/collections/{name}/ha_level (WAL-first)"
+          }
         },
-        "required": ["name", "dims", "index_type", "vectors"]
+        "required": [
+          "name",
+          "dims",
+          "index_type",
+          "vectors",
+          "ha_level"
+        ]
       },
       "CollectionStatus": {
         "type": "object",
         "properties": {
-          "name": { "type": "string" },
-          "indexed_count": { "type": "integer", "description": "已入图向量数" },
-          "pending_count": { "type": "integer", "description": "异步构图队列中待处理数；归零后检索可见" },
-          "dims": { "type": "integer" },
-          "index_type": { "type": "string" },
-          "scalar_row_count": { "type": "integer", "description": "标量页行数（仅携带 label/payload 的向量建行）" }
+          "name": {
+            "type": "string"
+          },
+          "indexed_count": {
+            "type": "integer",
+            "description": "已入图向量数"
+          },
+          "pending_count": {
+            "type": "integer",
+            "description": "异步构图队列中待处理数；归零后检索可见"
+          },
+          "dims": {
+            "type": "integer"
+          },
+          "index_type": {
+            "type": "string"
+          },
+          "metric": {
+            "type": "string",
+            "enum": [
+              "l2",
+              "cosine",
+              "ip",
+              "l1"
+            ],
+            "description": "创建时定型的距离度量（不可变）"
+          },
+          "hnsw": {
+            "type": "object",
+            "description": "仅 hnsw 后端返回的创建时参数（不可变）；其余后端省略",
+            "properties": {
+              "m": {
+                "type": "integer"
+              },
+              "ef_construction": {
+                "type": "integer"
+              },
+              "ef_search": {
+                "type": "integer"
+              }
+            },
+            "required": [
+              "m",
+              "ef_construction",
+              "ef_search"
+            ]
+          },
+          "applied_lsn": {
+            "type": "integer",
+            "format": "uint64",
+            "description": "已成功应用的 collections WAL LSN（快照 checkpoint 上界）"
+          },
+          "scalar_row_count": {
+            "type": "integer",
+            "description": "标量页物理行数（含 stale/墓碑行）"
+          },
+          "scalar_physical_rows": {
+            "type": "integer",
+            "description": "标量页物理行数（含 stale/墓碑行）"
+          },
+          "scalar_live_rows": {
+            "type": "integer",
+            "description": "去重后的可见 id 数"
+          },
+          "scalar_stale_rows": {
+            "type": "integer",
+            "description": "不贡献可见 id 的物理行数"
+          },
+          "scalar_tombstone_ids": {
+            "type": "integer",
+            "description": "标量墓碑 id 数"
+          },
+          "last_compaction_unix": {
+            "type": "integer",
+            "format": "uint64",
+            "description": "最近一次成功压实的 Unix 秒（0=从未）"
+          },
+          "last_compaction_dropped_rows": {
+            "type": "integer",
+            "format": "uint64",
+            "description": "最近一次压实丢弃的行数"
+          },
+          "ha_level": {
+            "type": "string",
+            "enum": [
+              "async",
+              "semi_sync",
+              "full_sync"
+            ],
+            "description": "只读展示的复制级别；变更走 POST /v1/collections/{name}/ha_level (WAL-first)"
+          }
         },
-        "required": ["name", "indexed_count", "pending_count", "dims", "index_type", "scalar_row_count"]
+        "required": [
+          "name",
+          "indexed_count",
+          "pending_count",
+          "dims",
+          "index_type",
+          "applied_lsn",
+          "scalar_row_count",
+          "ha_level"
+        ]
+      },
+      "CreateCollectionRequest": {
+        "type": "object",
+        "properties": {
+          "dims": {
+            "type": "integer",
+            "minimum": 1,
+            "description": "向量维度（创建后不可变）"
+          },
+          "metric": {
+            "type": "string",
+            "enum": [
+              "l2",
+              "cosine",
+              "ip",
+              "l1"
+            ],
+            "default": "cosine",
+            "description": "距离度量（创建后不可变）。缺省时由 index_type 派生：pq-flat → l2、hii-l0 → cosine，其余后端 → cosine。接受别名 euclidean / inner_product / dot / manhattan；pq-flat 仅支持 l2，hii-l0 仅支持 cosine"
+          },
+          "index_type": {
+            "type": "string",
+            "enum": [
+              "hnsw",
+              "clustered",
+              "flat-clustered",
+              "flat",
+              "pq-flat",
+              "hii-l0"
+            ],
+            "description": "索引后端；缺省取服务启动配置的默认后端"
+          },
+          "hnsw_m": {
+            "type": "integer",
+            "minimum": 2,
+            "maximum": 1024,
+            "description": "HNSW 每层最大出边数（合理下限 2）；三个 hnsw_* 参数必须同时提供"
+          },
+          "hnsw_ef_construction": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 65536,
+            "description": "HNSW 构图候选队列长度"
+          },
+          "hnsw_ef_search": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 65536,
+            "description": "HNSW 检索候选队列长度"
+          }
+        },
+        "required": [
+          "dims"
+        ]
+      },
+      "CreateCollectionResponse": {
+        "type": "object",
+        "required": [
+          "created",
+          "collection",
+          "dims",
+          "metric",
+          "index_type"
+        ],
+        "properties": {
+          "created": {
+            "type": "boolean",
+            "enum": [
+              true
+            ]
+          },
+          "collection": {
+            "type": "string"
+          },
+          "dims": {
+            "type": "integer"
+          },
+          "metric": {
+            "type": "string",
+            "enum": [
+              "l2",
+              "cosine",
+              "ip",
+              "l1"
+            ]
+          },
+          "index_type": {
+            "type": "string"
+          },
+          "hnsw": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "description": "仅 hnsw 后端返回；其余后端省略该字段",
+            "properties": {
+              "m": {
+                "type": "integer"
+              },
+              "ef_construction": {
+                "type": "integer"
+              },
+              "ef_search": {
+                "type": "integer"
+              }
+            },
+            "required": [
+              "m",
+              "ef_construction",
+              "ef_search"
+            ]
+          }
+        }
       },
       "UpsertRequest": {
         "type": "object",
         "properties": {
           "vectors": {
             "type": "array",
-            "items": { "$ref": "#/components/schemas/UpsertVector" },
+            "items": {
+              "$ref": "#/components/schemas/UpsertVector"
+            },
             "minItems": 1
           },
           "index": {
             "type": "object",
             "description": "可选 HNSW 构图提示",
             "properties": {
-              "m": { "type": "integer" },
-              "ef_construction": { "type": "integer" }
+              "m": {
+                "type": "integer"
+              },
+              "ef_construction": {
+                "type": "integer"
+              }
             }
           }
         },
-        "required": ["vectors"]
+        "required": [
+          "vectors"
+        ]
       },
       "UpsertVector": {
         "type": "object",
@@ -384,147 +1784,380 @@
           },
           "values": {
             "type": "array",
-            "items": { "type": "number", "format": "float" },
+            "items": {
+              "type": "number",
+              "format": "float"
+            },
             "description": "向量分量；长度即 collection 维度（首个向量定型）"
           },
-          "label": { "type": "string", "description": "可选标签（等价于 payload 的保留列 label）" },
+          "label": {
+            "type": "string",
+            "description": "可选标签（等价于 payload 的保留列 label）"
+          },
           "payload": {
             "type": "object",
             "additionalProperties": true,
             "description": "自由 JSON 标量字段，供混合检索过滤；键 label 保留，占用 400"
           }
         },
-        "required": ["id", "values"]
+        "required": [
+          "id",
+          "values"
+        ]
       },
       "UpsertResponse": {
         "type": "object",
-        "properties": { "inserted": { "type": "integer" } },
-        "required": ["inserted"]
+        "properties": {
+          "inserted": {
+            "type": "integer"
+          }
+        },
+        "required": [
+          "inserted"
+        ]
       },
       "SearchRequest": {
         "type": "object",
         "properties": {
-          "vector": { "type": "array", "items": { "type": "number", "format": "float" } },
-          "k": { "type": "integer", "minimum": 1 },
-          "ef_search": { "type": "integer", "description": "可选 HNSW ef 覆盖（flat 后端忽略）" },
-          "include_payload": { "type": "boolean", "default": false },
-          "filter_gt_id": { "type": "integer", "format": "uint64", "description": "可选：仅返回 id 大于该值的命中" },
-          "filter_label": { "type": "string", "description": "可选：按顶层 label 过滤" }
+          "vector": {
+            "type": "array",
+            "items": {
+              "type": "number",
+              "format": "float"
+            }
+          },
+          "k": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "ef_search": {
+            "type": "integer",
+            "description": "可选 HNSW ef 覆盖（flat 后端忽略）"
+          },
+          "include_payload": {
+            "type": "boolean",
+            "default": false
+          },
+          "filter_gt_id": {
+            "type": "integer",
+            "format": "uint64",
+            "description": "可选：仅返回 id 大于该值的命中"
+          },
+          "filter_label": {
+            "type": "string",
+            "description": "可选：按顶层 label 过滤"
+          }
         },
-        "required": ["vector", "k"]
+        "required": [
+          "vector",
+          "k"
+        ]
       },
       "HybridSearchRequest": {
         "type": "object",
         "properties": {
-          "vector": { "type": "array", "items": { "type": "number", "format": "float" } },
-          "k": { "type": "integer", "minimum": 1 },
+          "vector": {
+            "type": "array",
+            "items": {
+              "type": "number",
+              "format": "float"
+            }
+          },
+          "k": {
+            "type": "integer",
+            "minimum": 1
+          },
           "filters": {
             "type": "array",
-            "items": { "$ref": "#/components/schemas/Filter" },
+            "items": {
+              "$ref": "#/components/schemas/Filter"
+            },
             "description": "多条取交集（AND）"
           },
-          "include_payload": { "type": "boolean", "default": false },
-          "ef_search": { "type": "integer" }
+          "include_payload": {
+            "type": "boolean",
+            "default": false
+          },
+          "ef_search": {
+            "type": "integer"
+          }
         },
-        "required": ["vector", "k"]
+        "required": [
+          "vector",
+          "k"
+        ]
       },
       "Filter": {
         "type": "object",
         "properties": {
-          "column": { "type": "string", "description": "payload 键名，或保留列 label" },
-          "op": { "type": "string", "enum": ["eq", "gt", "gte", "lt", "lte", "in"] },
+          "column": {
+            "type": "string",
+            "description": "payload 键名，或保留列 label"
+          },
+          "op": {
+            "type": "string",
+            "enum": [
+              "eq",
+              "gt",
+              "gte",
+              "lt",
+              "lte",
+              "in"
+            ]
+          },
           "value": {
             "description": "比较字面值：in 必须是布尔/数字/字符串数组；其余算子不得为数组/对象/null"
           }
         },
-        "required": ["column", "op", "value"]
+        "required": [
+          "column",
+          "op",
+          "value"
+        ]
       },
       "SearchResponse": {
         "type": "object",
         "properties": {
           "ids": {
             "type": "array",
-            "items": { "type": "integer", "format": "uint64" },
+            "items": {
+              "type": "integer",
+              "format": "uint64"
+            },
             "description": "与 scores 按下标对齐，按相似度从高到低"
           },
           "scores": {
             "type": "array",
-            "items": { "type": "number", "format": "float" },
-            "description": "相似度（越大越相似）；余弦后端为 1 - cosine_distance ∈ [-1,1]"
+            "items": {
+              "type": "number",
+              "format": "float"
+            },
+            "description": "相似度（越大越相似），按 collection 度量换算：cosine → 1 - cosine_distance ∈ [-1,1]；l2/l1 → 1 - d（不钳制）；ip → -distance = 原始点积（不钳制）"
           },
           "payloads": {
             "type": "object",
-            "additionalProperties": { "type": "object", "additionalProperties": true },
+            "additionalProperties": {
+              "type": "object",
+              "additionalProperties": true
+            },
             "description": "键为 id 的十进制字符串；仅 include_payload=true 时存在"
+          },
+          "metric": {
+            "type": "string",
+            "enum": [
+              "l2",
+              "cosine",
+              "ip",
+              "l1"
+            ],
+            "description": "本次检索所用度量；benchmark 路径（/v1/vectors/search）省略该字段"
           }
         },
-        "required": ["ids", "scores"]
+        "required": [
+          "ids",
+          "scores"
+        ]
       },
       "DeleteRequest": {
         "type": "object",
         "properties": {
           "ids": {
             "type": "array",
-            "items": { "type": "integer", "format": "uint64" },
+            "items": {
+              "type": "integer",
+              "format": "uint64"
+            },
             "description": "显式 id 列表；与 filters 命中取并集"
           },
           "filters": {
             "type": "array",
-            "items": { "$ref": "#/components/schemas/Filter" }
+            "items": {
+              "$ref": "#/components/schemas/Filter"
+            }
           }
         }
       },
       "DeleteResponse": {
         "type": "object",
-        "properties": { "deleted": { "type": "integer" } },
-        "required": ["deleted"]
+        "properties": {
+          "deleted": {
+            "type": "integer"
+          }
+        },
+        "required": [
+          "deleted"
+        ]
       },
       "EmbeddingsRequest": {
         "type": "object",
         "description": "OpenAI embeddings 请求子集（原样转发上游）",
         "properties": {
-          "model": { "type": "string" },
+          "model": {
+            "type": "string"
+          },
           "input": {
             "oneOf": [
-              { "type": "string" },
-              { "type": "array", "items": { "type": "string" } }
+              {
+                "type": "string"
+              },
+              {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              }
             ]
           },
-          "encoding_format": { "type": "string", "enum": ["float", "base64"] }
+          "encoding_format": {
+            "type": "string",
+            "enum": [
+              "float",
+              "base64"
+            ]
+          }
         },
-        "required": ["model", "input"]
+        "required": [
+          "model",
+          "input"
+        ]
       },
       "EmbeddingsResponse": {
         "type": "object",
         "description": "OpenAI embeddings 响应（原样透传）",
         "properties": {
-          "object": { "type": "string" },
+          "object": {
+            "type": "string"
+          },
           "data": {
             "type": "array",
             "items": {
               "type": "object",
               "properties": {
-                "object": { "type": "string" },
-                "index": { "type": "integer" },
-                "embedding": { "type": "array", "items": { "type": "number" } }
+                "object": {
+                  "type": "string"
+                },
+                "index": {
+                  "type": "integer"
+                },
+                "embedding": {
+                  "type": "array",
+                  "items": {
+                    "type": "number"
+                  }
+                }
               }
             }
           },
-          "model": { "type": "string" },
+          "model": {
+            "type": "string"
+          },
           "usage": {
             "type": "object",
             "properties": {
-              "prompt_tokens": { "type": "integer" },
-              "total_tokens": { "type": "integer" }
+              "prompt_tokens": {
+                "type": "integer"
+              },
+              "total_tokens": {
+                "type": "integer"
+              }
             }
+          }
+        }
+      },
+      "LeaseGrant": {
+        "type": "object",
+        "properties": {
+          "term": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "ttl_ms": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "expires_in_ms": {
+            "type": "integer",
+            "format": "int64"
+          }
+        }
+      },
+      "LeaseStatus": {
+        "type": "object",
+        "properties": {
+          "term": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "active": {
+            "type": "boolean"
+          },
+          "expires_in_ms": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "required": {
+            "type": "boolean"
+          }
+        }
+      },
+      "QueryLogEntry": {
+        "type": "object",
+        "properties": {
+          "ts_ms": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "request_id": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "principal": {
+            "type": "string"
+          },
+          "route": {
+            "type": "string"
+          },
+          "collection": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "k": {
+            "type": "integer"
+          },
+          "status": {
+            "type": "integer"
+          },
+          "latency_ms": {
+            "type": "number"
+          },
+          "result_count": {
+            "type": "integer"
+          },
+          "filtered": {
+            "type": "boolean"
           }
         }
       }
     }
   },
   "tags": [
-    { "name": "collections", "description": "named collection 的写入/检索/删除/状态" },
-    { "name": "gateway", "description": "OpenAI 兼容网关" },
-    { "name": "meta", "description": "健康检查与内部状态" }
+    {
+      "name": "collections",
+      "description": "named collection 的写入/检索/删除/状态"
+    },
+    {
+      "name": "gateway",
+      "description": "OpenAI 兼容网关"
+    },
+    {
+      "name": "meta",
+      "description": "健康检查与内部状态"
+    },
+    {
+      "name": "admin",
+      "description": "管理端点（RBAC Admin 角色）"
+    }
   ]
 }

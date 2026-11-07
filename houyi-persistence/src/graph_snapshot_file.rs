@@ -339,7 +339,7 @@ pub fn write_graph_snapshot_atomic_with_encryption(
         .file_name()
         .and_then(|s| s.to_str())
         .unwrap_or("graph_snapshot.bin");
-    let dir = path.parent().unwrap_or_else(|| Path::new("."));
+    let dir = crate::parent_dir_or_dot(path);
     let nonce = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos())

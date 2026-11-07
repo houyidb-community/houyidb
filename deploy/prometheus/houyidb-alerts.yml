@@ -23,6 +23,15 @@ groups:
           description: "检查 promote 流程与旧主是否仍在接受写。"
           runbook_url: "https://github.com/houyidb-community/houyidb/blob/main/docs/runbooks/replication-divergence.md"
 
+      - alert: HouyiReplicationBehindRetained
+        expr: increase(houyidb_replication_behind_retained_rejections_total[10m]) > 0
+        labels:
+          severity: critical
+        annotations:
+          summary: "follower 落后于 leader 的保留范围（BEHIND_RETAINED）"
+          description: "断点已不可续传；按 runbook 做全量重同步，禁止自动清库。"
+          runbook_url: "https://github.com/houyidb-community/houyidb/blob/main/docs/runbooks/collections-retention-resync.md"
+
       - alert: HouyiReplicationLagHigh
         expr: houyidb_replication_lag_entries > 10000
         for: 10m

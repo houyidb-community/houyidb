@@ -23,6 +23,7 @@
 |-------------|--------|------|
 | Replication log divergence (diverged) / follower_ahead | Critical | [replication-divergence.md](replication-divergence.md) |
 | Replication lag, slow follower kicked | Warning | [replication-lag.md](replication-lag.md) |
+| Follower behind the retained range (BEHIND_RETAINED) | Critical | [collections-retention-resync.md](collections-retention-resync.md) |
 | WAL poisoned (writes rejected after a write failure) | Critical | [wal-poison.md](wal-poison.md) |
 | Missing encryption key for encrypted snapshot/WAL causes startup failure | Critical | [encryption-key-missing.md](encryption-key-missing.md) |
 | Audit chain verification failure / audit write error | Critical | [audit-chain-broken.md](audit-chain-broken.md) |

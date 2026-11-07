@@ -112,6 +112,76 @@ public final class Types {
     }
 
     /**
+     * 建集合时的 HNSW 参数三元组（必须三个全给，否则服务端 400）。
+     * EN: HNSW parameter triple for explicit creation (all three are required
+     * or the server returns 400).
+     */
+    public static final class HnswParams {
+        public final int m;
+        public final int efConstruction;
+        public final int efSearch;
+
+        public HnswParams(int m, int efConstruction, int efSearch) {
+            this.m = m;
+            this.efConstruction = efConstruction;
+            this.efSearch = efSearch;
+        }
+    }
+
+    /**
+     * 显式建集合的选项（省略即服务端默认：余弦 + 默认后端 + 默认 HNSW）。
+     * metric 与后端创建后不可变，改参数只能删除重建（旧图按旧度量构建）。
+     * EN: Options for explicit creation (omitted means server defaults: cosine,
+     * default backend, default HNSW). Metric and backend are immutable
+     * afterwards; changing them requires drop-and-recreate (old graphs were
+     * built under the old metric).
+     */
+    public static final class CreateCollectionOptions {
+        public String metric; // l2 / cosine / ip / l1。 EN: l2/cosine/ip/l1.
+        public String indexType; // hnsw / pq-flat / flat / ...。 EN: backend kind.
+        public HnswParams hnsw;
+
+        public CreateCollectionOptions metric(String v) {
+            this.metric = v;
+            return this;
+        }
+
+        public CreateCollectionOptions indexType(String v) {
+            this.indexType = v;
+            return this;
+        }
+
+        public CreateCollectionOptions hnsw(HnswParams v) {
+            this.hnsw = v;
+            return this;
+        }
+    }
+
+    /**
+     * 建集合响应：服务端回显实际生效的参数（hnsw 仅 hnsw 后端非 null）。
+     * EN: Creation response echoing the effective parameters (hnsw is non-null
+     * only for the hnsw backend).
+     */
+    public static final class CreateCollectionResult {
+        public final boolean created;
+        public final String collection;
+        public final int dims;
+        public final String metric;
+        public final String indexType;
+        public final HnswParams hnsw;
+
+        CreateCollectionResult(boolean created, String collection, int dims,
+                String metric, String indexType, HnswParams hnsw) {
+            this.created = created;
+            this.collection = collection;
+            this.dims = dims;
+            this.metric = metric;
+            this.indexType = indexType;
+            this.hnsw = hnsw;
+        }
+    }
+
+    /**
      * 检索/混合检索可选参数（默认构造即全默认）。
      * EN: Optional search/hybrid-search parameters (default construction means
      * all defaults).

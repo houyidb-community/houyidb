@@ -97,6 +97,10 @@ pub struct FollowerMetrics {
     pub fsync_total: AtomicU64,
     pub reconnects_total: AtomicU64,
     pub follower_ahead_rejections_total: AtomicU64,
+    /// 落后于 leader 保留范围的拒绝次数（人工全量重同步）。
+    /// EN: rejections because local history is behind the leader's retained
+    /// range (manual full resync required).
+    pub behind_retained_rejections_total: AtomicU64,
     /// 本地下一条期望 LSN（= 已连续落盘的最大 lsn + 1）。
     /// EN: Next expected local LSN (= highest contiguously persisted lsn + 1).
     pub recv_lsn: AtomicU64,
@@ -106,6 +110,9 @@ pub struct FollowerMetrics {
     /// HEARTBEAT 观测到的 leader_next_lsn（lag = leader_next - recv_lsn）。
     /// EN: leader_next_lsn observed via HEARTBEAT (lag = leader_next - recv_lsn).
     pub leader_next_lsn: AtomicU64,
+    /// WELCOME 观测到的 leader 最早可读 LSN（保留基线可见性）。
+    /// EN: leader first-available LSN observed via WELCOME (retention visibility).
+    pub leader_first_available_lsn: AtomicU64,
 }
 
 pub struct FollowerConfig {
@@ -139,6 +146,21 @@ pub struct FollowerConfig {
     /// 本地 WAL 静态加密句柄（P4.7.3）：指纹计算需要先解密本机段。
     /// EN: local WAL encryption handle; the local fingerprint needs decryption.
     pub encryption: Option<Arc<crate::encryption::Encryption>>,
+    /// 稳定 follower 身份（P5.0.4）：跨重连保留 retention grace；服务器从
+    /// 数据目录的 `replication.follower_id` 载入/生成，默认全零仅供测试。
+    /// EN: stable follower identity (P5.0.4) so retention grace survives
+    /// reconnects; the server loads/generates it from the data directory, and
+    /// the all-zero default is for tests only.
+    pub follower_id: [u8; 16],
+    /// 本地 manifest checkpoint 回调（0 = 无 manifest）。每次握手读取最新值，
+    /// leader 用它区分「快照已覆盖」与「需要重放」的尾部。
+    /// EN: local manifest checkpoint callback (0 = no manifest), read on every
+    /// handshake so the leader can distinguish snapshot-covered tails.
+    pub snapshot_checkpoint: Arc<dyn Fn() -> u64 + Send + Sync>,
+    /// 落后于保留范围时的退避（人工重同步前不自动清库）。
+    /// EN: backoff when behind the retained range; never auto-wipe before a
+    /// manual resync.
+    pub behind_retained_retry_interval: Duration,
 }
 
 impl FollowerConfig {
@@ -157,6 +179,18 @@ impl FollowerConfig {
             ..Self::default()
         }
     }
+
+    /// 注入稳定 follower 身份与本地 manifest checkpoint（P5.0.4）。
+    /// EN: injects the stable follower identity and local manifest checkpoint (P5.0.4).
+    pub fn with_follower_identity(
+        mut self,
+        follower_id: [u8; 16],
+        snapshot_checkpoint: Arc<dyn Fn() -> u64 + Send + Sync>,
+    ) -> Self {
+        self.follower_id = follower_id;
+        self.snapshot_checkpoint = snapshot_checkpoint;
+        self
+    }
 }
 
 impl Default for FollowerConfig {
@@ -171,6 +205,9 @@ impl Default for FollowerConfig {
             ahead_retry_interval: Duration::from_secs(30),
             auth_token: None,
             encryption: None,
+            follower_id: [0u8; 16],
+            snapshot_checkpoint: Arc::new(|| 0),
+            behind_retained_retry_interval: Duration::from_secs(60),
         }
     }
 }
@@ -195,6 +232,10 @@ enum SessionEnd {
     /// 本地日志故障（指纹无法计算）：重试无法自愈，长退避 + 人工处置。
     /// EN: local log cannot produce a fingerprint — retries cannot heal it.
     LocalLog(String),
+    /// 落后于 leader 的保留范围：人工全量重同步，绝不自动清库。
+    /// EN: behind the leader's retained range — manual full resync; never wipe
+    /// automatically.
+    BehindRetained(String),
     /// 外部 shutdown。
     /// EN: External shutdown.
     Stopped,
@@ -323,6 +364,18 @@ async fn run_loop(
                 );
                 jittered_sleep(config.ahead_retry_interval, &shutdown).await;
             }
+            SessionEnd::BehindRetained(msg) => {
+                metrics
+                    .behind_retained_rejections_total
+                    .fetch_add(1, Ordering::Relaxed);
+                tracing::error!(
+                    msg = %msg,
+                    "replication follower: BEHIND RETAINED — local history predates the \
+                     leader's retained range; a full manual resync is required \
+                     (see docs/runbooks/collections-retention-resync.md); never auto-wipe"
+                );
+                jittered_sleep(config.behind_retained_retry_interval, &shutdown).await;
+            }
             SessionEnd::Auth(msg) => {
                 metrics
                     .auth_rejections_total
@@ -392,6 +445,7 @@ async fn run_session(
         Err(SessionError::Diverged(m)) => SessionEnd::Diverged(m),
         Err(SessionError::Auth(m)) => SessionEnd::Auth(m),
         Err(SessionError::LocalLog(m)) => SessionEnd::LocalLog(m),
+        Err(SessionError::BehindRetained(m)) => SessionEnd::BehindRetained(m),
     }
 }
 
@@ -403,6 +457,7 @@ enum SessionError {
     Diverged(String),
     Auth(String),
     LocalLog(String),
+    BehindRetained(String),
 }
 
 #[cfg(not(loom))]
@@ -444,6 +499,84 @@ fn split_host_port(addr: &str) -> io::Result<(&str, u16)> {
     Ok((host, port))
 }
 
+/// 握手阶段的 leader 回包（WELCOME / ANCHOR / ERROR）。
+/// EN: Leader replies during the handshake (WELCOME / ANCHOR / ERROR).
+#[cfg(not(loom))]
+enum HandshakeReply {
+    Welcome(proto::Welcome),
+    Anchor(u64),
+    Error { kind: u8, msg: String },
+}
+
+/// 读一个完整握手回包（ERROR / ANCHOR / WELCOME），统一超时与长度校验。
+/// EN: Reads one complete handshake reply with a shared timeout and length checks.
+#[cfg(not(loom))]
+async fn read_handshake_reply(
+    stream: &mut TcpStream,
+    budget: Duration,
+) -> io::Result<HandshakeReply> {
+    let mut head = [0u8; 4];
+    runtime::timeout(budget, stream.read_exact(&mut head))
+        .await
+        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "handshake reply timeout"))??;
+    if head[0] == proto::FRAME_ERROR {
+        let kind = head[1];
+        let msg_len = u16::from_be_bytes([head[2], head[3]]) as usize;
+        if msg_len > proto::MAX_ERROR_MSG_BYTES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("error message too large: {msg_len}"),
+            ));
+        }
+        let mut msg = vec![0u8; msg_len];
+        runtime::timeout(budget, stream.read_exact(&mut msg))
+            .await
+            .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "error-frame read timeout"))??;
+        return Ok(HandshakeReply::Error {
+            kind,
+            msg: proto::decode_error_msg(&msg),
+        });
+    }
+    match &head {
+        b"ANCH" => {
+            let mut full = [0u8; proto::ANCHOR_LEN];
+            full[..4].copy_from_slice(&head);
+            runtime::timeout(budget, stream.read_exact(&mut full[4..]))
+                .await
+                .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "anchor read timeout"))??;
+            Ok(HandshakeReply::Anchor(proto::decode_anchor(&full)?))
+        }
+        b"WLCM" => {
+            let mut full = [0u8; proto::WELCOME_LEN];
+            full[..4].copy_from_slice(&head);
+            runtime::timeout(budget, stream.read_exact(&mut full[4..]))
+                .await
+                .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "welcome read timeout"))??;
+            Ok(HandshakeReply::Welcome(proto::decode_welcome(&full)?))
+        }
+        _ => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "unexpected handshake reply magic",
+        )),
+    }
+}
+
+/// 结构化 kind → 会话错误（禁止靠消息文本分类安全信号）。
+/// EN: structured kind → session error (never classify safety signals by text).
+#[cfg(not(loom))]
+fn classify_leader_error(kind: u8, msg: String) -> SessionError {
+    match kind {
+        proto::ERROR_KIND_FOLLOWER_AHEAD => SessionError::Ahead(msg),
+        proto::ERROR_KIND_DIVERGED => SessionError::Diverged(msg),
+        proto::ERROR_KIND_AUTH => SessionError::Auth(msg),
+        proto::ERROR_KIND_BEHIND_RETAINED => SessionError::BehindRetained(msg),
+        _ => SessionError::Retry(io::Error::new(
+            io::ErrorKind::ConnectionRefused,
+            format!("leader rejected: {msg}"),
+        )),
+    }
+}
+
 #[cfg(not(loom))]
 async fn session_inner(
     leader_addr: &str,
@@ -455,24 +588,72 @@ async fn session_inner(
 ) -> Result<(), SessionError> {
     let resume_lsn = wal.next_lsn();
     metrics.recv_lsn.store(resume_lsn, Ordering::Relaxed);
+    let first_available = wal
+        .first_available_lsn()
+        .map_err(|e| SessionError::LocalLog(format!("local first-available LSN failed: {e}")))?;
+    if first_available > resume_lsn {
+        return Err(SessionError::LocalLog(format!(
+            "local first_available_lsn {first_available} > next_lsn {resume_lsn}"
+        )));
+    }
 
     // 先校验本地配置形态（零成本），再算本地前缀指纹。
     // EN: validate the address form first (free), then fingerprint.
     let (host, port) = split_host_port(leader_addr)?;
 
-    // 本地日志前缀指纹：**建连之前**在阻塞池算完（P4.6.3 OCR 修正）——
+    // 本地日志范围指纹：**建连之前**在阻塞池算完（P4.6.3 OCR 修正）——
     // 若连上后再扫，扫描时长会吃掉 leader 的握手读窗口；且本地日志损坏
     // 属于本地永久故障，应与网络抖动区分（SessionError::LocalLog）。
-    // EN: compute the local prefix hash on the blocking pool *before*
+    // v6 只哈希本地仍保留的 [log_start, resume) 区间。本机保留任务可能在
+    // 采样 first_available 之后删掉最旧段：`Unavailable` 携带新的起点时
+    // 用它重试一次，而不是把这种瞬时竞态误报成本地永久故障。
+    // EN: compute the local range hash on the blocking pool *before*
     // connecting — scanning after connect eats the leader's handshake window,
     // and a corrupt local log is a local permanent fault, not a network flap.
-    let local_hash = crate::log_fingerprint::prefix_hash_blocking_with_encryption(
-        wal.path().to_path_buf(),
-        resume_lsn,
-        config.encryption.clone(),
-    )
-    .await
-    .map_err(|e| SessionError::LocalLog(format!("local log fingerprint failed: {e}")))?;
+    // v6 hashes only the locally retained [log_start, resume) range. Local
+    // retention may delete the oldest segment after sampling first-available;
+    // on `Unavailable` with a newer start, retry from that start instead of
+    // misreporting a transient race as a permanent local fault.
+    let mut log_start = first_available;
+    // 本地保留可能在「列段 → 逐个打开」之间删掉/轮转段：Unavailable 携带新
+    // 起点，NotFound/Corrupt 也可能只是竞态。两类都先重采样 floor，确认真的
+    // 推进才重试；重试上限防止保留策略跑赢扫描时反复全量扫盘。
+    // EN: Local retention may unlink/rotate a listed segment between listing and
+    // opening: `Unavailable` carries a new start, and NotFound/Corrupt may also
+    // be a race. Re-sample the floor for both and retry only when it actually
+    // advanced; a cap bounds full-log rescans if retention outruns the scan.
+    const MAX_FINGERPRINT_ATTEMPTS: usize = 3;
+    let mut attempts = 0usize;
+    let local_hash = loop {
+        attempts += 1;
+        match crate::log_fingerprint::range_hash_blocking_with_encryption(
+            wal.path().to_path_buf(),
+            log_start,
+            resume_lsn,
+            config.encryption.clone(),
+        )
+        .await
+        {
+            Ok(hash) => break hash,
+            Err(err) => {
+                let current = wal.first_available_lsn().unwrap_or(log_start);
+                let advanced = current > log_start && current <= resume_lsn;
+                if advanced && attempts < MAX_FINGERPRINT_ATTEMPTS {
+                    tracing::warn!(
+                        old_start = log_start,
+                        new_start = current,
+                        error = %err,
+                        "replication follower: local retention advanced during hashing; retrying"
+                    );
+                    log_start = current;
+                    continue;
+                }
+                return Err(SessionError::LocalLog(format!(
+                    "local log fingerprint failed after {attempts} attempt(s): {err}"
+                )));
+            }
+        }
+    };
 
     // 解析与建连分开设预算（P4.6.3）：DNS 走独立 timeout（系统解析器被吞包
     // 时可能钉住分钟级）；每个解析地址的 TCP 建连复用 read_timeout。
@@ -554,54 +735,62 @@ async fn session_inner(
         resume_lsn,
         proto::STREAM_MASK_COLLECTIONS,
         local_hash,
+        log_start,
+        (config.snapshot_checkpoint)(),
+        config.follower_id,
         config.auth_token.as_deref().unwrap_or(""),
     )?;
     runtime::timeout(config.handshake_timeout, stream.write_all(&handshake))
         .await
         .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "handshake write timeout"))??;
-    let mut tag = [0u8; 1];
-    runtime::timeout(config.handshake_timeout, stream.read_exact(&mut tag))
-        .await
-        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "handshake read timeout"))??;
-    let leader_next = if tag[0] == proto::FRAME_ERROR {
-        // 头余下部分 = kind:u8 + len:u16（frame_header_len(FRAME_ERROR) - 1）。
-        // EN: Rest of the header = kind:u8 + len:u16 (frame_header_len(FRAME_ERROR) - 1).
-        let mut hdr = [0u8; 3];
-        runtime::timeout(config.handshake_timeout, stream.read_exact(&mut hdr))
+    let mut reply = read_handshake_reply(&mut stream, config.handshake_timeout).await?;
+    if let HandshakeReply::Anchor(anchor) = reply {
+        // 锚点协商（P5.0.4）：leader 的 first_available 已越过本地最早可读点，
+        // 从锚点重算范围指纹。无法计算时发 (0,0) 哨兵，leader 必判 BEHIND_RETAINED。
+        // EN: anchor negotiation: the leader's first-available passed our earliest
+        // readable LSN; recompute the fingerprint from the anchor. If it cannot be
+        // computed, send the (0,0) sentinel so the leader rejects with
+        // BEHIND_RETAINED.
+        let anchored = if anchor < log_start || anchor > resume_lsn {
+            proto::encode_handshake_anchored(0, 0)
+        } else {
+            match crate::log_fingerprint::range_hash_blocking_with_encryption(
+                wal.path().to_path_buf(),
+                anchor,
+                resume_lsn,
+                config.encryption.clone(),
+            )
             .await
-            .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "error header read timeout"))??;
-        let kind = hdr[0];
-        let msg_len = u16::from_be_bytes([hdr[1], hdr[2]]) as usize;
-        let mut msg = vec![0u8; msg_len];
-        runtime::timeout(config.handshake_timeout, stream.read_exact(&mut msg))
+            {
+                Ok(h) => proto::encode_handshake_anchored(anchor, h),
+                Err(e) => {
+                    tracing::warn!(anchor, error = %e,
+                        "replication follower: anchor fingerprint unavailable; sending sentinel");
+                    proto::encode_handshake_anchored(0, 0)
+                }
+            }
+        };
+        runtime::timeout(config.handshake_timeout, stream.write_all(&anchored))
             .await
-            .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "error-frame read timeout"))??;
-        let msg = proto::decode_error_msg(&msg);
-        // 结构化 kind 判定脑裂：靠消息文本匹配，任一侧改文案都会让安全
-        // 信号静默失效。
-        // EN: Split-brain is decided by the structured kind: matching message text
-        // would let any wording change silently disable the safety signal.
-        if kind == proto::ERROR_KIND_FOLLOWER_AHEAD {
-            return Err(SessionError::Ahead(msg));
+            .map_err(|_| {
+                io::Error::new(io::ErrorKind::TimedOut, "anchored handshake write timeout")
+            })??;
+        reply = read_handshake_reply(&mut stream, config.handshake_timeout).await?;
+    }
+    let welcome = match reply {
+        HandshakeReply::Welcome(w) => w,
+        HandshakeReply::Error { kind, msg } => return Err(classify_leader_error(kind, msg)),
+        HandshakeReply::Anchor(_) => {
+            return Err(SessionError::Retry(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "leader sent a second ANCHOR after anchored handshake",
+            )))
         }
-        if kind == proto::ERROR_KIND_DIVERGED {
-            return Err(SessionError::Diverged(msg));
-        }
-        if kind == proto::ERROR_KIND_AUTH {
-            return Err(SessionError::Auth(msg));
-        }
-        return Err(SessionError::Retry(io::Error::new(
-            io::ErrorKind::ConnectionRefused,
-            format!("leader rejected: {msg}"),
-        )));
-    } else {
-        let mut full = [0u8; proto::WELCOME_LEN];
-        full[0] = tag[0];
-        runtime::timeout(config.handshake_timeout, stream.read_exact(&mut full[1..]))
-            .await
-            .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "welcome read timeout"))??;
-        proto::decode_welcome(&full)?
     };
+    metrics
+        .leader_first_available_lsn
+        .store(welcome.leader_first_available_lsn, Ordering::Relaxed);
+    let leader_next = welcome.leader_next_lsn;
     metrics
         .leader_next_lsn
         .store(leader_next, Ordering::Relaxed);
@@ -1337,6 +1526,102 @@ mod tests {
         drop(leader_wal);
     }
 
+    /// P5.0.4：follower 所需历史早于 leader 保留范围 ⇒ BEHIND_RETAINED，
+    /// 不应用任何记录，也绝不自动清库。
+    /// EN: P5.0.4 — when the follower needs history older than the leader's
+    /// retained range, reject with BEHIND_RETAINED, apply nothing, and never
+    /// auto-wipe.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn behind_retained_is_rejected_and_counted() {
+        let rig = Rig::new("behind-retained");
+        let gate = Arc::new(tokio::sync::RwLock::new(()));
+        let (leader_wal, _hub, leader, _wm, port) = start_leader_cfg(
+            &rig,
+            LeaderSessionConfig::default().with_retention(Arc::new(|| Ok(5)), gate),
+        )
+        .await;
+        // 物理记录不必存在：first_available 由 leader 注入的闭包给出。
+        // EN: Physical records are unnecessary: first_available comes from the
+        // injected closure.
+        let _ = &leader_wal;
+        let apply = Arc::new(RecordingApply {
+            seen: Mutex::new(Vec::new()),
+        });
+        let metrics = Arc::new(FollowerMetrics::default());
+        let cfg = FollowerConfig {
+            behind_retained_retry_interval: Duration::from_millis(100),
+            ..FollowerConfig::default()
+        };
+        let (_fwal, follower) =
+            start_follower_cfg(&rig, port, Arc::clone(&apply), Arc::clone(&metrics), cfg).await;
+
+        wait_until(
+            || {
+                metrics
+                    .behind_retained_rejections_total
+                    .load(Ordering::Relaxed)
+                    >= 1
+            },
+            Duration::from_secs(10),
+            "behind-retained rejection",
+        );
+        assert!(apply.seen.lock().unwrap().is_empty());
+        follower.shutdown().await;
+        leader.shutdown().await;
+    }
+
+    /// P5.0.4：follower 的基线早于 leader first_available 但尾部重叠 ⇒
+    /// ANCHOR 协商后放行，WELCOME 携带 leader first_available。
+    /// EN: P5.0.4 — the follower base predates the leader's first-available but
+    /// the tail overlaps; ANCHOR negotiation admits it and WELCOME carries the
+    /// leader's first-available.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn anchor_negotiation_admits_overlapping_tail() {
+        let rig = Rig::new("anchor");
+        let gate = Arc::new(tokio::sync::RwLock::new(()));
+        let (leader_wal, _hub, leader, _wm, port) = start_leader_cfg(
+            &rig,
+            LeaderSessionConfig::default().with_retention(Arc::new(|| Ok(4)), gate),
+        )
+        .await;
+        for i in 0..5u64 {
+            leader_wal.append(format!("r{i}").into_bytes()).unwrap();
+        }
+        // follower：同样的 5 条，然后只保留 [3,5)（first_available=3，next=5）。
+        // EN: The follower has the same 5 records, then keeps only [3,5)
+        // (first_available = 3, next = 5).
+        {
+            let (mut fw, _) = crate::FileWal::open(&rig.follower_wal_path).unwrap();
+            use crate::Wal;
+            for i in 0..5u64 {
+                fw.append(format!("r{i}").into_bytes());
+            }
+            fw.truncate_prefix_through(2).unwrap();
+        }
+        let apply = Arc::new(RecordingApply {
+            seen: Mutex::new(Vec::new()),
+        });
+        let metrics = Arc::new(FollowerMetrics::default());
+        let cfg = FollowerConfig::default().with_follower_identity([7u8; 16], Arc::new(|| 0));
+        let (_fwal, follower) =
+            start_follower_cfg(&rig, port, Arc::clone(&apply), Arc::clone(&metrics), cfg).await;
+
+        wait_until(
+            || metrics.leader_first_available_lsn.load(Ordering::Relaxed) == 4,
+            Duration::from_secs(10),
+            "anchored handshake WELCOME",
+        );
+        assert_eq!(
+            metrics
+                .behind_retained_rejections_total
+                .load(Ordering::Relaxed),
+            0
+        );
+        assert!(apply.seen.lock().unwrap().is_empty());
+        follower.shutdown().await;
+        leader.shutdown().await;
+    }
+
     /// P4.6.3：leader 配置了 token、follower 未配 ⇒ 拒绝并计 auth 指标，
     /// 不应用任何记录（此前任何 TCP 客户端都能伪装 follower 拉走全量日志）。
     /// EN: a leader with a token rejects an unauthenticated follower and applies
@@ -1593,7 +1878,7 @@ mod tests {
             let (mut s, _) = listener.accept().unwrap();
             let mut hbuf = [0u8; proto::HANDSHAKE_PREFIX_LEN];
             s.read_exact(&mut hbuf).unwrap();
-            s.write_all(&proto::encode_welcome(2)).unwrap();
+            s.write_all(&proto::encode_welcome(2, 0)).unwrap();
             for (lsn, p) in [(0u64, b"r0".as_slice()), (1, b"r1")] {
                 let h = proto::encode_data_header(proto::STREAM_COLLECTIONS, lsn, p.len() as u32);
                 s.write_all(&h).unwrap();

@@ -273,4 +273,60 @@ public class IntegrationTests
         });
         Assert.Equal(1, await col.DeleteAsync(ids: new[] { 42UL }));
     }
+
+    /// <summary>
+    /// 删除整库后 404；同名重建得到空 collection。
+    /// EN: Drops a whole collection (404 afterwards) and expects a same-name
+    /// recreate to start empty.
+    /// </summary>
+    [Fact]
+    public async Task DeleteCollectionAndRecreate()
+    {
+        var client = new HouyiClient(BaseUrl, TimeSpan.FromSeconds(3));
+        if (!await client.HealthAsync())
+        {
+            return;
+        }
+        const string name = "dotnet_it_admin_drop";
+        var col = client.GetCollection(name);
+        await col.UpsertAsync(new[]
+        {
+            new Vector
+            {
+                Id = 7,
+                Values = FakeEmbed("drop me"),
+                Payload = new Dictionary<string, object?> { ["tag"] = "drop" },
+            },
+        });
+
+        await client.DeleteCollectionAsync(name);
+
+        var ex = await Assert.ThrowsAsync<HouyiException>(() => col.StatusAsync());
+        Assert.Equal(404, ex.StatusCode);
+
+        // 同名重建：首次写入隐式创建，旧向量不得复活。
+        // EN: recreate by name: the first write implicitly creates it and the old
+        // vectors must not reappear.
+        await col.UpsertAsync(new[] { new Vector { Id = 8, Values = FakeEmbed("fresh") } });
+        await WaitFlushedAsync(col);
+        using var status = await col.StatusAsync();
+        Assert.Equal(1, status.RootElement.GetProperty("indexed_count").GetInt64());
+    }
+
+    /// <summary>
+    /// 删除不存在的 collection 返回上游 404。
+    /// EN: Dropping an unknown collection surfaces the upstream 404.
+    /// </summary>
+    [Fact]
+    public async Task DeleteMissingCollectionIs404()
+    {
+        var client = new HouyiClient(BaseUrl, TimeSpan.FromSeconds(3));
+        if (!await client.HealthAsync())
+        {
+            return;
+        }
+        var ex = await Assert.ThrowsAsync<HouyiException>(
+            () => client.DeleteCollectionAsync("dotnet_it_admin_never_created"));
+        Assert.Equal(404, ex.StatusCode);
+    }
 }

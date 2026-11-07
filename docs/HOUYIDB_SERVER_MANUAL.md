@@ -184,17 +184,80 @@ POST /v1/optimize
 ```bash
 GET /v1/index/status
 # → {"indexed_count": 50000, "pending_count": 0, "hot_count": 0,
-#     "hnsw_m": 24, "hnsw_ef_construction": 400, "hnsw_ef_search": 256, ...}
+#     "distance_metric": "cosine", "hnsw_m": 24,
+#     "hnsw_ef_construction": 400, "hnsw_ef_search": 256, ...}
 ```
+
+### 5.5.1 显式建集合与距离度量
+
+```bash
+PUT /v1/collections/{name}
+# {"dims":8,"metric":"ip","index_type":"hnsw",
+#  "hnsw_m":16,"hnsw_ef_construction":100,"hnsw_ef_search":64}
+# → 201 {"created":true,"collection":"goods","dims":8,"metric":"ip",
+#        "index_type":"hnsw","hnsw":{...}}
+```
+
+- RBAC 归属 `Action::Write`（写权限，不是 admin）；租户作用域外的名字仍被拒绝。
+- 参数在落 WAL 前统一校验（`validate_create`）：非法度量/后端/维度/边界返回
+  400，不会留下无法重放的创建记录；同名已存在（即使参数一致）返回 409；
+  follower/只读 503。成功时追加 `collection_create` 记录并复制到 follower。
+- `metric` 与 `index_type` 创建后不可变；HNSW 三参数必须同时给出
+  （`m` 1..=1024，`ef_construction`/`ef_search` 1..=65536）。
+- 支持矩阵：`hnsw` / `flat` / `clustered` / `flat-clustered` 支持
+  `l2`/`cosine`/`ip`/`l1`；`pq-flat` 仅 `l2`；`hii-l0` 仅 `cosine`。
+- 内核距离一律「越小越近」（L2 为平方距离、IP 为 `-dot`、L1 为 Σ|a-b|）；
+  HTTP 分数在唯一出口按度量换算：cosine `1-d`（钳制 [-1,1]）、l2/l1 `1-d`
+  （不截断）、ip `-d`（即原始点积）。集合/混合检索响应回传 `metric` 字段；
+  benchmark 兼容路径不带该字段以保持字节不变。
+- 快照与恢复：collection 快照 v2 携带 `metric` 与可选 HNSW 参数（v1 解码时
+  按后端默认度量）；图快照带度量，度量不匹配拒绝加载。WAL 的
+  `collection_create` 记录同样携带度量/HNSW，冷重放不会把历史集合重置为
+  cosine。
 
 ### 5.6 WAL 管理
 
 ```bash
-GET  /v1/wal/status     # WAL 状态 (next_lsn, applied_lsn, archived_segments)
+GET  /v1/wal/status      # 主 WAL 状态 + collections 段/保留/manifest 状态
 POST /v1/wal/checkpoint  # {"through_lsn": 42} → 截断 WAL
-POST /v1/wal/rotate       # 归档当前 WAL
-POST /v1/wal/snapshot     # 创建向量快照
+POST /v1/wal/rotate      # 归档当前 WAL
+POST /v1/wal/snapshot    # 创建向量快照
+
+# 存储生命周期（P5.0）
+GET  /v1/collections/{name}/status   # hot/indexed/pending + applied_lsn + 标量统计
+POST /v1/collections/{name}/compact  # {"force": true} 标量页内存压实
+POST /v1/admin/collections/compact   # {"rotate":true,"hold_retention_secs":3600}
+                                     # 快照周期 → manifest → 可选轮转 → 保留
+
+# 管理员：整 collection 删除（不可逆，需 admin 凭据）
+DELETE /v1/admin/collections/{name}
 ```
+
+`DELETE /v1/admin/collections/{name}` 成功返回
+`{"deleted":true,"collection":"<name>"}`；未知/重复删除 404，与并发删除竞争 409，
+follower/只读或 lease 过期 503。删除 WAL-first：先追加
+`{"v":1,"op":"collection_drop","name":"<name>"}` 再移除内存对象，崩溃重放与
+follower 实时 apply 都会收敛到「已删除」；follower 实时 apply 不追加本地 WAL。
+同名重建得到全新空 collection，旧向量不会复活。重放时 drop 与其它记录一样
+受 per-collection 快照 checkpoint 约束：`创建→删除→重建→快照` 后，旧 drop
+的 LSN 低于新 collection 的 checkpoint，会被跳过，不会删掉快照中存活的数据。
+删除期间周期快照跳过该 collection（不中止本轮）；全部删除后写入空 manifest，其
+`safe_checkpoint_lsn = global_barrier_lsn`，允许 WAL 截断到该屏障。follower
+**不**提交空名单 manifest：其本地 WAL 先 append 后 apply，`next_lsn - 1` 可能
+越过尚未应用的 create/upsert，写成 safe 会让保留策略截断未应用记录；因此
+follower 保留旧 manifest（仅暂时多占本地 WAL），直到有新 collection 应用落地
+或被 promote 为 leader 后再推进。
+复制协议 **v8** 在 v7（`collection_drop`）之上补齐 `collection_create` 的
+度量/HNSW 语义（线格式不变），版本门 fail-fast：v7/v8 不能混跑，升级须全集群
+协调（先停复制、全量升级、再恢复）。**禁止**把 v8 WAL 交给 v7 二进制冷重放：
+旧二进制会跳过未知 drop 记录、忽略创建记录里的度量字段而按 cosine 重建，
+造成「已删集合复活 + 度量静默漂移」的分叉。
+
+`collections_wal_segment_bytes`（默认 64 MiB，0=仅手动轮转）、
+`collections_wal_max_segments`（默认 16，0=关闭删除）、
+`collections_wal_follower_grace_secs`（默认 60，leader 断连进度保留）、
+`collections_scalar_compact_interval_secs`（默认 600，0=关闭）、
+`collections_scalar_compact_stale_ratio`（默认 0.5）。
 
 ### 5.7 pgwire 指标
 

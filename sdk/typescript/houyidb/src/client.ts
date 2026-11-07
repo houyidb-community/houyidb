@@ -26,6 +26,12 @@ export interface HouyiClientOptions {
    * EN: Custom fetch implementation (for test injection or proxy scenarios).
    */
   fetch?: typeof fetch;
+  /**
+   * 可选管理 token：只附在 `/v1/admin/*` 请求上，普通读写绝不携带。
+   * EN: Optional admin token attached only to `/v1/admin/*` requests; normal
+   * read/write calls never carry it.
+   */
+  adminToken?: string;
 }
 
 /**
@@ -58,6 +64,72 @@ export interface HybridSearchOptions extends SearchOptions {
 export interface DeleteOptions {
   ids?: VectorIdInput[];
   filters?: Filter[];
+}
+
+/**
+ * 建集合时的 HNSW 参数三元组（必须三个全给，否则服务端 400）。
+ * EN: HNSW parameter triple for explicit creation (all three are required or
+ * the server returns 400).
+ */
+export interface HnswParams {
+  m: number;
+  efConstruction: number;
+  efSearch: number;
+}
+
+/**
+ * 显式建集合的选项（省略即服务端默认：余弦 + 默认后端 + 默认 HNSW）。
+ *
+ * metric 与后端创建后不可变，改参数只能删除重建（旧图按旧度量构建）。
+ * EN: Options for explicit creation (omitted means server defaults: cosine,
+ * default backend, default HNSW). Metric and backend are immutable afterwards;
+ * changing them requires drop-and-recreate (old graphs were built under the
+ * old metric).
+ */
+export interface CreateCollectionOptions {
+  /**
+   * 度量：l2 / cosine / ip / l1（大小写不敏感，服务端接受常用别名）。
+   * EN: Metric: l2 / cosine / ip / l1 (case-insensitive; common aliases accepted).
+   */
+  metric?: string;
+  /**
+   * 后端类型：hnsw / pq-flat / flat / clustered / flat-clustered / hii-l0。
+   * EN: Backend kind: hnsw / pq-flat / flat / clustered / flat-clustered / hii-l0.
+   */
+  indexType?: string;
+  hnsw?: HnswParams;
+}
+
+/**
+ * 建集合响应：服务端回显实际生效的参数（hnsw 仅 hnsw 后端出现）。
+ *
+ * 请求侧用 camelCase、响应侧已由客户端在边界处映射为 camelCase：调用方
+ * 无需在“传 `indexType`、读 `index_type`”之间切换大小写（OCR #32）。
+ * EN: Creation response echoing the effective parameters (hnsw only for the
+ * hnsw backend). The request side uses camelCase and the client maps the wire
+ * response to camelCase at the boundary, so callers never have to pass
+ * `indexType` and then read `index_type` (OCR #32).
+ */
+export interface CreateCollectionResult {
+  created: boolean;
+  collection: string;
+  dims: number;
+  metric: string;
+  indexType: string;
+  hnsw?: HnswParams;
+}
+
+/**
+ * 服务端建集合响应的线格式（snake_case + 扁平 hnsw）。
+ * EN: Wire shape of the server's creation response (snake_case, flat hnsw).
+ */
+interface RawCreateCollectionResult {
+  created: boolean;
+  collection: string;
+  dims: number;
+  metric: string;
+  index_type: string;
+  hnsw?: { m: number; ef_construction: number; ef_search: number };
 }
 
 /**
@@ -181,11 +253,83 @@ export class HouyiClient {
   readonly #baseUrl: string;
   readonly #timeoutMs: number;
   readonly #fetch: typeof fetch;
+  readonly #adminToken?: string;
 
   constructor(baseUrl = "http://127.0.0.1:7000", opts: HouyiClientOptions = {}) {
     this.#baseUrl = baseUrl.replace(/\/+$/, "");
     this.#timeoutMs = opts.timeoutMs ?? 30_000;
     this.#fetch = opts.fetch ?? fetch;
+    this.#adminToken = opts.adminToken;
+  }
+
+  /**
+   * 显式创建 collection（可指定度量/后端/HNSW 参数；需要写权限）。
+   *
+   * 与隐式创建（首次 upsert）不同，dims、metric、后端与 HNSW 参数在这里
+   * 一次定型并由服务端回显。普通写路径不带管理 token；同名已存在抛
+   * `HouyiError(409)`、参数非法 400、follower/只读 503。
+   * EN: Explicitly create a collection (metric/backend/HNSW parameters are
+   * settable; requires write permission). Unlike implicit creation (first
+   * upsert), dims, metric, backend and HNSW parameters are fixed here and
+   * echoed back. This is the normal write path without the admin token; an
+   * existing name throws `HouyiError(409)`, invalid parameters 400, and
+   * followers/read-only nodes 503.
+   */
+  async createCollection(
+    name: string,
+    dims: number,
+    opts: CreateCollectionOptions = {},
+  ): Promise<CreateCollectionResult> {
+    const payload: Record<string, unknown> = { dims };
+    if (opts.metric !== undefined) payload.metric = opts.metric;
+    if (opts.indexType !== undefined) payload.index_type = opts.indexType;
+    if (opts.hnsw) {
+      payload.hnsw_m = opts.hnsw.m;
+      payload.hnsw_ef_construction = opts.hnsw.efConstruction;
+      payload.hnsw_ef_search = opts.hnsw.efSearch;
+    }
+    const raw = await this.put<RawCreateCollectionResult>(
+      `/v1/collections/${encodeURIComponent(name)}`,
+      payload,
+    );
+    // 在客户端边界把线格式映射成与请求侧一致的 camelCase（OCR #32）。
+    // 非 HNSW 后端不得出现 `hnsw` 键：显式 `hnsw: undefined` 仍会创建自有属性，
+    // `Object.keys`/`Object.hasOwn` 会把它当作存在（OCR 195e6be #09）。
+    // EN: Map the wire shape to request-side camelCase at the client boundary
+    // (OCR #32). Non-HNSW backends must not carry an `hnsw` key: an explicit
+    // `hnsw: undefined` still creates an own property, which `Object.keys` /
+    // `Object.hasOwn` report as present (OCR 195e6be #09).
+    return {
+      created: raw.created,
+      collection: raw.collection,
+      dims: raw.dims,
+      metric: raw.metric,
+      indexType: raw.index_type,
+      ...(raw.hnsw
+        ? {
+            hnsw: {
+              m: raw.hnsw.m,
+              efConstruction: raw.hnsw.ef_construction,
+              efSearch: raw.hnsw.ef_search,
+            },
+          }
+        : {}),
+    };
+  }
+
+  /**
+   * 删除整个 collection（不可逆；需要 admin 权限）。
+   *
+   * 服务端 WAL-first：记录先落盘，崩溃重放与 follower 复制都收敛到「已删除」；
+   * 不存在/已删除返回 404（抛 ``HouyiError``）。
+   * EN: Drop an entire collection (irreversible; admin permission required).
+   * WAL-first on the server, so crash replay and follower replication converge to
+   * "gone"; unknown/already-dropped collections throw ``HouyiError`` (404).
+   */
+  async deleteCollection(name: string): Promise<void> {
+    await this.delete<{ deleted: boolean }>(
+      `/v1/admin/collections/${encodeURIComponent(name)}`,
+    );
   }
 
   collection(name: string): Collection {
@@ -234,9 +378,42 @@ export class HouyiClient {
   }
 
   /** @internal */
-  async post<T>(path: string, payload: unknown): Promise<T> {
+  async delete<T>(path: string): Promise<T> {
+    const headers: Record<string, string> = {};
+    // 仅 /v1/admin/* 携带 Authorization；普通请求绝不外泄 admin token。
+    // 该 helper 是公开方法，未来非管理 DELETE 端点复用它时也必须安全。
+    // EN: only /v1/admin/* carries Authorization; normal calls never leak the
+    // admin token. The helper is a public method, so a future non-admin DELETE
+    // endpoint reusing it must stay safe by construction.
+    if (this.#adminToken && path.startsWith("/v1/admin/")) {
+      headers.authorization = `Bearer ${this.#adminToken}`;
+    }
     const resp = await this.#fetch(`${this.#baseUrl}${path}`, {
-      method: "POST",
+      method: "DELETE",
+      headers,
+      signal: AbortSignal.timeout(this.#timeoutMs),
+    });
+    return HouyiClient.checked<T>(resp);
+  }
+
+  /** @internal */
+  async post<T>(path: string, payload: unknown): Promise<T> {
+    return this.send<T>("POST", path, payload);
+  }
+
+  /** @internal */
+  async put<T>(path: string, payload: unknown): Promise<T> {
+    return this.send<T>("PUT", path, payload);
+  }
+
+  /** @internal */
+  private async send<T>(
+    method: "POST" | "PUT",
+    path: string,
+    payload: unknown,
+  ): Promise<T> {
+    const resp = await this.#fetch(`${this.#baseUrl}${path}`, {
+      method,
       headers: { "content-type": "application/json" },
       body: stringify(payload),
       signal: AbortSignal.timeout(this.#timeoutMs),

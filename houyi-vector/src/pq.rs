@@ -6,7 +6,6 @@
 //! 768D: m=48 → 48 bytes/向量 (64x 压缩)
 //! 1536D: m=96 → 96 bytes/向量 (64x 压缩)
 
-use crate::distance;
 use crate::DistanceMetric;
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
@@ -300,7 +299,23 @@ fn l2_dist(a: &[f32], b: &[f32], len: usize) -> f32 {
 fn dist_fn(metric: DistanceMetric, a: &[f32], b: &[f32]) -> f32 {
     match metric {
         DistanceMetric::L2 => l2_dist(a, b, a.len()),
-        DistanceMetric::Cosine => distance::cosine(a, b),
+        // PQ 仅支持 L2（构建/查表都按平方欧氏编码）；服务端在建索引前已拒绝
+        // 非 L2 组合。这里必须显式 panic 而不是返回「看起来合理」的距离：若
+        // 私有 metric 字段将来被改写，ADC 的码本/查表仍是平方欧氏，返回
+        // IP/L1 数值只会静默算错；Cosine 同理——ADC 逐段余弦之和并非整向量
+        // 余弦，属于最危险的一类「看似合理但算错」。宁可当场暴露（OCR #17、
+        // 195e6be #05）。
+        // EN: PQ only supports L2 (both training and table lookup encode squared
+        // Euclidean), and the server rejects non-L2 before building. Panic
+        // explicitly rather than returning a plausible-looking distance: if the
+        // private metric field ever gains a setter, the ADC codebooks/lookup are
+        // still squared-Euclidean, so IP/L1 numbers would be silently wrong.
+        // Cosine is no different — the sum of per-segment cosine values is not the
+        // full-vector cosine, the most dangerous kind of "plausible but wrong".
+        // Fail loudly instead (OCR #17, 195e6be #05).
+        DistanceMetric::Cosine | DistanceMetric::InnerProduct | DistanceMetric::L1 => {
+            unreachable!("PQ index only supports L2; cosine/IP/L1 are rejected before construction")
+        }
     }
 }
 

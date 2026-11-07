@@ -20,7 +20,7 @@
 //! shutdown can abort a wedged writer (peer not reading) instead of leaking the
 //! thread, and the network types can be swapped for turmoil's simulated net.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::io;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -389,12 +389,34 @@ struct SessionSlot {
 /// arms fall back to std).
 pub type ShipReceiver = HubReceiver<Arc<ShipBatch>>;
 
+/// 单 follower 的 DURABLE 进度（P5.0.4）：保留 floor 取所有活跃/未过期会话的最小值。
+/// EN: Per-follower DURABLE progress (P5.0.4): the retention floor is the minimum
+/// across active sessions and sessions still inside the disconnect grace.
+struct FollowerProgress {
+    durable_lsn: AtomicU64,
+    last_seen_ms: AtomicU64,
+    active: AtomicBool,
+    /// 是否已有 durable 证据：resume>0 的重连天然携带历史；resume=0 的全新
+    /// follower 在收到第一条 ACK 前不得计入 quorum（LSN 0 的原点二义性，
+    /// 与 `covers` 的 per-stage acked 标志同源）。
+    /// EN: whether durable evidence exists. A reconnect with resume>0 carries
+    /// history; a fresh follower (resume=0) must not count toward quorum before
+    /// its first ACK — the LSN-0 origin ambiguity, same class as `covers`.
+    acked: AtomicBool,
+    /// 当前占用该身份的 session id：旧会话的 unregister/ACK 不得改写新会话。
+    /// EN: session id owning this identity; a stale session must not clobber a
+    /// newer one's progress.
+    session_id: AtomicU64,
+}
+
 /// leader 侧扇出枢纽：wal worker flush 成功后 publish，各 follower session
 /// 从自有队列取批推送。
 /// EN: Leader-side fan-out hub: the wal worker publishes after a successful flush
 /// and each follower session drains its own queue.
 pub struct ShipHub {
     sessions: RwLock<Vec<SessionSlot>>,
+    progress: RwLock<HashMap<[u8; 16], Arc<FollowerProgress>>>,
+    started: Instant,
     next_id: AtomicU64,
     queue_batches: usize,
     // ── 指标（Relaxed，role!=disabled 才输出）──
@@ -408,6 +430,8 @@ impl ShipHub {
     pub fn new(queue_batches: usize) -> Self {
         Self {
             sessions: RwLock::new(Vec::new()),
+            progress: RwLock::new(HashMap::new()),
+            started: Instant::now(),
             next_id: AtomicU64::new(1),
             queue_batches,
             slow_follower_kicks_total: AtomicU64::new(0),
@@ -416,21 +440,245 @@ impl ShipHub {
         }
     }
 
-    /// 注册一个 follower session，返回 (session_id, 接收端)。
-    /// EN: Registers a follower session and returns (session_id, receiver).
+    /// 注册一个匿名测试 session（每次使用合成 follower_id）。
+    /// EN: Registers an anonymous test session (synthetic follower_id each time).
     pub fn register(&self) -> (u64, ShipReceiver) {
-        let (tx, rx) = sc::hub_channel(self.queue_batches.max(1));
+        let n = self.next_id.fetch_add(1, Ordering::Relaxed);
+        let mut follower_id = [0u8; 16];
+        follower_id[8..].copy_from_slice(&n.to_be_bytes());
+        self.register_inner(follower_id, n, 0)
+            .expect("synthetic follower ids are unique")
+    }
+
+    /// 按稳定 follower 身份注册并记录 resume_lsn：初始 durable = resume-1。
+    /// 活跃身份重复注册返回 Err（调用方回结构化错误并告警）。
+    /// EN: Registers by stable follower identity with initial durable = resume-1.
+    /// A duplicate active identity returns Err (the caller emits a structured
+    /// error and logs it).
+    pub fn register_with_resume(
+        &self,
+        follower_id: [u8; 16],
+        resume_lsn: u64,
+    ) -> Result<(u64, ShipReceiver), String> {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        self.register_inner(follower_id, id, resume_lsn)
+    }
+
+    fn register_inner(
+        &self,
+        follower_id: [u8; 16],
+        id: u64,
+        resume_lsn: u64,
+    ) -> Result<(u64, ShipReceiver), String> {
+        let (tx, rx) = sc::hub_channel(self.queue_batches.max(1));
+        // 先挂 session 再在 progress 的写锁内做「查重 + 插入」：两个并发握手
+        // 持同一读锁也能被串行化；锁序保持 sessions → progress（与 unregister
+        // 一致），不引入反序死锁。
+        // EN: push the session first, then do duplicate-check + insert under one
+        // progress write lock — concurrent handshakes holding the gate read lock
+        // are still serialized. Lock order stays sessions → progress (same as
+        // unregister), so no inversion.
         self.sessions.write().unwrap().push(SessionSlot { id, tx });
-        (id, rx)
+        let now = self.now_ms();
+        let mut progress = self.progress.write().unwrap();
+        let duplicate_session = progress.get(&follower_id).and_then(|existing| {
+            existing
+                .active
+                .load(Ordering::Relaxed)
+                .then(|| existing.session_id.load(Ordering::Relaxed))
+        });
+        if let Some(existing_session) = duplicate_session {
+            drop(progress);
+            self.sessions.write().unwrap().retain(|s| s.id != id);
+            return Err(format!(
+                "duplicate active follower_id {} (session {existing_session})",
+                hex16(&follower_id)
+            ));
+        }
+        match progress.get(&follower_id) {
+            Some(existing) => {
+                // 同一身份重连：复用进度条目，新会话从自己的 resume 起算。
+                // EN: Same identity reconnecting: reuse the entry; the new session
+                // starts from its own resume point.
+                existing
+                    .durable_lsn
+                    .store(resume_lsn.saturating_sub(1), Ordering::Relaxed);
+                // resume>0 表示 follower 已持有 [0, resume) 的历史，durable
+                // 证据成立；resume=0 必须等第一条 ACK。
+                // EN: resume>0 carries history; resume=0 waits for the first ACK.
+                existing.acked.store(resume_lsn > 0, Ordering::Relaxed);
+                existing.last_seen_ms.store(now, Ordering::Relaxed);
+                existing.active.store(true, Ordering::Relaxed);
+                existing.session_id.store(id, Ordering::Relaxed);
+            }
+            None => {
+                progress.insert(
+                    follower_id,
+                    Arc::new(FollowerProgress {
+                        durable_lsn: AtomicU64::new(resume_lsn.saturating_sub(1)),
+                        last_seen_ms: AtomicU64::new(now),
+                        active: AtomicBool::new(true),
+                        acked: AtomicBool::new(resume_lsn > 0),
+                        session_id: AtomicU64::new(id),
+                    }),
+                );
+            }
+        }
+        Ok((id, rx))
     }
 
-    /// 注销 session（session 退出路径幂等调用）。
-    /// EN: Unregisters a session (called idempotently on the session exit path).
-    pub fn unregister(&self, id: u64) {
-        self.sessions.write().unwrap().retain(|s| s.id != id);
+    /// DURABLE ACK 推进单会话进度（ACK reader 调用）；旧会话的迟到 ACK 被忽略。
+    /// EN: Advance one session's progress on a DURABLE ACK; late ACKs from a
+    /// superseded session are ignored.
+    pub fn note_durable(&self, follower_id: [u8; 16], session_id: u64, lsn: u64) {
+        if let Some(progress) = self.progress.read().unwrap().get(&follower_id) {
+            if progress.session_id.load(Ordering::Relaxed) != session_id {
+                return;
+            }
+            progress.acked.store(true, Ordering::Relaxed);
+            progress.durable_lsn.fetch_max(lsn, Ordering::Relaxed);
+            progress
+                .last_seen_ms
+                .store(self.now_ms(), Ordering::Relaxed);
+        }
     }
 
+    /// 注销 session（session 退出路径幂等调用）；进度保留到 grace 过期。
+    /// 已被新会话接管的身份不会被旧会话标记为断连。
+    /// EN: Unregister a session; progress is retained until the grace expires.
+    /// An identity taken over by a newer session is not marked disconnected by
+    /// the old one.
+    pub fn unregister(&self, follower_id: [u8; 16], session_id: u64) {
+        self.sessions
+            .write()
+            .unwrap()
+            .retain(|s| s.id != session_id);
+        if let Some(progress) = self.progress.read().unwrap().get(&follower_id) {
+            if progress.session_id.load(Ordering::Relaxed) != session_id {
+                return;
+            }
+            progress.active.store(false, Ordering::Relaxed);
+            progress
+                .last_seen_ms
+                .store(self.now_ms(), Ordering::Relaxed);
+        }
+    }
+
+    /// 活跃 + 未过期断连会话的最小 DURABLE LSN；无会话返回 None。
+    /// EN: Minimum DURABLE LSN across active and still-in-grace disconnected
+    /// sessions; None when there are none.
+    pub fn min_active_durable_lsn(&self, grace: Duration) -> Option<u64> {
+        let now = self.now_ms();
+        let grace_ms = grace.as_millis().min(u64::MAX as u128) as u64;
+        let mut expired = Vec::new();
+        let mut min_lsn: Option<u64> = None;
+        {
+            let progress = self.progress.read().unwrap();
+            for (id, entry) in progress.iter() {
+                let active = entry.active.load(Ordering::Relaxed);
+                let last_seen = entry.last_seen_ms.load(Ordering::Relaxed);
+                if !active && now.saturating_sub(last_seen) > grace_ms {
+                    expired.push(*id);
+                    continue;
+                }
+                let lsn = entry.durable_lsn.load(Ordering::Relaxed);
+                min_lsn = Some(min_lsn.map_or(lsn, |current| current.min(lsn)));
+            }
+        }
+        if !expired.is_empty() {
+            let mut progress = self.progress.write().unwrap();
+            for id in expired {
+                progress.remove(&id);
+            }
+        }
+        min_lsn
+    }
+
+    /// 单个 follower 的进度视图（管理/诊断端点用）。
+    /// EN: per-follower progress view for admin/diagnostic endpoints.
+    pub fn progress_snapshot(&self, grace: Duration) -> Vec<FollowerProgressView> {
+        let now = self.now_ms();
+        let grace_ms = grace.as_millis().min(u64::MAX as u128) as u64;
+        let progress = self.progress.read().unwrap();
+        progress
+            .iter()
+            .filter_map(|(id, entry)| {
+                let active = entry.active.load(Ordering::Relaxed);
+                let last_seen_ms = entry.last_seen_ms.load(Ordering::Relaxed);
+                if !active && now.saturating_sub(last_seen_ms) > grace_ms {
+                    return None;
+                }
+                Some(FollowerProgressView {
+                    follower_id: *id,
+                    session_id: entry.session_id.load(Ordering::Relaxed),
+                    durable_lsn: entry.durable_lsn.load(Ordering::Relaxed),
+                    active,
+                    last_seen_ms,
+                })
+            })
+            .collect()
+    }
+
+    /// 活跃 session 数（quorum 判定只看活跃会话，断连宽限期内的旧进度不算）。
+    /// EN: active session count — quorum counts live sessions only; progress
+    /// inside the disconnect grace never counts as an acknowledgement.
+    pub fn active_follower_count(&self) -> usize {
+        self.progress
+            .read()
+            .unwrap()
+            .values()
+            .filter(|entry| entry.active.load(Ordering::Relaxed))
+            .count()
+    }
+
+    /// K-th 大 durable LSN：至少 `quorum` 个活跃 follower 已持久化到该 LSN。
+    /// 活跃会话不足 `quorum` 时返回 None（调用方按 NoFollower 语义降级）。
+    /// EN: K-th largest durable LSN such that at least `quorum` active followers
+    /// have persisted it; None when fewer active sessions exist.
+    pub fn quorum_durable_lsn(&self, quorum: usize) -> Option<u64> {
+        if quorum == 0 {
+            return None;
+        }
+        let progress = self.progress.read().unwrap();
+        let mut durable: Vec<u64> = progress
+            .values()
+            .filter(|entry| entry.active.load(Ordering::Relaxed))
+            .filter(|entry| entry.acked.load(Ordering::Relaxed))
+            .map(|entry| entry.durable_lsn.load(Ordering::Relaxed))
+            .collect();
+        if durable.len() < quorum {
+            return None;
+        }
+        durable.sort_unstable_by(|a, b| b.cmp(a));
+        Some(durable[quorum - 1])
+    }
+
+    fn now_ms(&self) -> u64 {
+        self.started.elapsed().as_millis().min(u64::MAX as u128) as u64
+    }
+}
+
+/// 单个 follower 的进度快照（对外只读视图）。
+/// EN: read-only per-follower progress snapshot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FollowerProgressView {
+    pub follower_id: [u8; 16],
+    pub session_id: u64,
+    pub durable_lsn: u64,
+    pub active: bool,
+    pub last_seen_ms: u64,
+}
+
+fn hex16(id: &[u8; 16]) -> String {
+    let mut out = String::with_capacity(32);
+    for byte in id {
+        use std::fmt::Write as _;
+        let _ = write!(out, "{byte:02x}");
+    }
+    out
+}
+
+impl ShipHub {
     /// 发布一批（wal worker 单发布者，flush 成功后、reply 前调用）。
     /// 队列满/已断开的 follower 立即踢出——慢 follower 不拖累 wal 写路径。
     /// EN: Publishes one batch (single publisher: the wal worker, after flush and
@@ -520,6 +768,16 @@ pub struct LeaderSessionConfig {
     /// EN: local WAL encryption handle, used only for reading this node's
     /// segments (catch-up and fingerprints); the wire format is unchanged.
     pub encryption: Option<Arc<crate::encryption::Encryption>>,
+    /// leader 真实最早可读 LSN（P5.0.4）：0 表示无截断历史（默认，兼容测试）。
+    /// EN: leader's effective first-available LSN (P5.0.4); 0 means untruncated
+    /// history (the default, keeping tests unchanged).
+    pub leader_first_available_lsn: Arc<dyn Fn() -> io::Result<u64> + Send + Sync>,
+    /// 握手/保留互斥门（P5.0.4）：握手持读锁完成校验与注册，保留持写锁删除；
+    /// None 仅测试使用（保留任务不接线时无竞态）。
+    /// EN: handshake/retention gate (P5.0.4): handshakes hold the read lock
+    /// through validation and registration, retention holds the write lock to
+    /// delete; None is test-only.
+    pub retention_gate: Option<Arc<tokio::sync::RwLock<()>>>,
 }
 
 /// **不要**用默认值重建生产配置：安全字段（如 `auth_token`）会静默丢失。
@@ -535,6 +793,8 @@ impl Default for LeaderSessionConfig {
             catchup_poll_interval: Duration::from_millis(20),
             auth_token: None,
             encryption: None,
+            leader_first_available_lsn: Arc::new(|| Ok(0)),
+            retention_gate: None,
         }
     }
 }
@@ -569,6 +829,19 @@ impl LeaderSessionConfig {
             encryption,
             ..Self::default()
         }
+    }
+
+    /// 注入 leader first-available 读取器与握手/保留互斥门（P5.0.4）。
+    /// EN: injects the leader first-available reader and the handshake/retention
+    /// gate (P5.0.4).
+    pub fn with_retention(
+        mut self,
+        leader_first_available_lsn: Arc<dyn Fn() -> io::Result<u64> + Send + Sync>,
+        retention_gate: Arc<tokio::sync::RwLock<()>>,
+    ) -> Self {
+        self.leader_first_available_lsn = leader_first_available_lsn;
+        self.retention_gate = Some(retention_gate);
+        self
     }
 }
 
@@ -723,6 +996,112 @@ impl AckWatermarks {
         self.sync_wait_nanos_total
             .fetch_add(start.elapsed().as_nanos() as u64, Ordering::Relaxed);
         outcome
+    }
+
+    /// 等待至少 `quorum` 个**活跃** follower 的 DURABLE 进度达到 `lsn`。
+    /// EN: wait until at least `quorum` active followers have DURABLE ≥ lsn.
+    ///
+    /// 为什么不用 `AckWatermarks` 的 max 水位线判 quorum：该水位线是「任一
+    /// follower 的最大 ACK」，单个 follower 就能推满；quorum 语义必须读每
+    /// follower 的进度，故以 ShipHub 为准。ACK reader 的顺序是
+    /// `note_durable` → `on_ack`（见 session 读循环），因此**被唤醒后**的
+    /// 重查必然可见（注册前完成的进度没有该边，超时分支会再读一次）。
+    /// 本循环复用同一 waiter 段与唤醒机制，无需轮询。
+    /// EN: the max watermark is "any follower's best ACK" and cannot witness a
+    /// quorum, so progress comes from ShipHub. The ACK reader advances
+    /// `note_durable` before `on_ack`, so a wakeup-triggered re-check observes
+    /// the progress it was awakened for (pre-registration progress has no such
+    /// edge; the timeout branch re-reads once). The loop reuses the same waiter
+    /// segments rather than polling.
+    ///
+    /// 活跃 follower 少于 quorum 时按 `NoFollower` 立即降级（等下去也不会有
+    /// 第 K 份 ACK）；超时按 `Timeout` 降级并计数。
+    /// EN: fewer active followers than `quorum` degrades immediately as
+    /// `NoFollower`; expiry reports `Timeout` and is counted.
+    pub fn wait_durable_quorum(
+        &self,
+        lsn: u64,
+        hub: &ShipHub,
+        quorum: usize,
+        timeout: Duration,
+    ) -> SyncWaitOutcome {
+        let start = Instant::now();
+        self.sync_waits_total.fetch_add(1, Ordering::Relaxed);
+        // quorum=0 是配置默认的「任一 ACK」；直接走既有语义，避免调用方把
+        // 原始配置值传进来时每笔 sync 写都空等超时。
+        // EN: quorum=0 means the legacy any-ACK semantics; a caller passing the
+        // raw configured default must not wait out every timeout.
+        let outcome = if quorum == 0 {
+            self.wait_inner(
+                lsn,
+                proto::ACK_STAGE_DURABLE,
+                hub.follower_count() > 0,
+                timeout,
+            )
+        } else {
+            self.wait_quorum_inner(lsn, hub, quorum, timeout)
+        };
+        self.sync_wait_nanos_total
+            .fetch_add(start.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        outcome
+    }
+
+    fn wait_quorum_inner(
+        &self,
+        lsn: u64,
+        hub: &ShipHub,
+        quorum: usize,
+        timeout: Duration,
+    ) -> SyncWaitOutcome {
+        let stage = proto::ACK_STAGE_DURABLE;
+        let deadline = Instant::now() + timeout;
+        loop {
+            if hub.quorum_durable_lsn(quorum).is_some_and(|d| d >= lsn) {
+                return SyncWaitOutcome::Satisfied;
+            }
+            if hub.active_follower_count() < quorum {
+                self.sync_no_follower_total.fetch_add(1, Ordering::Relaxed);
+                return SyncWaitOutcome::NoFollower;
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                self.sync_timeouts_total.fetch_add(1, Ordering::Relaxed);
+                return SyncWaitOutcome::Timeout;
+            }
+            let (tx, rx) = sc::channel::<()>();
+            let id = self.next_waiter_id.fetch_add(1, Ordering::Relaxed);
+            let seg = &self.waiters[(lsn as usize) & (WAITER_SEGMENTS - 1)];
+            seg.lock().unwrap().push(WaiterEntry { id, lsn, stage, tx });
+            // 注册后复检 + ACK reader 的 note_durable→on_ack 顺序共同关闭
+            // 错失唤醒窗口：复检为假时，下一次推进必在注册之后发 on_ack。
+            // EN: the post-registration re-check plus note_durable-before-on_ack
+            // close the missed-wakeup window: if the re-check is false, the
+            // next progress must fire on_ack after our registration.
+            if hub.quorum_durable_lsn(quorum).is_some_and(|d| d >= lsn) {
+                seg.lock().unwrap().retain(|w| w.id != id);
+                return SyncWaitOutcome::Satisfied;
+            }
+            match recv_timeout(&rx, remaining) {
+                Ok(()) => continue,
+                Err(RecvTimeoutError::Timeout) | Err(RecvTimeoutError::Disconnected) => {
+                    seg.lock().unwrap().retain(|w| w.id != id);
+                    // 超时前再读一次真实进度：注册前的 ACK 没有唤醒边，
+                    // 弱序架构上复检可能读到旧值，不能让它白等一个完整超时。
+                    // EN: re-read the real progress before reporting a timeout —
+                    // a pre-registration ACK has no wakeup edge and a weak-memory
+                    // re-check may have missed it.
+                    if hub.quorum_durable_lsn(quorum).is_some_and(|d| d >= lsn) {
+                        return SyncWaitOutcome::Satisfied;
+                    }
+                    // Disconnected 与既有 wait_inner 同纪律：无 ACK 证据绝不
+                    // 虚报 durable，按超时降级。
+                    // EN: same discipline as wait_inner — without ACK evidence
+                    // never report durable; degrade as a timeout.
+                    self.sync_timeouts_total.fetch_add(1, Ordering::Relaxed);
+                    return SyncWaitOutcome::Timeout;
+                }
+            }
+        }
     }
 
     fn wait_inner(
@@ -882,6 +1261,10 @@ impl ReplicationLeader {
                                 catchup_poll_interval: config.catchup_poll_interval,
                                 auth_token: config.auth_token.clone(),
                                 encryption: config.encryption.clone(),
+                                leader_first_available_lsn: Arc::clone(
+                                    &config.leader_first_available_lsn,
+                                ),
+                                retention_gate: config.retention_gate.as_ref().map(Arc::clone),
                             };
                             let handle = tokio::spawn(async move {
                                 if let Err(e) =
@@ -952,6 +1335,30 @@ impl ReplicationLeader {
 /// EN: per-IO hard timeout so a silent peer cannot pin the task.
 #[cfg(not(loom))]
 const SESSION_IO_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// 采样 leader 的 first_available：`WalHandle::Async` 的读取是 mpsc 发送 +
+/// 无超时阻塞收包，不能直接在 runtime worker 上调用（WAL writer 可能正卡在
+/// fsync 或已 wedged）。移到阻塞池并用会话预算限时；超时只放弃本次握手，
+/// 不阻塞保留门。
+/// EN: Sample the leader's first-available: the WAL-handle read is a blocking
+/// mpsc round trip (the writer may be mid-fsync or wedged), so it must not run
+/// on a runtime worker. Run it on the blocking pool under the session budget;
+/// a timeout abandons this handshake without pinning the retention gate.
+#[cfg(not(loom))]
+async fn sample_first_available(config: &LeaderSessionConfig) -> io::Result<u64> {
+    let sample = Arc::clone(&config.leader_first_available_lsn);
+    let join = tokio::task::spawn_blocking(move || sample());
+    match runtime::timeout(SESSION_IO_TIMEOUT, join).await {
+        Ok(Ok(result)) => result,
+        Ok(Err(join_err)) => Err(io::Error::other(format!(
+            "first-available sampler join failed: {join_err}"
+        ))),
+        Err(_) => Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "first-available sampler timed out",
+        )),
+    }
+}
 
 /// 单 follower session：握手 → catch-up → live 推送；ACK reader 并行 task。
 /// EN: One follower session: handshake → catch-up → live push; a parallel ACK
@@ -1040,6 +1447,9 @@ async fn serve_session(
         resume_lsn,
         stream_mask,
         log_hash: follower_hash,
+        log_start_lsn,
+        snapshot_checkpoint,
+        follower_id,
         ..
     } = prefix;
     if stream_mask & proto::STREAM_MASK_COLLECTIONS == 0 {
@@ -1057,6 +1467,30 @@ async fn serve_session(
         .await;
         return Err(e);
     }
+    // 病态字段校验（P5.0.4）：不可信的 follower 不得用畸形基线驱动哈希。
+    // EN: pathological-field checks (P5.0.4): an untrusted follower must not
+    // drive hashing with a malformed baseline.
+    if log_start_lsn > resume_lsn {
+        let msg =
+            format!("malformed handshake: log_start_lsn {log_start_lsn} > resume_lsn {resume_lsn}");
+        let _ = runtime::timeout(
+            SESSION_IO_TIMEOUT,
+            stream.write_all(&proto::encode_error(proto::ERROR_KIND_GENERIC, &msg)),
+        )
+        .await;
+        return Err(io::Error::new(io::ErrorKind::InvalidData, msg));
+    }
+    if snapshot_checkpoint != 0 && snapshot_checkpoint >= resume_lsn {
+        let msg = format!(
+            "malformed handshake: snapshot_checkpoint {snapshot_checkpoint} >= resume_lsn {resume_lsn}"
+        );
+        let _ = runtime::timeout(
+            SESSION_IO_TIMEOUT,
+            stream.write_all(&proto::encode_error(proto::ERROR_KIND_GENERIC, &msg)),
+        )
+        .await;
+        return Err(io::Error::new(io::ErrorKind::InvalidData, msg));
+    }
     let leader_next = leader_next_lsn();
     if resume_lsn > leader_next {
         // follower_ahead = 脑裂信号：拒绝并显式报错，人工处置。
@@ -1072,32 +1506,18 @@ async fn serve_session(
         return Err(io::Error::new(io::ErrorKind::InvalidData, msg));
     }
 
-    // 1.5) 日志指纹：长度相同必须内容相同。
-    //
-    // 为什么放在 ahead 检查之后（WHY）：resume_lsn 超前时 leader 没有对应的
-    // 历史可哈希（prefix_hash 会因「历史短于 resume」报错），先按既有语义
-    // 返回 follower_ahead。长度不超前但内容不同 = 分叉，必须拒绝——否则
-    // follower 的 `lsn < expected` 幂等跳过会把同 LSN 的两条不同记录永久
-    // 固化（P4.5.6 模型反例）。
-    // EN: run after the ahead check (which handles resume > leader_next); an
-    // equal-length but different history is divergence and must be rejected,
-    // or the follower's idempotent skip freezes two different records at one
-    // LSN (the P4.5.6 counterexample).
-    //
-    // 失败必须先回结构化 ERROR 再断开（OCR 批次二十七）：裸 EOF 会让 follower
-    // 把「本地日志损坏/格式不符」误分类成网络抖动，陷入通用重连风暴。
-    // EN: send a structured ERROR before closing (batch 27) — a bare EOF makes
-    // the follower misclassify a local-log fault as a network flap.
-    let leader_hash = match crate::log_fingerprint::prefix_hash_blocking_with_encryption(
-        wal_path.to_path_buf(),
-        resume_lsn,
-        config.encryption.clone(),
-    )
-    .await
-    {
-        Ok(h) => h,
+    // 1.5) 锚点协商（P5.0.4）：先在不持锁的情况下采样 first_available 并完成
+    // ANCHOR/HNDA 往返（对端节奏，不能让它卡住保留）。真正的保留门在拿到
+    // 基线后获取，并在锁内重采样，关闭「采样后段被删」的窗口。
+    // EN: Anchor negotiation (P5.0.4): sample first-available and complete the
+    // ANCHOR/HNDA round trip without holding the gate (follower-paced I/O must
+    // not stall retention). The gate is taken after the baseline is known and
+    // first-available is re-sampled under it, closing the sampled-then-deleted
+    // window.
+    let leader_first = match sample_first_available(config).await {
+        Ok(v) => v,
         Err(e) => {
-            let msg = format!("log fingerprint failed at resume_lsn {resume_lsn}: {e}");
+            let msg = format!("leader first-available LSN failed: {e}");
             let _ = runtime::timeout(
                 SESSION_IO_TIMEOUT,
                 stream.write_all(&proto::encode_error(proto::ERROR_KIND_GENERIC, &msg)),
@@ -1106,37 +1526,213 @@ async fn serve_session(
             return Err(e);
         }
     };
-    if leader_hash != follower_hash {
+    if resume_lsn < leader_first {
         let msg = format!(
-            "log diverged at resume_lsn {resume_lsn}: follower_hash={follower_hash:#018x} \
-             leader_hash={leader_hash:#018x}"
+            "behind retained: resume_lsn {resume_lsn} < leader first_available {leader_first}; \
+             follower must be fully re-synced"
         );
         let _ = runtime::timeout(
             SESSION_IO_TIMEOUT,
-            stream.write_all(&proto::encode_error(proto::ERROR_KIND_DIVERGED, &msg)),
+            stream.write_all(&proto::encode_error(
+                proto::ERROR_KIND_BEHIND_RETAINED,
+                &msg,
+            )),
         )
         .await;
         return Err(io::Error::new(io::ErrorKind::InvalidData, msg));
     }
 
-    // 2) WELCOME
-    runtime::timeout(
-        SESSION_IO_TIMEOUT,
-        stream.write_all(&proto::encode_welcome(leader_next)),
+    // 基线：follower 的起始点仍在 leader 保留范围内则直接用；否则发 ANCHOR，
+    // 让 follower 以 leader 的 first_available 重算范围指纹。
+    // EN: if the follower's base is still inside the leader's retained range,
+    // hash it directly; otherwise send ANCHOR so the follower rehashes from the
+    // leader's first-available point.
+    let anchored = log_start_lsn < leader_first;
+    // 锚点路径下 follower 发来的是 [anchor, resume) 的哈希；非锚点路径才是
+    // 原始 [log_start, resume) 哈希。比较对象必须随路径切换。
+    // EN: On the anchor path the follower sends the [anchor, resume) hash; the
+    // non-anchor path keeps the original [log_start, resume) hash.
+    let mut expected_hash = follower_hash;
+    let base_lsn = if anchored {
+        runtime::timeout(
+            SESSION_IO_TIMEOUT,
+            stream.write_all(&proto::encode_anchor(leader_first)),
+        )
+        .await
+        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "anchor write timeout"))??;
+        let mut abuf = [0u8; proto::HANDSHAKE_ANCHORED_LEN];
+        let read = runtime::timeout(SESSION_IO_TIMEOUT, stream.read_exact(&mut abuf)).await;
+        let got = match read {
+            Ok(Ok(_)) => proto::decode_handshake_anchored(&abuf)?,
+            Ok(Err(e)) => return Err(e),
+            Err(_) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "anchored handshake read timeout",
+                ))
+            }
+        };
+        if got.anchor_lsn != leader_first {
+            let msg = format!(
+                "behind retained: follower anchored at {} but leader first_available is {}",
+                got.anchor_lsn, leader_first
+            );
+            let _ = runtime::timeout(
+                SESSION_IO_TIMEOUT,
+                stream.write_all(&proto::encode_error(
+                    proto::ERROR_KIND_BEHIND_RETAINED,
+                    &msg,
+                )),
+            )
+            .await;
+            return Err(io::Error::new(io::ErrorKind::InvalidData, msg));
+        }
+        expected_hash = got.log_hash;
+        leader_first
+    } else {
+        log_start_lsn
+    };
+
+    // 保留门在基线确定后获取；锁内重采样 first_available，若它已越过基线
+    // （锚点/起点被删），必须让 follower 重新握手而不是继续用陈旧基线。
+    // EN: Take the gate once the baseline is known and re-sample first-available
+    // under it; if it has moved past the baseline, the follower must handshake
+    // again instead of continuing with a stale base.
+    let gate_guard = match &config.retention_gate {
+        Some(gate) => Some(gate.read().await),
+        None => None,
+    };
+    let leader_first_now = match sample_first_available(config).await {
+        Ok(v) => v,
+        Err(e) => {
+            let msg = format!("leader first-available LSN failed: {e}");
+            let _ = runtime::timeout(
+                SESSION_IO_TIMEOUT,
+                stream.write_all(&proto::encode_error(proto::ERROR_KIND_GENERIC, &msg)),
+            )
+            .await;
+            return Err(e);
+        }
+    };
+    if base_lsn < leader_first_now {
+        let msg = format!(
+            "behind retained: baseline {base_lsn} < leader first_available {leader_first_now} \
+             (retention advanced during handshake); follower must re-handshake"
+        );
+        let _ = runtime::timeout(
+            SESSION_IO_TIMEOUT,
+            stream.write_all(&proto::encode_error(
+                proto::ERROR_KIND_BEHIND_RETAINED,
+                &msg,
+            )),
+        )
+        .await;
+        return Err(io::Error::new(io::ErrorKind::InvalidData, msg));
+    }
+
+    // 长度相同必须内容相同：否则 follower 的 `lsn < expected` 幂等跳过会把
+    // 同 LSN 的两条不同记录永久固化（P4.5.6 模型反例）。
+    // EN: equal bases must have equal content; otherwise the follower's
+    // idempotent skip freezes two different records at one LSN (P4.5.6).
+    //
+    // 失败必须先回结构化 ERROR 再断开（OCR 批次二十七）：裸 EOF 会让 follower
+    // 把「本地日志损坏/格式不符」误分类成网络抖动。
+    // EN: send a structured ERROR before closing (batch 27) — a bare EOF makes
+    // the follower misclassify a local-log fault as a network flap.
+    let leader_hash = match crate::log_fingerprint::range_hash_blocking_with_encryption(
+        wal_path.to_path_buf(),
+        base_lsn,
+        resume_lsn,
+        config.encryption.clone(),
     )
     .await
-    .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "welcome write timeout"))??;
+    {
+        Err(crate::log_fingerprint::FingerprintError::Unavailable { .. }) if anchored => {
+            let msg = format!(
+                "behind retained: leader cannot hash [{base_lsn}, {resume_lsn}) after anchor"
+            );
+            let _ = runtime::timeout(
+                SESSION_IO_TIMEOUT,
+                stream.write_all(&proto::encode_error(
+                    proto::ERROR_KIND_BEHIND_RETAINED,
+                    &msg,
+                )),
+            )
+            .await;
+            return Err(io::Error::new(io::ErrorKind::InvalidData, msg));
+        }
+        Ok(h) => h,
+        Err(e) => {
+            let msg = format!("log fingerprint failed at [{base_lsn}, {resume_lsn}): {e}");
+            let _ = runtime::timeout(
+                SESSION_IO_TIMEOUT,
+                stream.write_all(&proto::encode_error(proto::ERROR_KIND_GENERIC, &msg)),
+            )
+            .await;
+            return Err(io::Error::new(io::ErrorKind::InvalidData, msg));
+        }
+    };
+    if leader_hash != expected_hash {
+        let msg = format!(
+            "log diverged at resume_lsn {resume_lsn}: follower_hash={expected_hash:#018x} \
+             leader_hash={leader_hash:#018x}"
+        );
+        // 锚点后的哈希不一致属于同 LSN 不同内容（分叉），与 anchor_lsn 不匹配
+        // （保留推进）是两回事；保留不可用已在前面单独判为 BEHIND_RETAINED。
+        // EN: A hash mismatch after anchoring is same-LSN/different-content
+        // divergence; an unusable retained range was already classified as
+        // BEHIND_RETAINED above.
+        let kind = proto::ERROR_KIND_DIVERGED;
+        let _ = runtime::timeout(
+            SESSION_IO_TIMEOUT,
+            stream.write_all(&proto::encode_error(kind, &msg)),
+        )
+        .await;
+        return Err(io::Error::new(io::ErrorKind::InvalidData, msg));
+    }
+    tracing::info!(
+        follower_id = %hex16(&follower_id),
+        resume_lsn,
+        leader_next,
+        leader_first,
+        snapshot_checkpoint,
+        anchored,
+        "replication leader: handshake verified"
+    );
 
-    // 3) 先注册后 catch-up：衔接缝隙（注册后到达的 live 批与文件 catch-up
-    //    重叠）由 follower 幂等吸收（lsn < expected 跳过仍 ACK）。
-    // EN: 3) Register before catch-up: the seam (live batches arriving after
-    // registration overlap with file catch-up) is absorbed idempotently by the
-    // follower (lsn < expected is skipped but still ACKed).
-    let (session_id, mut rx) = hub.register();
+    // 2) 注册（仍在保留门外加锁读锁下）→ WELCOME。
+    //    衔接缝隙（注册后到达的 live 批与文件 catch-up 重叠）由 follower
+    //    幂等吸收（lsn < expected 跳过仍 ACK）。
+    // EN: 2) Register (still under the retention read lock), then WELCOME. The
+    // seam between live batches and file catch-up is absorbed idempotently by
+    // the follower (lsn < expected is skipped but still ACKed).
+    let (session_id, mut rx) = match hub.register_with_resume(follower_id, resume_lsn) {
+        Ok(v) => v,
+        Err(msg) => {
+            let _ = runtime::timeout(
+                SESSION_IO_TIMEOUT,
+                stream.write_all(&proto::encode_error(proto::ERROR_KIND_GENERIC, &msg)),
+            )
+            .await;
+            return Err(io::Error::new(io::ErrorKind::InvalidData, msg));
+        }
+    };
     let _guard = SessionGuard {
         hub: Arc::clone(&hub),
         id: session_id,
+        follower_id,
     };
+    // 注册完成后即受 follower durable 进度保护，无需再持锁；WELCOME 是
+    // follower 节奏的写，不能让它拖住保留。
+    // EN: Once registered, the follower's durable progress protects the range;
+    // WELCOME is follower-paced and must not stall retention.
+    drop(gate_guard);
+    runtime::timeout(
+        SESSION_IO_TIMEOUT,
+        stream.write_all(&proto::encode_welcome(leader_next, leader_first)),
+    )
+    .await
+    .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "welcome write timeout"))??;
 
     // 4) 双向拆分：ACK reader 用读半，writer 用写半。
     // EN: 4) Bidirectional split: the ACK reader uses the read half, the writer
@@ -1150,6 +1746,7 @@ async fn serve_session(
     let ack_handle = {
         let wm = Arc::clone(&watermarks);
         let dead = Arc::clone(&ack_dead);
+        let hub_ack = Arc::clone(&hub);
         tokio::spawn(async move {
             let mut last_ack = Instant::now();
             loop {
@@ -1204,6 +1801,15 @@ async fn serve_session(
                 }
                 match proto::decode_frame_header(&frame) {
                     Ok(proto::FrameHeader::Ack { stage, lsn, .. }) => {
+                        // 进度先行、唤醒在后（EE M1 quorum 等待依赖此顺序）：
+                        // 被 on_ack 唤醒的 quorum 等待者重查 ShipHub 进度时，
+                        // note_durable 必须已经可见，否则会漏掉这一次唤醒。
+                        // EN: progress first, wake second (EE M1 quorum waits rely
+                        // on it): a waiter woken by on_ack must see note_durable
+                        // already applied, or it would miss this wakeup.
+                        if stage == proto::ACK_STAGE_DURABLE {
+                            hub_ack.note_durable(follower_id, session_id, lsn);
+                        }
                         wm.on_ack(stage, lsn);
                         last_ack = Instant::now();
                     }
@@ -1337,12 +1943,13 @@ async fn session_body<W: tokio::io::AsyncWrite + Unpin>(
 struct SessionGuard {
     hub: Arc<ShipHub>,
     id: u64,
+    follower_id: [u8; 16],
 }
 
 #[cfg(not(loom))]
 impl Drop for SessionGuard {
     fn drop(&mut self) {
-        self.hub.unregister(self.id);
+        self.hub.unregister(self.follower_id, self.id);
     }
 }
 
@@ -1399,6 +2006,129 @@ mod tests {
         }
     }
 
+    /// P5.0.4：保留 floor 取活跃/未过期会话的最小 durable；断连 grace 过期后剔除。
+    /// EN: P5.0.4 — the retention floor is the minimum durable across active and
+    /// in-grace sessions; expired disconnected sessions are dropped.
+    #[test]
+    fn hub_progress_uses_min_durable_and_grace() {
+        let hub = ShipHub::new(4);
+        let id_a = [1u8; 16];
+        let id_b = [2u8; 16];
+        let (a, _rx_a) = hub.register_with_resume(id_a, 10).unwrap();
+        assert_eq!(hub.min_active_durable_lsn(Duration::from_secs(60)), Some(9));
+        let (b, _rx_b) = hub.register_with_resume(id_b, 5).unwrap();
+        assert_eq!(hub.min_active_durable_lsn(Duration::from_secs(60)), Some(4));
+        hub.note_durable(id_a, a, 20);
+        assert_eq!(
+            hub.min_active_durable_lsn(Duration::from_secs(60)),
+            Some(4),
+            "the lagging session must pin the floor"
+        );
+        hub.unregister(id_b, b);
+        assert_eq!(
+            hub.min_active_durable_lsn(Duration::from_secs(60)),
+            Some(4),
+            "disconnected session stays in grace"
+        );
+        std::thread::sleep(Duration::from_millis(2));
+        assert_eq!(
+            hub.min_active_durable_lsn(Duration::from_secs(0)),
+            Some(20),
+            "expired session must no longer pin the floor"
+        );
+    }
+
+    /// K-th 大 durable：quorum 只看活跃会话，断连宽限期内的旧进度不算 ACK。
+    /// EN: K-th largest durable counts active sessions only; a disconnected
+    /// follower inside the grace never counts as an acknowledgement.
+    #[test]
+    fn hub_quorum_durable_is_kth_largest_of_active() {
+        let hub = ShipHub::new(8);
+        let (id_a, id_b, id_c) = ([1u8; 16], [2u8; 16], [3u8; 16]);
+        let (a, _rx_a) = hub.register_with_resume(id_a, 1).unwrap();
+        let (b, _rx_b) = hub.register_with_resume(id_b, 1).unwrap();
+        let (c, _rx_c) = hub.register_with_resume(id_c, 1).unwrap();
+        hub.note_durable(id_a, a, 100);
+        hub.note_durable(id_b, b, 50);
+        hub.note_durable(id_c, c, 10);
+        assert_eq!(hub.active_follower_count(), 3);
+        assert_eq!(hub.quorum_durable_lsn(1), Some(100));
+        assert_eq!(
+            hub.quorum_durable_lsn(2),
+            Some(50),
+            "2nd quorum is the second largest"
+        );
+        assert_eq!(hub.quorum_durable_lsn(3), Some(10));
+        assert_eq!(
+            hub.quorum_durable_lsn(4),
+            None,
+            "fewer followers than quorum"
+        );
+        // 断连的 follower 不参与 quorum（即便宽限期内仍参与保留 floor）。
+        // EN: A disconnected follower never counts toward quorum (it still pins
+        // the retention floor inside the grace).
+        hub.unregister(id_c, c);
+        assert_eq!(hub.active_follower_count(), 2);
+        assert_eq!(hub.quorum_durable_lsn(3), None);
+        assert!(
+            !hub.progress_snapshot(Duration::from_secs(60))
+                .iter()
+                .find(|p| p.follower_id == id_c)
+                .expect("id_c visible inside grace")
+                .active
+        );
+    }
+
+    /// 全新 follower（resume=0）在首条 ACK 前不得计入 quorum：LSN 0 的原点
+    /// 二义性会让首条写入被虚报为 quorum-durable。
+    /// EN: a fresh follower (resume=0) must not count toward quorum before its
+    /// first ACK — the LSN-0 origin ambiguity would fake the first write.
+    #[test]
+    fn fresh_follower_needs_an_ack_before_counting() {
+        let hub = ShipHub::new(4);
+        let id = [7u8; 16];
+        let (session, _rx) = hub.register_with_resume(id, 0).unwrap();
+        assert_eq!(
+            hub.quorum_durable_lsn(1),
+            None,
+            "resume=0 without an ACK has no durable evidence"
+        );
+        hub.note_durable(id, session, 0);
+        assert_eq!(hub.quorum_durable_lsn(1), Some(0));
+    }
+
+    /// quorum 等待：满足即返回；活跃 follower 不足按 NoFollower；无进度超时。
+    /// EN: quorum wait: satisfied immediately; insufficient active followers is
+    /// NoFollower; no progress times out.
+    #[test]
+    fn quorum_wait_outcomes() {
+        let hub = Arc::new(ShipHub::new(8));
+        let wm = AckWatermarks::new();
+        let (id_a, id_b) = ([1u8; 16], [2u8; 16]);
+        let (a, _rx_a) = hub.register_with_resume(id_a, 1).unwrap();
+        let (b, _rx_b) = hub.register_with_resume(id_b, 1).unwrap();
+        hub.note_durable(id_a, a, 10);
+        hub.note_durable(id_b, b, 10);
+        assert_eq!(
+            wm.wait_durable_quorum(10, &hub, 2, Duration::from_millis(200)),
+            SyncWaitOutcome::Satisfied
+        );
+        // 目标 LSN 超出两个 follower 的进度，且没有后续 ACK → 超时。
+        // EN: The target LSN is beyond both followers' progress and no further
+        // ACK arrives, so the wait times out.
+        assert_eq!(
+            wm.wait_durable_quorum(11, &hub, 2, Duration::from_millis(20)),
+            SyncWaitOutcome::Timeout
+        );
+        // quorum=3 但只有 2 个活跃会话 → 立即 NoFollower（不空等）。
+        // EN: quorum=3 with only two active sessions degrades immediately as
+        // NoFollower instead of waiting out the timeout.
+        assert_eq!(
+            wm.wait_durable_quorum(1, &hub, 3, Duration::from_millis(200)),
+            SyncWaitOutcome::NoFollower
+        );
+    }
+
     #[test]
     fn hub_fanout_delivers_to_all_sessions() {
         let hub = ShipHub::new(8);
@@ -1451,10 +2181,33 @@ mod tests {
     #[test]
     fn hub_unregister_is_idempotent() {
         let hub = ShipHub::new(4);
-        let (id, _rx) = hub.register();
-        hub.unregister(id);
-        hub.unregister(id);
+        let follower_id = [9u8; 16];
+        let (id, _rx) = hub.register_with_resume(follower_id, 0).unwrap();
+        hub.unregister(follower_id, id);
+        hub.unregister(follower_id, id);
         assert_eq!(hub.follower_count(), 0);
+    }
+
+    /// P5.0.4：同一 follower_id 活跃时重复注册必须拒绝；断连后可重连并接管。
+    /// EN: P5.0.4 — a duplicate active follower_id is rejected; after disconnect
+    /// the same identity may reconnect and take over.
+    #[test]
+    fn hub_rejects_duplicate_active_follower_id() {
+        let hub = ShipHub::new(4);
+        let follower_id = [3u8; 16];
+        let (first, _rx_first) = hub.register_with_resume(follower_id, 4).unwrap();
+        // 不用 unwrap_err：shuttle 的 Receiver Debug 要求 payload 也实现 Debug，
+        // 而 ShipBatch 不实现；显式 match 不触发该约束。
+        // EN: avoid unwrap_err: shuttle's Receiver Debug requires the payload to be
+        // Debug, which ShipBatch is not; an explicit match sidesteps it.
+        let err = match hub.register_with_resume(follower_id, 4) {
+            Ok(_) => panic!("duplicate follower_id must be rejected"),
+            Err(err) => err,
+        };
+        assert!(err.contains("duplicate active follower_id"), "{err}");
+        hub.unregister(follower_id, first);
+        let (_second, _rx_second) = hub.register_with_resume(follower_id, 4).unwrap();
+        assert_eq!(hub.min_active_durable_lsn(Duration::from_secs(60)), Some(3));
     }
 
     #[test]

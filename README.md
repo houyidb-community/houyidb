@@ -1,10 +1,8 @@
-# HouyiDB v0.2.0-beta.5
+# HouyiDB v0.2.0-beta.8
 
 > [English](README.en.md)
 
 <p align="center"><img src="docs/assets/logo-h-zh-red.png" alt="HouyiDB 后羿向量数据库" width="420"></p>
-
-<p align="center"><a href="https://artifacthub.io/packages/helm/houyidb/houyidb"><img src="https://img.shields.io/endpoint?url=https://artifacthub.io/badge/repository/houyidb" alt="Artifact Hub"></a></p>
 
 单机、内存优先的向量数据库：HNSW 向量检索 + PAX 行列混存 + pg_wire/HTTP 双接口 + WAL 持久化。
 

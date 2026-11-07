@@ -142,7 +142,9 @@ pub fn parse_houyi_pgwire_sql(sql: &str) -> Result<HouyiPgWireSql, String> {
 
 /// AST-based：从 SQL 中提取 `LIMIT n` 子句。
 /// EN: AST-based: extracts the `LIMIT n` clause from SQL.
-fn extract_limit_k(sql: &str) -> Option<usize> {
+/// 提取 `LIMIT n`（查询日志/统计用；与规划器共用同一实现）。
+/// EN: extract `LIMIT n`; shared with the planner and query logging.
+pub fn extract_limit_k(sql: &str) -> Option<usize> {
     let dialect = GenericDialect {};
     let ast = Parser::parse_sql(&dialect, sql).ok()?;
     let stmt = ast.first()?;

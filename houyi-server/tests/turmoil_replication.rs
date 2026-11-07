@@ -110,6 +110,9 @@ fn fast_follower_config() -> FollowerConfig {
         ahead_retry_interval: Duration::from_millis(50),
         auth_token: None,
         encryption: None,
+        follower_id: [1u8; 16],
+        snapshot_checkpoint: Arc::new(|| 0),
+        behind_retained_retry_interval: Duration::from_millis(50),
     }
 }
 

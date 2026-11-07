@@ -16,7 +16,7 @@ cxl-memory = []
 ha-raft = []
 
 [dependencies]
-houyi-core = { path = "../houyi-core", version = "0.2.0-beta.5", default-features = false, features = ["portable"] }
+houyi-core = { path = "../houyi-core", version = "0.2.0-beta.8", default-features = false, features = ["portable"] }
 ahash = "0.8"
 async-trait.workspace = true
 parking_lot.workspace = true

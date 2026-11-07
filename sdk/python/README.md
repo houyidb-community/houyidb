@@ -40,6 +40,30 @@ col.delete(filters=[Filter("price", "lt", 10)])                # 按条件（见
 
 LangChain / LlamaIndex 用法见各自包内 README。
 
+## 显式建集合（维度/度量/后端/HNSW 一次定型）
+
+`PUT /v1/collections/{name}` 是普通写路径（写权限，不需要 admin token）。
+显式创建会锁定维度与度量：同名已存在 → `HouyiError(status_code=409)`；
+度量与后端创建后不可变，省略字段走服务端默认（`cosine` + `hnsw`）。
+
+```python
+from houyidb import HnswParams
+
+created = client.create_collection(
+    "docs", 768,
+    metric="ip",          # l2 / cosine / ip / l1
+    index_type="hnsw",    # hnsw / flat / clustered / flat-clustered / pq-flat / hii-l0
+    hnsw=HnswParams(m=16, ef_construction=100, ef_search=64),
+)
+created["metric"]  # "ip"；服务端回显实际生效参数
+```
+
+度量支持矩阵：`hnsw` / `flat` / `clustered` / `flat-clustered` 支持全部四种；
+`pq-flat` 仅 `l2`；`hii-l0` 仅 `cosine`。
+
+检索分数按度量换算（越大越相似）：`cosine` → `1 - distance` ∈ [-1, 1]；
+`l2` / `l1` → `1 - distance`（不截断）；`ip` → 点积本身。
+
 ## 写入可见性（双速写入）
 
 批量 upsert 先滞留异步构图队列（builder_queue），flush（日常约几十毫秒）后才
@@ -69,6 +93,24 @@ resp = client.embeddings.create(
 resp.houyi  # {"collection": "docs", "upserted": 1} —— id = stable_id(text)，重跑幂等
 ```
 
+## 管理操作：删除整个 collection（不可逆）
+
+需服务端管理员权限（RBAC `Action::Admin`）。删除走 WAL-first：记录先落盘，
+崩溃重放与 follower 复制都收敛到「已删除」。**不可逆**，删除前请先用导出
+端点（`GET /v1/collections/{name}/export`）备份。同名重建得到全新的空
+collection，旧向量不会复活。`admin_token` 只附加在 `/v1/admin/*` 请求上，
+普通读写不携带。
+
+```python
+admin = HouyiClient(base_url, admin_token=admin_token)
+admin.delete_collection("docs")  # 不存在 → HouyiError(status_code=404)
+```
+
+EN: Admin-only on the server. WAL-first, so crash replay and follower
+replication converge to "gone". **Irreversible**; export first. A same-name
+recreate starts empty and never resurrects old vectors. `admin_token` is
+attached only to `/v1/admin/*` requests.
+
 ## 测试
 
 ```bash
@@ -89,4 +131,5 @@ cargo build --release -p houyi-server
 - payload/metadata 键 `label` 为保留列。
 - 过滤操作符仅 `eq/gt/gte/lt/lte/in`，多条件 AND 交集；仅 hnsw/flat 后端支持
   过滤与删除（其余后端 400 fail-fast）。
-- delete 为内存态操作（与标量页同口径，不进 WAL/快照）。
+- 向量 delete 为内存态操作（与标量页同口径，不进 WAL/快照）；整库
+  `delete_collection` 是管理操作，走 WAL（`collection_drop`）并复制到 follower。

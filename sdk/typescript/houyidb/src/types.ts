@@ -4,7 +4,8 @@
  * 与服务端的契约要点：
  * - collection 在首次 upsert 时隐式创建，维度由首个向量定型；
  * - payload 键 "label" 为保留列，占用会 400（用顶层 label 字段）；
- * - 检索响应的 score 是相似度（1 - cosine_distance，越大越相似）；
+ * - 检索响应的 score 是相似度，按 collection 度量换算（cosine 为 1 - d 且
+ *   钳制 [-1,1]；l2/l1 为 1 - d 不钳制；ip 为原始点积），越大越相似；
  * - 向量 id 是 u64：一律以 bigint 暴露（Number 安全域只到 2^53-1），
  *   输入侧接受 bigint | number | string 并归一。
  *
@@ -15,8 +16,9 @@
  * are fixed by the first vector;
  * EN: - The payload key "label" is a reserved column; using it returns 400
  * (use the top-level label field instead);
- * EN: - The score in search responses is a similarity (1 - cosine_distance,
- * larger is more similar);
+ * EN: - The score in search responses is a similarity converted per the
+ * collection metric (cosine is 1 - d clamped to [-1,1]; l2/l1 are 1 - d
+ * unclamped; ip is the raw dot product), larger is more similar;
  * EN: - Vector ids are u64: always exposed as bigint (the Number safe range
  * only reaches 2^53-1); the input side accepts bigint | number | string and
  * normalizes them.
@@ -87,7 +89,18 @@ export interface SearchHit {
  * EN: Search response: hits are ordered by similarity from high to low.
  */
 export class SearchResult {
-  constructor(public readonly hits: SearchHit[]) {}
+  constructor(
+    public readonly hits: SearchHit[],
+    /**
+     * 本次检索使用的度量（服务端回显；benchmark 直连路径可能省略）。
+     * 有了它，调用方才能判断 l2/l1/ip 的越界分数是否合法，而不必再发一次
+     * status 请求（OCR #30）。
+     * EN: Metric used by this search (echoed by the server; omitted on the
+     * benchmark path). It lets callers judge whether out-of-range l2/l1/ip
+     * scores are legitimate without an extra status round-trip (OCR #30).
+     */
+    public readonly metric?: string,
+  ) {}
 
   get ids(): bigint[] {
     return this.hits.map((h) => h.id);
@@ -117,7 +130,7 @@ export class SearchResult {
         payload: payloads?.[id.toString()] ?? null,
       };
     });
-    return new SearchResult(hits);
+    return new SearchResult(hits, body.metric);
   }
 }
 

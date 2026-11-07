@@ -18,12 +18,16 @@ package com.houyidb.client;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.junit.jupiter.api.Assumptions.assumeTrue;
 
+import com.houyidb.client.Types.CreateCollectionOptions;
+import com.houyidb.client.Types.CreateCollectionResult;
 import com.houyidb.client.Types.Filter;
 import com.houyidb.client.Types.FilterOp;
+import com.houyidb.client.Types.HnswParams;
 import com.houyidb.client.Types.SearchHit;
 import com.houyidb.client.Types.SearchOptions;
 import com.houyidb.client.Types.SearchResult;
@@ -214,5 +218,76 @@ class IntegrationTest {
         HouyiClient.Collection col = client.collection("java 名/a?b#c");
         col.upsert(List.of(new Vector(42, fakeEmbed("quoted"), Map.of("k", "v"))));
         assertEquals(1, col.delete(List.of(42L), null));
+    }
+
+    /**
+     * 显式建集合回显度量与 HNSW 三元组；同名再建 409。
+     * EN: Explicit creation echoes the metric and HNSW triple; a second create
+     * of the same name yields 409.
+     */
+    @Test
+    void createCollectionMetricAndHnsw() throws Exception {
+        String name = "java_it_create_metric";
+        // 清理只容忍 404（从未创建）；其他错误直接失败。
+        // EN: Cleanup tolerates only 404 (never created); anything else fails.
+        try {
+            client.deleteCollection(name);
+        } catch (HouyiException e) {
+            assertEquals(404, e.statusCode(), "cleanup delete must succeed or 404");
+        }
+
+        CreateCollectionResult created = client.createCollection(name, TEST_DIMS,
+                new CreateCollectionOptions()
+                        .metric("ip")
+                        .indexType("hnsw")
+                        .hnsw(new HnswParams(16, 100, 32)));
+        assertTrue(created.created);
+        assertEquals(name, created.collection);
+        assertEquals(TEST_DIMS, created.dims);
+        assertEquals("ip", created.metric);
+        assertEquals("hnsw", created.indexType);
+        assertNotNull(created.hnsw, "hnsw echo must be present");
+        assertEquals(16, created.hnsw.m);
+        assertEquals(100, created.hnsw.efConstruction);
+        assertEquals(32, created.hnsw.efSearch);
+
+        HouyiException conflict = assertThrows(HouyiException.class,
+                () -> client.createCollection(name, TEST_DIMS, null));
+        assertEquals(409, conflict.statusCode());
+    }
+
+    /**
+     * 删除整库后 404；同名重建得到空 collection。
+     * EN: Drops a whole collection (404 afterwards) and expects a same-name
+     * recreate to start empty.
+     */
+    @Test
+    void deleteCollectionAndRecreate() throws Exception {
+        String name = "java_it_admin_drop";
+        HouyiClient.Collection col = client.collection(name);
+        col.upsert(List.of(new Vector(7, fakeEmbed("drop me"), Map.of("tag", "drop"))));
+
+        client.deleteCollection(name);
+
+        HouyiException ex = assertThrows(HouyiException.class, col::status);
+        assertEquals(404, ex.statusCode());
+
+        // 同名重建：首次写入隐式创建，旧向量不得复活。
+        // EN: recreate by name: the first write implicitly creates it and the old
+        // vectors must not reappear.
+        col.upsert(List.of(new Vector(8, fakeEmbed("fresh"), Map.of())));
+        waitFlushed(col);
+        assertEquals(1, col.status().get("indexed_count").asLong());
+    }
+
+    /**
+     * 删除不存在的 collection 返回上游 404。
+     * EN: Dropping an unknown collection surfaces the upstream 404.
+     */
+    @Test
+    void deleteMissingCollectionIs404() {
+        HouyiException ex = assertThrows(HouyiException.class,
+                () -> client.deleteCollection("java_it_admin_never_created"));
+        assertEquals(404, ex.statusCode());
     }
 }

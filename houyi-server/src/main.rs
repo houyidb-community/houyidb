@@ -85,6 +85,7 @@ fn apply_toml_config_file(cfg: &mut ServerConfig, path: &std::path::Path) -> Res
     #[cfg(unix)]
     if file.auth_token.is_some()
         || file.replication_auth_token.is_some()
+        || file.sentinel_token.is_some()
         || file
             .auth_principals
             .iter()
@@ -94,15 +95,16 @@ fn apply_toml_config_file(cfg: &mut ServerConfig, path: &std::path::Path) -> Res
         if let Ok(meta) = std::fs::metadata(path) {
             let mode = meta.permissions().mode() & 0o777;
             if mode & 0o077 != 0 {
-                // 两种凭据同一纪律（OCR 批次二十八）：只检查 auth_token 会
-                // 让复制共享秘密静默逃过权限告警。
-                // EN: both credentials share the hygiene check.
+                // 三种凭据同一纪律（OCR 批次二十八 + EE M1）：漏检任何一种
+                // 都会让该共享秘密静默逃过权限告警。
+                // EN: all three credentials share the hygiene check (OCR batch 28
+                // + EE M1); missing one lets that secret skip the warning.
                 tracing::warn!(
                     path = %path.display(),
                     mode = format!("{mode:o}"),
                     "config file contains a credential (auth_token / \
-                     replication_auth_token) but is group/world-accessible; \
-                     consider chmod 600"
+                     replication_auth_token / sentinel_token) but is \
+                     group/world-accessible; consider chmod 600"
                 );
             }
         }
@@ -241,6 +243,34 @@ fn parse_config_from_env(mut cfg: ServerConfig) -> Result<ServerConfig, String> 
             .parse::<u64>()
             .map_err(|e| format!("HOUYI_SERVER_SNAPSHOT_WAL_THRESHOLD_BYTES parse error: {e}"))?;
     }
+    // 标量页自动压实（P5.0.1）：0 = 关闭自动压实，管理端点仍可触发。
+    // EN: Scalar auto-compaction (P5.0.1): 0 disables the periodic path; the
+    // admin endpoint still works.
+    if let Ok(v) = std::env::var("HOUYI_SERVER_COLLECTIONS_SCALAR_COMPACT_INTERVAL_SECS") {
+        cfg.collections_scalar_compact_interval_secs = v.parse::<u64>().map_err(|e| {
+            format!("HOUYI_SERVER_COLLECTIONS_SCALAR_COMPACT_INTERVAL_SECS parse error: {e}")
+        })?;
+    }
+    if let Ok(v) = std::env::var("HOUYI_SERVER_COLLECTIONS_SCALAR_COMPACT_STALE_RATIO") {
+        cfg.collections_scalar_compact_stale_ratio = v.parse::<f64>().map_err(|e| {
+            format!("HOUYI_SERVER_COLLECTIONS_SCALAR_COMPACT_STALE_RATIO parse error: {e}")
+        })?;
+    }
+    if let Ok(v) = std::env::var("HOUYI_SERVER_COLLECTIONS_WAL_SEGMENT_BYTES") {
+        cfg.collections_wal_segment_bytes = v
+            .parse::<u64>()
+            .map_err(|e| format!("HOUYI_SERVER_COLLECTIONS_WAL_SEGMENT_BYTES parse error: {e}"))?;
+    }
+    if let Ok(v) = std::env::var("HOUYI_SERVER_COLLECTIONS_WAL_MAX_SEGMENTS") {
+        cfg.collections_wal_max_segments = v
+            .parse::<usize>()
+            .map_err(|e| format!("HOUYI_SERVER_COLLECTIONS_WAL_MAX_SEGMENTS parse error: {e}"))?;
+    }
+    if let Ok(v) = std::env::var("HOUYI_SERVER_COLLECTIONS_WAL_FOLLOWER_GRACE_SECS") {
+        cfg.collections_wal_follower_grace_secs = v.parse::<u64>().map_err(|e| {
+            format!("HOUYI_SERVER_COLLECTIONS_WAL_FOLLOWER_GRACE_SECS parse error: {e}")
+        })?;
+    }
     // 复制（P4.4.1）：role 枚举笔误 fast-fail（与 flush_policy 同纪律）。
     // EN: Replication (P4.4.1): a role enum typo fast-fails (same discipline as flush_policy).
     if let Ok(v) = std::env::var("HOUYI_SERVER_ROLE") {
@@ -345,6 +375,53 @@ fn parse_config_from_env(mut cfg: ServerConfig) -> Result<ServerConfig, String> 
         }
         cfg.encryption_key_id = Some(trimmed.to_string());
     }
+    // Sentinel 控制面（EE M1）：token 属敏感项，仅 ENV/TOML——CLI 参数对 ps
+    // 可见，与 HOUYI_AUTH_TOKEN 同规。空白值 fail-closed。
+    // EN: sentinel control plane (EE M1): the token is ENV/TOML only, matching
+    // the auth-token discipline; blank values fail closed.
+    if let Ok(v) = std::env::var("HOUYI_SERVER_SENTINEL_TOKEN") {
+        let trimmed = v.trim();
+        if trimmed.is_empty() {
+            return Err(
+                "HOUYI_SERVER_SENTINEL_TOKEN is blank; unset it to disable the \
+                 sentinel control plane explicitly"
+                    .to_string(),
+            );
+        }
+        cfg.sentinel_token = Some(trimmed.to_string());
+    }
+    if let Ok(v) = std::env::var("HOUYI_SERVER_REQUIRE_LEADER_LEASE") {
+        cfg.require_leader_lease = match v.trim().to_ascii_lowercase().as_str() {
+            "1" | "true" | "yes" | "on" => true,
+            "0" | "false" | "off" | "no" => false,
+            other => {
+                return Err(format!(
+                    "HOUYI_SERVER_REQUIRE_LEADER_LEASE: invalid boolean {other:?} \
+                     (use 1/0, true/false, yes/no, on/off)"
+                ))
+            }
+        };
+    }
+    if let Ok(v) = std::env::var("HOUYI_SERVER_LEADER_LEASE_MAX_TTL_MS") {
+        cfg.leader_lease_max_ttl_ms = v
+            .parse::<u64>()
+            .map_err(|e| format!("HOUYI_SERVER_LEADER_LEASE_MAX_TTL_MS parse error: {e}"))?;
+    }
+    if let Ok(v) = std::env::var("HOUYI_SERVER_REPLICATION_SYNC_QUORUM") {
+        cfg.replication_sync_quorum = v
+            .parse::<usize>()
+            .map_err(|e| format!("HOUYI_SERVER_REPLICATION_SYNC_QUORUM parse error: {e}"))?;
+    }
+    if let Ok(v) = std::env::var("HOUYI_SERVER_QUERY_LOG_CAPACITY") {
+        cfg.query_log_capacity = v
+            .parse::<usize>()
+            .map_err(|e| format!("HOUYI_SERVER_QUERY_LOG_CAPACITY parse error: {e}"))?;
+    }
+    if let Ok(v) = std::env::var("HOUYI_SERVER_QUERY_LOG_SAMPLE_EVERY") {
+        cfg.query_log_sample_every = v
+            .parse::<u32>()
+            .map_err(|e| format!("HOUYI_SERVER_QUERY_LOG_SAMPLE_EVERY parse error: {e}"))?;
+    }
     Ok(cfg)
 }
 
@@ -384,6 +461,11 @@ fn print_help() {
     println!("  --slow-query-ms <n>            ENV HOUYI_SERVER_SLOW_QUERY_MS (default 0=禁用; pgwire/HTTP 检索超阈值打 warn 日志)");
     println!("  --snapshot-interval-secs <n>   ENV HOUYI_SERVER_SNAPSHOT_INTERVAL_SECS (default 600; 0=关闭周期图快照)");
     println!("  --snapshot-wal-threshold-bytes <n>  ENV HOUYI_SERVER_SNAPSHOT_WAL_THRESHOLD_BYTES (default 268435456; 0=关闭 WAL 增量阈值触发)");
+    println!("  --collections-scalar-compact-interval-secs <n>  ENV HOUYI_SERVER_COLLECTIONS_SCALAR_COMPACT_INTERVAL_SECS (default 600; 0=关闭标量自动压实)");
+    println!("  --collections-scalar-compact-stale-ratio <f>    ENV HOUYI_SERVER_COLLECTIONS_SCALAR_COMPACT_STALE_RATIO (default 0.5; 0..=1)");
+    println!("  --collections-wal-segment-bytes <n>             ENV HOUYI_SERVER_COLLECTIONS_WAL_SEGMENT_BYTES (default 67108864; 0=只手动轮转)");
+    println!("  --collections-wal-max-segments <n>              ENV HOUYI_SERVER_COLLECTIONS_WAL_MAX_SEGMENTS (default 16; 0=关闭删除)");
+    println!("  --collections-wal-follower-grace-secs <n>       ENV HOUYI_SERVER_COLLECTIONS_WAL_FOLLOWER_GRACE_SECS (default 60; leader 断连/启动/promote 宽限)");
     println!("  关停图快照(P4.4.0e)默认开启: ENV HOUYI_SHUTDOWN_SNAPSHOT=0 关闭 (行为变更——此前默认关闭、=1 开启, 且写出格式由 JSON 向量快照切换为 HNSW 图快照)");
     println!(
         "  复制(P4.4.1): --role disabled|leader|follower  ENV HOUYI_SERVER_ROLE (default disabled)"
@@ -393,6 +475,12 @@ fn print_help() {
     println!("  (无 CLI 旗标) 复制认证共享秘密          ENV HOUYI_SERVER_REPLICATION_AUTH_TOKEN / TOML replication_auth_token (leader 与 follower 必须一致; 缺省不认证)");
     println!("  --replication-queue-batches <n>   ENV HOUYI_SERVER_REPLICATION_QUEUE_BATCHES (default 4096; 慢 follower 积满即踢)");
     println!("  --replication-sync-timeout-ms <n> ENV HOUYI_SERVER_REPLICATION_SYNC_TIMEOUT_MS (default 2000; semi/full_sync 等 follower ACK 上限, 超时降级 async + 指标)");
+    println!("  --replication-sync-quorum <n>  ENV HOUYI_SERVER_REPLICATION_SYNC_QUORUM (default 0=任一 ACK; >0 要求 n 个活跃 follower 的 DURABLE ≥ 写入 LSN, 会降低可用性)");
+    println!("  (无 CLI 旗标) sentinel 控制面秘密     ENV HOUYI_SERVER_SENTINEL_TOKEN / TOML sentinel_token (sentinel 角色: lease/demote/promote/replication-status; 需同时配置数据面 token)");
+    println!("  --require-leader-lease         ENV HOUYI_SERVER_REQUIRE_LEADER_LEASE (default false; 开启后 leader 必须有有效租约才可写, 过期 503 lease_expired)");
+    println!("  --leader-lease-max-ttl-ms <n>  ENV HOUYI_SERVER_LEADER_LEASE_MAX_TTL_MS (default 60000; 硬上限同一常量)");
+    println!("  --query-log-capacity <n>       ENV HOUYI_SERVER_QUERY_LOG_CAPACITY (default 0=关闭; 有界查询日志, 只记元数据)");
+    println!("  --query-log-sample-every <n>   ENV HOUYI_SERVER_QUERY_LOG_SAMPLE_EVERY (default 1=全量; 每 n 条记 1 条)");
     println!("  --default-ha-level <name>       ENV HOUYI_SERVER_DEFAULT_HA_LEVEL (default async; 新建 collection 默认 HA 级别: async|semi_sync|full_sync)");
     println!("  --audit-log-path <path>        ENV HOUYI_SERVER_AUDIT_LOG (default 关闭; 开启后启动即校验哈希链, 链断拒绝启动)");
     println!("  --audit-include-reads          ENV HOUYI_SERVER_AUDIT_INCLUDE_READS (default false; 读请求也入审计)");
@@ -423,9 +511,12 @@ async fn total_wal_bytes(wal_main: &Arc<WalHandle>, wal_coll: &Arc<WalHandle>) -
     let m = Arc::clone(wal_main);
     let c = Arc::clone(wal_coll);
     let read = tokio::task::spawn_blocking(move || {
-        let a = m.active_file_len().ok()?;
-        let b = c.active_file_len().ok()?;
-        Some(a + b)
+        // 轮转后 active 变小、归档变大；只算 active 会让阈值通道误判「WAL 变小」。
+        // EN: After rotation the active file shrinks while archives grow; counting
+        // only active bytes would make the threshold channel see false shrinkage.
+        let a = m.segment_stats().ok()?;
+        let b = c.segment_stats().ok()?;
+        Some(a.active_bytes + a.archived_bytes + b.active_bytes + b.archived_bytes)
     });
     match time::timeout(Duration::from_secs(5), read).await {
         Ok(Ok(v)) => v,
@@ -645,6 +736,46 @@ fn parse_config_from_cli(mut cfg: ServerConfig) -> Result<ServerConfig, String> 
                 cfg.snapshot_wal_threshold_bytes =
                     parse_value("--snapshot-wal-threshold-bytes", v)?;
             }
+            "--collections-scalar-compact-interval-secs" => {
+                i += 1;
+                let v = args
+                    .get(i)
+                    .ok_or("--collections-scalar-compact-interval-secs requires a value")?;
+                cfg.collections_scalar_compact_interval_secs =
+                    parse_value("--collections-scalar-compact-interval-secs", v)?;
+            }
+            "--collections-scalar-compact-stale-ratio" => {
+                i += 1;
+                let v = args
+                    .get(i)
+                    .ok_or("--collections-scalar-compact-stale-ratio requires a value")?;
+                cfg.collections_scalar_compact_stale_ratio =
+                    parse_value("--collections-scalar-compact-stale-ratio", v)?;
+            }
+            "--collections-wal-segment-bytes" => {
+                i += 1;
+                let v = args
+                    .get(i)
+                    .ok_or("--collections-wal-segment-bytes requires a value")?;
+                cfg.collections_wal_segment_bytes =
+                    parse_value("--collections-wal-segment-bytes", v)?;
+            }
+            "--collections-wal-max-segments" => {
+                i += 1;
+                let v = args
+                    .get(i)
+                    .ok_or("--collections-wal-max-segments requires a value")?;
+                cfg.collections_wal_max_segments =
+                    parse_value("--collections-wal-max-segments", v)?;
+            }
+            "--collections-wal-follower-grace-secs" => {
+                i += 1;
+                let v = args
+                    .get(i)
+                    .ok_or("--collections-wal-follower-grace-secs requires a value")?;
+                cfg.collections_wal_follower_grace_secs =
+                    parse_value("--collections-wal-follower-grace-secs", v)?;
+            }
             "--role" => {
                 i += 1;
                 let v = args
@@ -708,6 +839,37 @@ fn parse_config_from_cli(mut cfg: ServerConfig) -> Result<ServerConfig, String> 
             }
             "--audit-include-reads" => {
                 cfg.audit_include_reads = true;
+            }
+            // Sentinel 控制面（EE M1）：token 不走 CLI（ps 可见），其余非敏感。
+            // EN: sentinel control plane (EE M1) — the token stays off the CLI.
+            "--require-leader-lease" => {
+                cfg.require_leader_lease = true;
+            }
+            "--leader-lease-max-ttl-ms" => {
+                i += 1;
+                let v = args
+                    .get(i)
+                    .ok_or("--leader-lease-max-ttl-ms requires a value")?;
+                cfg.leader_lease_max_ttl_ms = parse_value("--leader-lease-max-ttl-ms", v)?;
+            }
+            "--replication-sync-quorum" => {
+                i += 1;
+                let v = args
+                    .get(i)
+                    .ok_or("--replication-sync-quorum requires a value")?;
+                cfg.replication_sync_quorum = parse_value("--replication-sync-quorum", v)?;
+            }
+            "--query-log-capacity" => {
+                i += 1;
+                let v = args.get(i).ok_or("--query-log-capacity requires a value")?;
+                cfg.query_log_capacity = parse_value("--query-log-capacity", v)?;
+            }
+            "--query-log-sample-every" => {
+                i += 1;
+                let v = args
+                    .get(i)
+                    .ok_or("--query-log-sample-every requires a value")?;
+                cfg.query_log_sample_every = parse_value("--query-log-sample-every", v)?;
             }
             "--audit-max-bytes" => {
                 i += 1;
@@ -807,6 +969,25 @@ fn validate_config(cfg: &ServerConfig) -> Result<(), String> {
     if cfg.max_http_inflight == 0 {
         return Err("max_http_inflight must be > 0".to_string());
     }
+    // 标量压实阈值必须是有限 0..=1；interval=0 是合法的「关闭自动压实」。
+    // EN: The stale ratio must be finite and in 0..=1; interval=0 legally
+    // disables auto-compaction.
+    if !cfg.collections_scalar_compact_stale_ratio.is_finite()
+        || !(0.0..=1.0).contains(&cfg.collections_scalar_compact_stale_ratio)
+    {
+        return Err(format!(
+            "collections_scalar_compact_stale_ratio must be finite and in 0..=1, got {}",
+            cfg.collections_scalar_compact_stale_ratio
+        ));
+    }
+    // 段太小会让轮转/保留开销压过收益；0 = 只手动轮转是合法值。
+    // EN: Tiny segments cost more than they save; 0 = manual rotation only is valid.
+    if cfg.collections_wal_segment_bytes != 0 && cfg.collections_wal_segment_bytes < 1024 * 1024 {
+        return Err(format!(
+            "collections_wal_segment_bytes must be 0 or >= 1 MiB, got {}",
+            cfg.collections_wal_segment_bytes
+        ));
+    }
     // 复制（P4.4.1）组合校验：缺对端地址是典型部署笔误，fast-fail 优于
     // 启动后空跑。队列 0 = 每 follower 第一条 publish 即踢，等同自我 DoS。
     // EN: Replication combo validation — missing peer addresses and a zero
@@ -875,6 +1056,33 @@ fn validate_config(cfg: &ServerConfig) -> Result<(), String> {
         return Err(
             "encryption_key_id is set but encryption_key_file is not; configure the \
              keyring or remove both"
+                .to_string(),
+        );
+    }
+    // 租约 TTL 上限（EE M1）：0 会让所有 grant 失败；超过硬上限会放大时钟
+    // 偏斜风险。两者都按配置笔误 fast-fail。
+    // EN: lease TTL cap (EE M1): 0 rejects every grant; above the hard cap it
+    // widens clock-skew exposure. Both are config typos.
+    if cfg.leader_lease_max_ttl_ms == 0
+        || cfg.leader_lease_max_ttl_ms > houyi_server::cluster::MAX_LEASE_TTL_MS
+    {
+        return Err(format!(
+            "leader_lease_max_ttl_ms must be in 1..={}ms, got {}",
+            houyi_server::cluster::MAX_LEASE_TTL_MS,
+            cfg.leader_lease_max_ttl_ms
+        ));
+    }
+    if cfg.query_log_sample_every == 0 {
+        return Err("query_log_sample_every must be > 0 (1 = record every query)".to_string());
+    }
+    // 只配置 sentinel token 会把整个数据面锁死（策略非空 → 所有端点要认证，
+    // 而没有任何数据面主体）——运维本意几乎不可能是这样，fast-fail。
+    // EN: a lone sentinel token would lock the whole data plane (non-empty
+    // policy requires auth, but no data-plane principal exists) — fail fast.
+    if cfg.sentinel_token.is_some() && cfg.auth_token.is_none() && cfg.auth_principals.is_empty() {
+        return Err(
+            "sentinel_token requires auth_token or [[auth_principals]]; otherwise the \
+             data plane has no principal and every request is rejected"
                 .to_string(),
         );
     }
@@ -1108,6 +1316,57 @@ fn install_panic_hook() {
 /// 传播（main 返回 Result，无需在生产路径 panic）。
 /// Await a shutdown signal: SIGTERM and SIGINT on Unix, ctrl_c elsewhere.
 /// Handler-registration failures propagate instead of panicking.
+/// 读取或生成稳定的 follower 身份（P5.0.4）：人工重同步前保持不变，
+/// leader 侧的 retention grace 才能跨重连识别同一副本。
+/// EN: Loads or generates the stable follower identity (P5.0.4); it survives
+/// reconnects until a manual resync deletes the file.
+fn load_or_create_follower_id(wal_path: &std::path::Path) -> std::io::Result<[u8; 16]> {
+    use rand::RngCore;
+    use std::io::Write as _;
+
+    let dir = wal_path
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new("."));
+    let path = dir.join("replication.follower_id");
+    match std::fs::read(&path) {
+        Ok(bytes) => {
+            let id: [u8; 16] = bytes.as_slice().try_into().map_err(|_| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!(
+                        "{} must contain exactly 16 bytes, found {}; delete the file to \
+                         issue a fresh follower identity (this orphans the leader's grace \
+                         entry for the old id and may force a full resync)",
+                        path.display(),
+                        bytes.len()
+                    ),
+                )
+            })?;
+            return Ok(id);
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e),
+    }
+    let mut id = [0u8; 16];
+    rand::thread_rng().fill_bytes(&mut id);
+    let tmp = dir.join("replication.follower_id.tmp");
+    {
+        let mut f = std::fs::File::create(&tmp)?;
+        f.write_all(&id)?;
+        f.sync_all()?;
+    }
+    std::fs::rename(&tmp, &path)?;
+    // 目录项也要落盘：崩溃后 follower_id 丢失会换身份，旧 grace 记录失联。
+    // EN: fsync the directory too: losing the id across a crash would orphan the
+    // old grace entry.
+    #[cfg(unix)]
+    {
+        let dir_handle = std::fs::File::open(dir)?;
+        dir_handle.sync_all()?;
+    }
+    Ok(id)
+}
+
 async fn shutdown_signal() -> std::io::Result<&'static str> {
     #[cfg(unix)]
     {
@@ -1289,6 +1548,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         let mut hns = HotBufferIndex::new_with_metric(cfg.vector_dim, DistanceMetric::Cosine);
         hns.set_build_config(bench_build);
+        // pgwire 构建参数在启动时即生效，而不是等首批 upsert：`/v1/index/status`
+        // 从启动起就报告真实生效值，基准客户端可在写入前核对。
+        // EN: Apply pgwire build parameters at startup instead of on the first
+        // upsert so /v1/index/status reports the effective values immediately.
+        if let Some(m) = cfg.pgwire_hnsw_m {
+            hns.set_hnsw_m(m).map_err(std::io::Error::other)?;
+        }
+        if let Some(efc) = cfg.pgwire_hnsw_ef_construction {
+            hns.set_hnsw_ef_construction(efc)
+                .map_err(std::io::Error::other)?;
+        }
         if let Some(ef) = cfg.hnsw_ef_search {
             hns.set_hnsw_ef_search(ef).map_err(std::io::Error::other)?;
         }
@@ -1307,6 +1577,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // EN: Graph snapshot first (binary HNSW, no graph rebuild); fall back to the
     // legacy JSON vector snapshot, then to full WAL replay.
     let graph_snapshot_metrics = Arc::new(GraphSnapshotMetrics::default());
+    // P5.0.3：快照锁/段上限/保留租约与计数器在 HTTP、周期任务之间共享。
+    // EN: P5.0.3 snapshot lock, segment cap, retention lease and counters are
+    // shared between HTTP and the periodic task.
+    let lifecycle = Arc::new(
+        houyi_server::collection_lifecycle::CollectionLifecycleState::new(
+            cfg.collections_wal_max_segments,
+            houyi_server::collection_lifecycle::DEFAULT_MAX_DELETES_PER_RUN,
+        ),
+    );
     let snapshot_checkpoint = match apply_graph_snapshot_if_present_with_encryption(
         &cfg.wal_path,
         &index,
@@ -1317,11 +1596,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     {
         Some(cp) => Some(cp),
         None => {
+            // 期望度量必须取索引实际值：pq-flat 如实在接口上报告 L2，硬编码
+            // Cosine 会让它自己写出的新快照在下次启动时被判为度量不符。
+            // EN: The expected metric must come from the live index: pq-flat now
+            // truthfully reports L2, so hard-coding Cosine would reject the very
+            // snapshots the new binary writes.
             apply_vector_snapshot_if_present_with_encryption(
                 &cfg.wal_path,
                 &index,
                 cfg.vector_dim,
-                DistanceMetric::Cosine,
+                index.distance_metric(),
                 encryption.as_deref(),
             )
             .await?
@@ -1408,13 +1692,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             );
         }
     });
+    // 自检探针使用保留 ID，避免重启时覆盖 WAL 重放出的真实 0/1/2；自检结束后
+    // 删除，保证主索引从空态开始（VDB 客户端的 drop_old 检查依赖这一点）。
+    // EN: Self-check probes use reserved IDs so a restart cannot overwrite real
+    // rows at 0/1/2; they are removed afterwards so the main index starts empty
+    // (the VectorDBBench client's drop_old enforcement relies on it).
     let sample_vector = vec![0.1_f32; cfg.vector_dim];
-    index.insert(0, sample_vector.clone()).await?;
-    index.insert(1, sample_vector.clone()).await?;
-    index.insert(2, sample_vector.clone()).await?;
+    let sample_ids = [u64::MAX - 2, u64::MAX - 1, u64::MAX];
+    for id in sample_ids {
+        index.insert(id, sample_vector.clone()).await?;
+    }
     let query_ids = execute_query(
         &index,
-        "SELECT id FROM docs WHERE id IN (2)",
+        &format!("SELECT id FROM docs WHERE id IN ({})", sample_ids[2]),
         &sample_vector,
         5,
         None,
@@ -1438,6 +1728,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     )
     .await;
     tracing::info!(?hybrid_ids, "houyi-vector ready: scalar_bitset_hybrid_ids");
+    for id in sample_ids {
+        match index.delete(id).await {
+            Ok(_) => {}
+            // clustered / pq-flat / hii-l0 当前不支持 delete；保留探针不影响
+            // 真实数据（保留 ID 不会与数据集冲突），但该后端无法从空态验收。
+            // EN: Those backends do not support delete today; the reserved-ID
+            // probes cannot collide with dataset rows, but such a backend cannot
+            // pass an empty-index check.
+            Err(err) => tracing::warn!(id, %err, "houyi-vector ready: probe cleanup skipped"),
+        }
+    }
 
     // Collection HNSW 后端与主索引同源的异步构图配置：缺了它 Collection 写入永不
     // 可检索（insert_batch 只进待构图队列）。
@@ -1472,36 +1773,68 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     } else {
         None
     };
-    let (collections_wal, collections_wal_entries) = WalHandle::open_with_ship_and_encryption(
+    let (collections_wal, collections_wal_entries) = WalHandle::open_with_config(
         &collections_wal_path,
         cfg.wal_write_mode,
         ship_hub.clone(),
         encryption.clone(),
+        houyi_persistence::wal_async::WalOpenConfig {
+            segment_bytes: cfg.collections_wal_segment_bytes,
+        },
     )?;
     let collections = std::sync::Arc::new(
         CollectionManager::new(cfg.vector_dim, &cfg.index_type)
             .with_builder_config(collection_builder_cfg)
             .with_default_ha_level(cfg.default_ha_level),
     );
-    // P4.4.0：先恢复各 collection 的图快照（snapshots/ 子目录），再全量扫 WAL——
-    // LSN ≤ checkpoint 的记录跳向量插入/删除但仍重建标量行（见 recovery 文档）。
-    // EN: Restore per-collection graph snapshots first, then full-scan the WAL —
-    // covered records skip vector work but still rebuild scalar rows.
-    let graph_checkpoints = apply_collection_graph_snapshots_with_encryption(
+    // P5.0.2：优先恢复 collection / manifest 快照；没有 manifest 时回退 P4.4 的
+    // 逐 collection 图快照。`first_available > 0` 且 manifest 不可用时，加载器
+    // 直接报错——截断历史没有快照无法安全恢复。
+    // EN: Prefer collection/manifest snapshots; fall back to P4.4 graph snapshots
+    // when no manifest exists. With first_available > 0, the loader fails on an
+    // unusable manifest — truncated history cannot be safely replayed without one.
+    let collections_first_available = collections_wal.first_available_lsn().unwrap_or(0);
+    let loaded = houyi_server::collection_lifecycle::load_collection_snapshots(
         &collections,
         &collections_wal_path,
+        collections_first_available,
+        encryption.clone(),
         &graph_snapshot_metrics,
-        encryption.as_deref(),
     )
     .await?;
-    let collections_stats = replay_collections_wal_into_manager(
+    let (graph_checkpoints, manifest_mode, manifest_safe_checkpoint) = match loaded {
+        Some(loaded) => (
+            loaded.checkpoints,
+            true,
+            Some(loaded.manifest.safe_checkpoint_lsn),
+        ),
+        None => (
+            apply_collection_graph_snapshots_with_encryption(
+                &collections,
+                &collections_wal_path,
+                &graph_snapshot_metrics,
+                encryption.as_deref(),
+            )
+            .await?,
+            false,
+            None,
+        ),
+    };
+    let collections_stats = houyi_server::recovery::replay_collections_wal_into_manager_with_mode(
         &collections_wal_entries,
         &collections,
         &graph_checkpoints,
+        manifest_mode,
     )
     .await?;
+    // 缓存 manifest checkpoint：follower 握手只读原子量，不做磁盘 IO。
+    // EN: Cache the manifest checkpoint so follower handshakes never do disk IO.
+    lifecycle.set_manifest_checkpoint(manifest_safe_checkpoint.unwrap_or(0));
     tracing::info!(
         path = %collections_wal_path.display(),
+        first_available_lsn = collections_first_available,
+        manifest_mode,
+        manifest_safe_checkpoint = ?manifest_safe_checkpoint,
         creates = collections_stats.creates,
         upsert_batches = collections_stats.upsert_batches,
         upsert_batches_skipped_snapshot = collections_stats.upsert_batches_skipped_snapshot,
@@ -1510,6 +1843,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         delete_batches = collections_stats.delete_batches,
         delete_batches_skipped_snapshot = collections_stats.delete_batches_skipped_snapshot,
         tombstones = collections_stats.tombstones,
+        records_skipped_snapshot = collections_stats.records_skipped_snapshot,
         graph_snapshots = graph_checkpoints.len(),
         "houyi-persistence: collections WAL replay"
     );
@@ -1523,6 +1857,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // runtime role lives in a shared atomic (read-only guards + metrics);
     // leader/follower handles are shut down in the teardown sequence below.
     let role_state = houyi_server::types::RoleState::new(cfg.role);
+    // leader 启动后先留出 follower 重连窗口：期间不删除段，避免旧 follower
+    // 还没握手就被截断。promote 路径在 P5.0.4 后续接线同样设置。
+    // EN: Give followers a reconnect window right after leader startup: no
+    // deletion until it expires, so old followers can handshake first. The
+    // promote path will set the same hold in the follow-up P5.0.4 wiring.
+    if role_state.get() == houyi_server::types::ReplicationRole::Leader
+        && cfg.collections_wal_follower_grace_secs > 0
+    {
+        lifecycle.hold_retention(cfg.collections_wal_follower_grace_secs);
+    }
     // 运维警示（OCR 批次十六/十八）：范围与安全边界必须在启动日志里可见——
     // 两条警示对 leader 与 follower 同样成立（监听端口暴露警示适用于任何
     // 可被 promote 的节点；「主索引不复制」的意外正是纯 follower 部署会撞上
@@ -1549,6 +1893,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let replication_handles: houyi_server::types::SharedReplicationHandles = std::sync::Arc::new(
         std::sync::Mutex::new(houyi_server::types::ReplicationHandles::default()),
     );
+    // follower 身份与快照 checkpoint 在 leader/follower/demote 三处共用：
+    // 运行时 demote→follower 转换（M3）需要它们，而不只在启动为 follower 时。
+    // EN: follower identity and the snapshot checkpoint are shared by leader,
+    // follower and runtime demote conversion (M3), not just follower startup.
+    let follower_id = if cfg.role == houyi_server::types::ReplicationRole::Disabled {
+        None
+    } else {
+        Some(load_or_create_follower_id(&collections_wal_path)?)
+    };
+    let snapshot_checkpoint: std::sync::Arc<dyn Fn() -> u64 + Send + Sync> = {
+        let lifecycle_for_cp = std::sync::Arc::clone(&lifecycle);
+        std::sync::Arc::new(move || lifecycle_for_cp.manifest_checkpoint())
+    };
     let replication_metrics: houyi_server::types::SharedReplicationMetrics = match cfg.role {
         houyi_server::types::ReplicationRole::Disabled => {
             houyi_server::types::shared_replication_metrics(None)
@@ -1560,6 +1917,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let wal_for_next = Arc::clone(&collections_wal);
             let leader_next_lsn: std::sync::Arc<dyn Fn() -> u64 + Send + Sync> =
                 std::sync::Arc::new(move || wal_for_next.next_lsn());
+            let wal_for_first = Arc::clone(&collections_wal);
+            let leader_first_available: std::sync::Arc<
+                dyn Fn() -> std::io::Result<u64> + Send + Sync,
+            > = std::sync::Arc::new(move || wal_for_first.first_available_lsn());
+            let gate = lifecycle.retention_gate();
             let leader = houyi_persistence::replication_leader::ReplicationLeader::start(
                 &cfg.replication_listen_addr,
                 hub,
@@ -1570,7 +1932,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     cfg.replication_queue_batches,
                     cfg.replication_auth_token.clone(),
                     encryption.clone(),
-                ),
+                )
+                .with_retention(leader_first_available, gate),
             )
             .await?;
             tracing::info!(
@@ -1583,6 +1946,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 watermarks,
                 leader_next_lsn,
                 sync_timeout: std::time::Duration::from_millis(cfg.replication_sync_timeout_ms),
+                sync_quorum: cfg.replication_sync_quorum,
             };
             replication_handles.lock().unwrap().leader = Some(leader);
             houyi_server::types::shared_replication_metrics(Some(view))
@@ -1603,6 +1967,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     std::sync::Arc::clone(&collections),
                 ));
             let poison_skipped = apply_sink.poison_skipped_handle();
+            let follower_id = follower_id.expect("follower id for follower role");
             let follower = houyi_persistence::replication_follower::ReplicationFollower::start(
                 leader_addr.clone(),
                 wal_async,
@@ -1611,9 +1976,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 houyi_persistence::replication_follower::FollowerConfig::for_replication(
                     cfg.replication_auth_token.clone(),
                     encryption.clone(),
-                ),
+                )
+                .with_follower_identity(follower_id, std::sync::Arc::clone(&snapshot_checkpoint)),
             )?;
-            tracing::info!(leader_addr = %leader_addr, "replication follower ready (read-only)");
+            tracing::info!(
+                leader_addr = %leader_addr,
+                follower_id = %follower_id
+                    .iter()
+                    .map(|b| format!("{b:02x}"))
+                    .collect::<String>(),
+                "replication follower ready (read-only)"
+            );
             let view = houyi_server::types::ReplicationMetricsView::Follower {
                 metrics: follower_metrics,
                 poison_skipped,
@@ -1638,8 +2011,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             collections_wal: Arc::clone(&collections_wal),
             queue_batches: cfg.replication_queue_batches,
             sync_timeout: std::time::Duration::from_millis(cfg.replication_sync_timeout_ms),
+            sync_quorum: cfg.replication_sync_quorum,
+            lifecycle: std::sync::Arc::clone(&lifecycle),
+            follower_grace_secs: cfg.collections_wal_follower_grace_secs,
             replication_auth_token: cfg.replication_auth_token.clone(),
             encryption: encryption.clone(),
+            collections: std::sync::Arc::clone(&collections),
+            follower_id: follower_id.expect("follower id when replication is on"),
+            snapshot_checkpoint: std::sync::Arc::clone(&snapshot_checkpoint),
         }))
     } else {
         None
@@ -1662,15 +2041,54 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         tracing::info!(?upstream, "openai gateway");
     }
 
+    // 集群控制原语（EE M1）：term 持久化在 WAL 目录的 cluster_state.json，
+    // 损坏 fail-closed（启动失败优于带着未知 term 继续写）。租约默认关闭，
+    // 关闭时所有写闸门直接放行，行为与手动 promote 一致。
+    // EN: cluster primitives (EE M1): the term lives next to the WAL in
+    // cluster_state.json and corruption is fatal. Leases are off by default;
+    // while off, every write gate is a no-op, matching manual promote.
+    let cluster = std::sync::Arc::new(
+        houyi_server::cluster::ClusterControl::open_with_max_ttl(
+            &cfg.wal_path,
+            cfg.require_leader_lease,
+            cfg.leader_lease_max_ttl_ms,
+        )
+        .map_err(|e| format!("cluster state store {}: {e}", cfg.wal_path.display()))?,
+    );
+    tracing::info!(
+        term = cluster.term(),
+        require_leader_lease = cfg.require_leader_lease,
+        max_ttl_ms = cluster.max_ttl_ms(),
+        "cluster control"
+    );
+    if cfg.require_leader_lease && cfg.sentinel_token.is_none() {
+        tracing::warn!(
+            "require_leader_lease is on without sentinel_token: leases must be granted \
+             manually via POST /v1/admin/lease or the cluster stays read-only"
+        );
+    }
+
+    // 查询日志（EE M1）：容量 0 = 关闭（None），写路径零开销。
+    // EN: query log (EE M1); capacity 0 disables it and the write path stays free.
+    let query_log: Option<std::sync::Arc<houyi_server::query_log::QueryLog>> =
+        (cfg.query_log_capacity > 0).then(|| {
+            std::sync::Arc::new(houyi_server::query_log::QueryLog::new(
+                cfg.query_log_capacity,
+                cfg.query_log_sample_every,
+            ))
+        });
+
     // 认证令牌（P4.2.1）：HTTP 与 pgwire 共享同一份 Arc<str>；只记录是否启用，
     // 永不记录令牌本体。
     // EN: Shared auth token handle — log only whether auth is on, never the token.
-    // RBAC（P4.7.1）：legacy auth_token 作为全权 admin，配置主体追加。
+    // RBAC（P4.7.1）：legacy auth_token 作为全权 admin，配置主体追加；sentinel
+    // 专用秘密（EE M1）作为独立控制面主体。
     // 校验失败 fast-fail（重复 token/非法角色/坏哈希都在启动期暴露）。
     // EN: build the authorization policy; invalid principals are fatal at startup.
-    let auth_policy = houyi_server::rbac::AuthzPolicy::from_config(
+    let auth_policy = houyi_server::rbac::AuthzPolicy::from_config_with_sentinel(
         cfg.auth_token.as_deref(),
         &cfg.auth_principals,
+        cfg.sentinel_token.as_deref(),
     )
     .map_err(|e| format!("auth principals: {e}"))?;
     let authz: Option<Arc<houyi_server::rbac::AuthzPolicy>> =
@@ -1739,6 +2157,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         index.clone(),
         Arc::clone(&wal),
         Arc::clone(&collections_wal),
+        Arc::clone(&lifecycle),
         std::sync::Arc::clone(&collections),
         cfg.vector_dim,
         Arc::clone(&pgwire_metrics),
@@ -1754,6 +2173,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         promote_ctx.clone(),
         audit,
         encryption.clone(),
+        std::sync::Arc::clone(&cluster),
+        query_log.clone(),
         http_shutdown,
     )
     .await?;
@@ -1769,6 +2190,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         collections_wal: Some(Arc::clone(&collections_wal)),
         role: role_state.clone(),
         replication_metrics: std::sync::Arc::clone(&replication_metrics),
+        cluster: std::sync::Arc::clone(&cluster),
+        query_log: query_log.clone(),
     });
     let pgwire_shutdown = {
         let mut rx = shutdown_rx.clone();
@@ -1787,6 +2210,50 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     .await?;
     tracing::info!("Listening on pg_wire://{pgwire_addr}");
 
+    // ── 标量页自动压实（P5.0.1）────────────────────────────────
+    // 内存优化，不写 WAL；每个 collection 独立锁，压实失败只告警不影响服务。
+    // 首 tick 吞掉：刚启动没有 stale 行，且冷重放可能仍在收尾。
+    // EN: In-memory optimization (no WAL); per-collection locks; failures are
+    // warnings only. The first tick is swallowed: startup has no stale rows and
+    // cold replay may still be finishing.
+    let scalar_compaction_task = if cfg.collections_scalar_compact_interval_secs > 0 {
+        let manager = std::sync::Arc::clone(&collections);
+        let interval = cfg.collections_scalar_compact_interval_secs;
+        let ratio = cfg.collections_scalar_compact_stale_ratio;
+        Some(tokio::spawn(async move {
+            let mut ticker = time::interval(Duration::from_secs(interval));
+            ticker.tick().await;
+            loop {
+                ticker.tick().await;
+                for name in manager.list() {
+                    let Some(col) = manager.get(&name) else {
+                        continue;
+                    };
+                    match col.compact_scalars(false, ratio).await {
+                        Ok(result) if result.skipped_reason.is_none() => {
+                            tracing::info!(
+                                collection = %name,
+                                dropped_rows = result.dropped_rows,
+                                physical_after = result.physical_after,
+                                "scalar compaction: ok"
+                            );
+                        }
+                        Ok(_) => {}
+                        Err(e) => {
+                            tracing::warn!(
+                                collection = %name,
+                                error = %e,
+                                "scalar compaction failed"
+                            );
+                        }
+                    }
+                }
+            }
+        }))
+    } else {
+        None
+    };
+
     // ── 图快照自动触发（P4.4.0e）────────────────────────────────
     // 同一写出例程（GraphSnapshotWriter::write_all）服务三个通道：周期间隔、
     // WAL 增量阈值、关停。周期间隔与阈值共用一个 tick 循环（tick = min(30s,
@@ -1804,11 +2271,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         collections_wal_path: collections_wal_path.clone(),
         metrics: Arc::clone(&graph_snapshot_metrics),
         encryption: encryption.clone(),
+        lifecycle: Arc::clone(&lifecycle),
+        roles: role_state.clone(),
     });
-    let snapshot_write_lock = Arc::new(tokio::sync::Mutex::new(()));
     let snapshot_task = if cfg.snapshot_interval_secs > 0 || cfg.snapshot_wal_threshold_bytes > 0 {
         let writer = Arc::clone(&graph_snapshot_writer);
-        let lock = Arc::clone(&snapshot_write_lock);
+        let lock = Arc::clone(&lifecycle);
         let wal_main = Arc::clone(&wal);
         let wal_coll = Arc::clone(&collections_wal);
         let interval_secs = cfg.snapshot_interval_secs;
@@ -1860,7 +2328,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     "graph snapshot: auto trigger fired"
                 );
                 {
-                    let _guard = lock.lock().await;
+                    let _guard = lock.snapshot_lock.lock().await;
                     writer.write_all().await;
                 }
                 last_at = std::time::Instant::now();
@@ -1876,6 +2344,89 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     } else {
         None
     };
+
+    // ── collections WAL 段保留（P5.0.3）──────────────────────────
+    // 与快照解耦：每 30s 读一次当前 manifest 的安全 checkpoint，按整段删除
+    // 最旧归档。leader 在 P5.0.4 之前一律 blocked（没有 follower floor）；
+    // follower/单机用本地 manifest。租约由管理员 compact 端点设置。
+    // EN: Retention is decoupled from snapshots: every 30s read the current
+    // manifest's safe checkpoint and delete oldest whole archives. Leaders are
+    // blocked until P5.0.4 (no follower floor); followers/standalone use the
+    // local manifest. The admin compact endpoint sets the lease.
+    let retention_task = if cfg.collections_wal_max_segments > 0 {
+        let wal = Arc::clone(&collections_wal);
+        let path = collections_wal_path.clone();
+        let roles = role_state.clone();
+        let life = Arc::clone(&lifecycle);
+        let hub = ship_hub.clone();
+        let gate = lifecycle.retention_gate();
+        let follower_grace = Duration::from_secs(cfg.collections_wal_follower_grace_secs);
+        Some(tokio::spawn(async move {
+            let mut ticker = time::interval(Duration::from_secs(30));
+            ticker.tick().await;
+            loop {
+                ticker.tick().await;
+                // 写锁覆盖「采样 follower floor → 删除段」：与握手的读锁互斥，
+                // 不存在「握手校验通过后段被删」的窗口。
+                // EN: the write lock spans floor sampling and segment deletion,
+                // mutually exclusive with handshake read locks.
+                let _gate = gate.write().await;
+                let wal = Arc::clone(&wal);
+                let path = path.clone();
+                let roles = roles.clone();
+                let life = Arc::clone(&life);
+                let hub = hub.clone();
+                match tokio::task::spawn_blocking(move || {
+                    let follower_floor = hub
+                        .as_ref()
+                        .and_then(|h| h.min_active_durable_lsn(follower_grace));
+                    houyi_server::collection_lifecycle::run_retention_with_follower_floor(
+                        &wal,
+                        &path,
+                        &roles,
+                        &life,
+                        follower_floor,
+                    )
+                })
+                .await
+                {
+                    Ok(report) if report.deleted_segments > 0 => tracing::info!(
+                        deleted_segments = report.deleted_segments,
+                        bytes_freed = report.bytes_freed,
+                        first_available_lsn = report.first_available_lsn,
+                        "collections retention: deleted whole segments"
+                    ),
+                    Ok(report) => tracing::debug!(
+                        archived_segments = report.archived_segments,
+                        blocked_reason = ?report.blocked_reason,
+                        "collections retention: no deletion"
+                    ),
+                    Err(e) => tracing::warn!(error = %e, "collections retention task join failed"),
+                }
+            }
+        }))
+    } else {
+        None
+    };
+
+    // ── follower 进度 GC（P5.0.4）──────────────────────────────
+    // min_active_durable_lsn 同时负责清理过期断连进度；保留关闭时也必须运行，
+    // 否则 follower 频繁重连会让 progress map 持续增长。
+    // EN: min_active_durable_lsn also reclaims expired disconnected progress;
+    // it must run even when retention is disabled, or follower churn grows the
+    // progress map for the process lifetime.
+    let progress_gc_task = ship_hub.as_ref().map(|hub| {
+        let hub = Arc::clone(hub);
+        let grace = Duration::from_secs(cfg.collections_wal_follower_grace_secs);
+        tokio::spawn(async move {
+            let mut ticker = time::interval(Duration::from_secs(60));
+            ticker.tick().await;
+            loop {
+                ticker.tick().await;
+                let _ = hub.min_active_durable_lsn(grace);
+            }
+        })
+    });
 
     // ── 优雅关停序列（P4.0.3）────────────────────────────────────
     // 顺序即语义：先摘流（停止 accept + drain 在途请求），再停 builder 并排空
@@ -1894,6 +2445,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // write lock; an in-flight blocking write runs to completion in the
     // background (atomic rename — no torn files).
     if let Some(task) = snapshot_task {
+        task.abort();
+    }
+    if let Some(task) = retention_task {
+        task.abort();
+    }
+    if let Some(task) = progress_gc_task {
+        task.abort();
+    }
+    if let Some(task) = scalar_compaction_task {
         task.abort();
     }
     // 等 HTTP drain 真正完成：axum 停止 accept 并等在途请求处理完毕才返回。
@@ -2018,7 +2578,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // used to be opt-in JSON via HOUYI_SHUTDOWN_SNAPSHOT=1); =0 disables.
     // Failures warn and never block WAL/sidecar teardown.
     if shutdown_snapshot_enabled(std::env::var("HOUYI_SHUTDOWN_SNAPSHOT").ok().as_deref()) {
-        let _guard = snapshot_write_lock.lock().await;
+        let _guard = lifecycle.snapshot_lock.lock().await;
         graph_snapshot_writer.write_all().await;
     }
     // next_lsn 与 shutdown 必须贴进同一 spawn_blocking 且在 shutdown 之前

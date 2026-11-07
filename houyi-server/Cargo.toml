@@ -33,18 +33,23 @@ proptest.workspace = true
 proptest-state-machine.workspace = true
 
 [dependencies]
-houyi-core = { path = "../houyi-core", version = "0.2.0-beta.5" }
-houyi-persistence = { path = "../houyi-persistence", version = "0.2.0-beta.5" }
-houyi-query = { path = "../houyi-query", version = "0.2.0-beta.5" }
-houyi-vector = { path = "../houyi-vector", version = "0.2.0-beta.5" }
+houyi-core = { path = "../houyi-core", version = "0.2.0-beta.8" }
+houyi-persistence = { path = "../houyi-persistence", version = "0.2.0-beta.8" }
+houyi-query = { path = "../houyi-query", version = "0.2.0-beta.8" }
+houyi-vector = { path = "../houyi-vector", version = "0.2.0-beta.8" }
 tokio.workspace = true
 # P4.5.5：ReplicationApply 的 async 实现宏。
 async-trait.workspace = true
 # 确定性网络仿真（可选，仅 feature `turmoil-dst`；默认构建不进依赖图）。
 turmoil = { workspace = true, optional = true }
 axum.workspace = true
+futures-util.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+# 快照 payload CRC（P5.0.2）。 / Snapshot payload CRC (P5.0.2).
+crc32fast.workspace = true
+# follower 稳定身份生成（P5.0.4）。 / Stable follower identity (P5.0.4).
+rand.workspace = true
 # TOML 配置文件(P4.3.1)
 toml.workspace = true
 # OpenAI 兼容网关依赖（选型理由见根 manifest [workspace.dependencies] 注释）。

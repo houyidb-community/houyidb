@@ -1,7 +1,7 @@
 //! K-Means 聚类：Rayon 并行距离计算，返回平坦的聚类中心向量。
 //! K-Means clustering with Rayon-parallel distance computation.
 
-use crate::distance;
+use super::boundary::dist_fn;
 use crate::DistanceMetric;
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
@@ -88,9 +88,22 @@ pub fn kmeans(
             }
         });
 
-        // 加权随机采样下一个中心
-        // EN: Weighted-random-sample the next centroid.
-        let total: f32 = min_dists.iter().sum();
+        // 加权随机采样下一个中心。IP 的 -dot 距离可为负——直接求和会得到负
+        // total 并按「全部重合」兜底随机选，k-means++ 加权完全失效；先把最小值
+        // 按 0 截断后平移（仅当 min_d < 0 时生效），既修复负 IP，又与旧行为在
+        // L2/Cosine 的 min_d ≥ 0 区间逐位一致——无条件的 min_d 平移会把采样权重
+        // 从 d 改成 d - min_d，静默改变既有非 IP 聚类的初始化结果（OCR #15、#10）。
+        // EN: Weighted-random-sample the next centroid. IP's -dot distances may
+        // be negative — summing them directly yields a negative total and falls
+        // into the "all coincide" random pick, disabling k-means++ weighting
+        // entirely. Clamp the minimum at 0 and shift only when it is negative:
+        // this fixes negative IP while staying bit-identical to the old behavior
+        // for L2/Cosine (min_d ≥ 0). An unconditional min_d shift would change
+        // the sampling weights from d to d - min_d, silently altering the
+        // initialization of every existing non-IP clustering run (OCR #15, #10).
+        let min_d = min_dists.iter().copied().fold(f32::INFINITY, f32::min);
+        let shift = min_d.min(0.0);
+        let total: f32 = min_dists.iter().map(|&d| d - shift).sum();
         if total <= 0.0 {
             // 所有点已经重合, 随机选
             // EN: All points coincide; pick randomly.
@@ -102,7 +115,7 @@ pub fn kmeans(
             let mut cumulative = 0.0_f32;
             let mut chosen = 0;
             for (i, &md) in min_dists.iter().enumerate() {
-                cumulative += md;
+                cumulative += md - shift;
                 if cumulative >= threshold {
                     chosen = i;
                     break;
@@ -194,14 +207,6 @@ pub fn kmeans(
     }
 }
 
-#[inline]
-fn dist_fn(metric: DistanceMetric, a: &[f32], b: &[f32]) -> f32 {
-    match metric {
-        DistanceMetric::L2 => distance::l2_squared(a, b),
-        DistanceMetric::Cosine => distance::cosine(a, b),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -257,6 +262,37 @@ mod tests {
         assert_eq!(result.centroids.len(), dims);
         assert!(result.assignments.iter().all(|&a| a == 0));
         assert_eq!(result.iterations, 1); // 单聚类一次迭代即收敛
+    }
+
+    #[test]
+    fn test_kmeans_inner_product_negative_distances_still_partition() {
+        // OCR #15：所有点积为正 → 所有 IP 距离为负；旧实现 min_dists 求和为负，
+        // 每次都走「全部重合」随机兜底。最小平移后 k-means++ 加权恢复，两个
+        // 方向簇应各自成簇。这里用固定种子锁死结果形态。
+        // EN: OCR #15 — all dots are positive, so every IP distance is negative;
+        // the old implementation summed to a negative total and always took the
+        // "all coincide" random fallback. The min-shift restores k-means++ weighting,
+        // so the two directional groups partition cleanly; a fixed seed pins the shape.
+        let dims = 2;
+        let mut data = Vec::new();
+        for i in 0..20 {
+            data.push(10.0_f32 + i as f32 * 0.1);
+            data.push(5.0);
+        }
+        for i in 0..20 {
+            data.push(1.0);
+            data.push(10.0_f32 + i as f32 * 0.1);
+        }
+        let result = kmeans(&data, dims, 2, 30, 42, DistanceMetric::InnerProduct);
+        let mut sizes = vec![0_usize; 2];
+        for &a in &result.assignments {
+            sizes[a] += 1;
+        }
+        assert_eq!(
+            sizes,
+            vec![20, 20],
+            "each directional group must form its own cluster"
+        );
     }
 
     #[test]

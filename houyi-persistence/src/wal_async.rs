@@ -12,9 +12,16 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
 use crate::replication_leader::ShipHub;
-use crate::{FileWal, WalEntry};
+use crate::{FileWal, RetentionOutcome, SegmentStats, WalEntry};
 
 const WAL_CHANNEL_BOUND: usize = 4096;
+
+/// 打开配置（P5.0.2）：目前只有自动轮转阈值。
+/// EN: Open config (P5.0.2): currently only the auto-rotation threshold.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct WalOpenConfig {
+    pub segment_bytes: u64,
+}
 
 /// 单次从 channel 合并的最多 Append（一次 `flush_wal`）。
 /// Max coalesced appends per `flush_wal` syscall batch.
@@ -53,11 +60,30 @@ enum WalMsg {
     NextLsn {
         reply: std::sync::mpsc::Sender<u64>,
     },
+    FirstAvailable {
+        reply: std::sync::mpsc::Sender<io::Result<u64>>,
+    },
+    SegmentStats {
+        reply: std::sync::mpsc::Sender<io::Result<SegmentStats>>,
+    },
+    Retain {
+        safe_floor: u64,
+        max_segments: usize,
+        max_deletes: usize,
+        reply: std::sync::mpsc::Sender<io::Result<RetentionOutcome>>,
+    },
     ActiveFileLen {
         reply: std::sync::mpsc::Sender<io::Result<u64>>,
     },
     ArchivedCount {
         reply: std::sync::mpsc::Sender<io::Result<usize>>,
+    },
+    /// 全量读取本地 WAL（promote 尾部补齐，P5.0.4）：writer 独占 FileWal，
+    /// 读取必须在同一线程做，避免第二份句柄与追加竞争。
+    /// EN: full local WAL read for promote tail replay (P5.0.4); the writer owns
+    /// the FileWal, so the read must run on that thread.
+    ReplayEntries {
+        reply: std::sync::mpsc::Sender<io::Result<Vec<WalEntry>>>,
     },
     Shutdown,
 }
@@ -130,11 +156,28 @@ fn worker_loop(mut wal: FileWal, rx: Receiver<WalMsg>, ship: Option<Arc<ShipHub>
             WalMsg::NextLsn { reply } => {
                 let _ = reply.send(wal.next_lsn());
             }
+            WalMsg::FirstAvailable { reply } => {
+                let _ = reply.send(Ok(wal.first_available_lsn()));
+            }
+            WalMsg::SegmentStats { reply } => {
+                let _ = reply.send(Ok(wal.segment_stats()));
+            }
+            WalMsg::Retain {
+                safe_floor,
+                max_segments,
+                max_deletes,
+                reply,
+            } => {
+                let _ = reply.send(wal.retain_segments(safe_floor, max_segments, max_deletes));
+            }
             WalMsg::ActiveFileLen { reply } => {
                 let _ = reply.send(wal.active_file_len());
             }
             WalMsg::ArchivedCount { reply } => {
                 let _ = reply.send(wal.archived_segment_count());
+            }
+            WalMsg::ReplayEntries { reply } => {
+                let _ = reply.send(wal.replay_all());
             }
         }
     }
@@ -280,7 +323,19 @@ impl WalAsyncHandle {
         ship: Option<Arc<ShipHub>>,
         encryption: Option<Arc<crate::encryption::Encryption>>,
     ) -> io::Result<(Self, Vec<WalEntry>)> {
-        let (wal, entries) = FileWal::open_with_encryption(path.as_ref(), encryption)?;
+        Self::open_with_config(path, ship, encryption, WalOpenConfig::default())
+    }
+
+    /// `open_with_ship_and_encryption` + 分段配置（P5.0.2）。
+    /// EN: shipping/encryption plus segment config (P5.0.2).
+    pub fn open_with_config(
+        path: impl AsRef<Path>,
+        ship: Option<Arc<ShipHub>>,
+        encryption: Option<Arc<crate::encryption::Encryption>>,
+        config: WalOpenConfig,
+    ) -> io::Result<(Self, Vec<WalEntry>)> {
+        let (mut wal, entries) = FileWal::open_with_encryption(path.as_ref(), encryption)?;
+        wal.set_segment_bytes(config.segment_bytes);
         let path = wal.path().to_path_buf();
         let (tx, rx) = sync_channel(WAL_CHANNEL_BOUND);
         let join = std::thread::Builder::new()
@@ -400,6 +455,62 @@ impl WalAsyncHandle {
             return 0;
         }
         reply_rx.recv().unwrap_or(0)
+    }
+
+    pub fn first_available_lsn(&self) -> io::Result<u64> {
+        let (reply_tx, reply_rx) = std::sync::mpsc::channel();
+        self.inner
+            .tx
+            .send(WalMsg::FirstAvailable { reply: reply_tx })
+            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "wal writer stopped"))?;
+        reply_rx
+            .recv()
+            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "wal reply missing"))?
+    }
+
+    /// 读取本地 WAL 的全部条目（promote 尾部补齐，P5.0.4）。
+    /// EN: Reads every local WAL entry for promote tail replay (P5.0.4).
+    pub fn replay_entries(&self) -> io::Result<Vec<WalEntry>> {
+        let (reply_tx, reply_rx) = std::sync::mpsc::channel();
+        self.inner
+            .tx
+            .send(WalMsg::ReplayEntries { reply: reply_tx })
+            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "wal writer stopped"))?;
+        reply_rx
+            .recv()
+            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "wal reply missing"))?
+    }
+
+    pub fn segment_stats(&self) -> io::Result<SegmentStats> {
+        let (reply_tx, reply_rx) = std::sync::mpsc::channel();
+        self.inner
+            .tx
+            .send(WalMsg::SegmentStats { reply: reply_tx })
+            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "wal writer stopped"))?;
+        reply_rx
+            .recv()
+            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "wal reply missing"))?
+    }
+
+    pub fn retain_segments(
+        &self,
+        safe_floor: u64,
+        max_segments: usize,
+        max_deletes: usize,
+    ) -> io::Result<RetentionOutcome> {
+        let (reply_tx, reply_rx) = std::sync::mpsc::channel();
+        self.inner
+            .tx
+            .send(WalMsg::Retain {
+                safe_floor,
+                max_segments,
+                max_deletes,
+                reply: reply_tx,
+            })
+            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "wal writer stopped"))?;
+        reply_rx
+            .recv()
+            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "wal reply missing"))?
     }
 
     pub fn active_file_len(&self) -> io::Result<u64> {

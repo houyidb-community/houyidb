@@ -185,17 +185,91 @@ POST /v1/optimize
 ```bash
 GET /v1/index/status
 # → {"indexed_count": 50000, "pending_count": 0, "hot_count": 0,
-#     "hnsw_m": 24, "hnsw_ef_construction": 400, "hnsw_ef_search": 256, ...}
+#     "distance_metric": "cosine", "hnsw_m": 24,
+#     "hnsw_ef_construction": 400, "hnsw_ef_search": 256, ...}
 ```
+
+### 5.5.1 Explicit Creation and Distance Metrics
+
+```bash
+PUT /v1/collections/{name}
+# {"dims":8,"metric":"ip","index_type":"hnsw",
+#  "hnsw_m":16,"hnsw_ef_construction":100,"hnsw_ef_search":64}
+# -> 201 {"created":true,"collection":"goods","dims":8,"metric":"ip",
+#         "index_type":"hnsw","hnsw":{...}}
+```
+
+- RBAC classifies it as `Action::Write` (write permission, not admin); names
+  outside a tenant scope are still rejected.
+- Parameters are validated before any WAL append (`validate_create`): invalid
+  metric/backend/dims/bounds return 400 and never leave an unreplayable record.
+  An existing name (even with identical parameters) yields 409; follower/read-only
+  503. On success a `collection_create` record is appended and replicated.
+- `metric` and `index_type` are immutable after creation; the three HNSW
+  parameters must be supplied together (`m` 1..=1024,
+  `ef_construction`/`ef_search` 1..=65536).
+- Support matrix: `hnsw` / `flat` / `clustered` / `flat-clustered` support
+  `l2`/`cosine`/`ip`/`l1`; `pq-flat` supports `l2` only; `hii-l0` supports
+  `cosine` only.
+- Kernel distances are always "smaller = closer" (L2 is squared, IP is `-dot`,
+  L1 is Σ|a-b|). HTTP scores are converted at the single edge by metric:
+  cosine `1-d` (clamped to [-1,1]), l2/l1 `1-d` (unclamped), ip `-d` (the raw
+  dot product). Collection/hybrid search responses echo `metric`; the
+  benchmark-compatibility path omits it to keep bytes identical.
+- Snapshots and recovery: collection snapshot v2 carries `metric` plus optional
+  HNSW parameters (v1 decodes to the backend default metric); graph snapshots
+  carry the metric and reject mismatches. `collection_create` WAL records carry
+  metric/HNSW too, so cold replay never resets historical collections to cosine.
 
 ### 5.6 WAL Management
 
 ```bash
-GET  /v1/wal/status     # WAL 状态 (next_lsn, applied_lsn, archived_segments)
-POST /v1/wal/checkpoint  # {"through_lsn": 42} → 截断 WAL
-POST /v1/wal/rotate       # 归档当前 WAL
-POST /v1/wal/snapshot     # 创建向量快照
+GET  /v1/wal/status      # main WAL plus collections segments/retention/manifest
+POST /v1/wal/checkpoint  # {"through_lsn": 42} -> truncate WAL
+POST /v1/wal/rotate       # archive current WAL
+POST /v1/wal/snapshot     # create vector snapshot
+
+# Storage lifecycle (P5.0)
+GET  /v1/collections/{name}/status   # hot/indexed/pending + applied_lsn + scalar stats
+POST /v1/collections/{name}/compact  # {"force": true} in-memory scalar compaction
+POST /v1/admin/collections/compact   # {"rotate":true,"hold_retention_secs":3600}
+                                     # snapshot cycle -> manifest -> optional rotate -> retention
+
+# Admin: drop a whole collection (irreversible; requires admin credentials)
+DELETE /v1/admin/collections/{name}
 ```
+
+`DELETE /v1/admin/collections/{name}` responds
+`{"deleted":true,"collection":"<name>"}` on success; unknown/already-dropped 404,
+delete races 409, follower/read-only or expired lease 503. Deletion is WAL-first:
+a `{"v":1,"op":"collection_drop","name":"<name>"}` record is appended before the
+in-memory removal, so crash replay and follower live apply both converge to
+"gone"; live apply on a follower does not append to the local WAL. A same-name
+recreate yields a fresh empty collection and never resurrects old vectors.
+Replay treats drops like any other record under the per-collection snapshot
+checkpoint: after `create→drop→recreate→snapshot`, the stale drop LSN is below
+the new collection's checkpoint and is skipped, so live snapshot data survives.
+Periodic snapshots skip a collection being dropped (the cycle is not aborted);
+after dropping everything an empty manifest is written with
+`safe_checkpoint_lsn = global_barrier_lsn`, allowing WAL truncation to that
+barrier. Followers **never** publish empty-name manifests: their local WAL
+appends before apply, so `next_lsn - 1` may outrun a not-yet-applied
+create/upsert; publishing it as safe would let retention truncate unapplied
+records. A follower keeps the previous manifest instead (temporarily using
+more local WAL) until a collection lands or it is promoted to leader.
+Replication protocol **v8** extends v7 (`collection_drop`) with `collection_create`
+metric/HNSW semantics (wire format unchanged) behind a fail-fast version gate:
+v7/v8 cannot be mixed, so upgrades must be coordinated cluster-wide (stop
+replication, upgrade everything, resume). **Never** cold-replay v8 WAL on a v7
+binary: it skips unknown drop records and ignores the metric fields on create
+records, rebuilding as cosine—resurrecting dropped collections and silently
+diverging on metrics.
+
+`collections_wal_segment_bytes` (default 64 MiB; 0 = manual rotation only),
+`collections_wal_max_segments` (default 16; 0 = disable deletion),
+`collections_wal_follower_grace_secs` (default 60),
+`collections_scalar_compact_interval_secs` (default 600; 0 = disabled),
+`collections_scalar_compact_stale_ratio` (default 0.5).
 
 ### 5.7 pgwire Metrics
 

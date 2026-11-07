@@ -26,10 +26,12 @@
 
 use std::sync::Arc;
 
+use axum::body::Body;
 use axum::extract::{Request, State};
 use axum::http::{header, HeaderMap, Method, StatusCode};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
+use futures_util::StreamExt;
 use serde::Serialize;
 
 use crate::audit::sha256_hex;
@@ -42,6 +44,11 @@ pub enum Role {
     Admin,
     Writer,
     Reader,
+    /// 控制面角色（EE M1）：只能访问 lease/demote/promote/replication-status。
+    /// 由专用 `sentinel_token` 派生，不与数据面读写权限交叉。
+    /// EN: control-plane role (EE M1) derived from the dedicated sentinel token;
+    /// grants only lease/demote/promote/replication-status.
+    Sentinel,
 }
 
 impl Role {
@@ -50,8 +57,9 @@ impl Role {
             "admin" => Ok(Self::Admin),
             "writer" => Ok(Self::Writer),
             "reader" => Ok(Self::Reader),
+            "sentinel" => Ok(Self::Sentinel),
             other => Err(format!(
-                "invalid role {other:?}: expect admin | writer | reader"
+                "invalid role {other:?}: expect admin | writer | reader | sentinel"
             )),
         }
     }
@@ -61,6 +69,7 @@ impl Role {
             Self::Admin => "admin",
             Self::Writer => "writer",
             Self::Reader => "reader",
+            Self::Sentinel => "sentinel",
         }
     }
 }
@@ -72,6 +81,14 @@ pub enum Action {
     Read,
     Write,
     Admin,
+    /// sentinel 控制面动作（lease/demote/promote/replication-status）。
+    /// EN: sentinel control actions (lease/demote/promote/replication-status).
+    Sentinel,
+    /// 只读元数据（`/v1/version`）：任何已认证角色可读，sentinel 也需要它做
+    /// 能力探测——不归入数据面 Read，避免 sentinel 借此读 collection。
+    /// EN: read-only metadata (`/v1/version`) open to every authenticated role;
+    /// kept separate from data-plane Read so the sentinel role cannot read data.
+    Meta,
 }
 
 /// 已认证主体。
@@ -227,6 +244,11 @@ impl Principal {
             Action::Read => matches!(self.role, Role::Admin | Role::Writer | Role::Reader),
             Action::Write => matches!(self.role, Role::Admin | Role::Writer),
             Action::Admin => self.role == Role::Admin,
+            // admin 隐含控制面权限（排障/手动故障转移）；sentinel 角色只有这一项。
+            // EN: admin implies control-plane access (manual failover); the
+            // sentinel role has nothing else.
+            Action::Sentinel => matches!(self.role, Role::Admin | Role::Sentinel),
+            Action::Meta => true,
         };
         if !role_ok {
             return false;
@@ -323,6 +345,18 @@ impl AuthzPolicy {
     pub fn from_config(
         legacy_token: Option<&str>,
         configs: &[PrincipalConfig],
+    ) -> Result<Self, String> {
+        Self::from_config_with_sentinel(legacy_token, configs, None)
+    }
+
+    /// `from_config` + sentinel 专用秘密（EE M1）。沿用既有构造函数的调用点
+    /// 不受影响——没有 sentinel token 时行为逐字节不变。
+    /// EN: `from_config` plus the sentinel secret (EE M1); existing callers are
+    /// unaffected — without a sentinel token behavior is unchanged.
+    pub fn from_config_with_sentinel(
+        legacy_token: Option<&str>,
+        configs: &[PrincipalConfig],
+        sentinel_token: Option<&str>,
     ) -> Result<Self, String> {
         let mut principals: Vec<Principal> = Vec::new();
         if let Some(token) = legacy_token {
@@ -435,6 +469,39 @@ impl AuthzPolicy {
                 writes_per_sec,
             ));
         }
+        // Sentinel 专用秘密（EE M1）：独立主体，避免把控制面权限混进数据面
+        // token；空白值 fail-closed（与 auth_token 同规）。
+        // EN: the sentinel secret becomes its own principal so control-plane
+        // authority never rides a data-plane token; a blank value is fatal.
+        if let Some(token) = sentinel_token {
+            if token.is_empty() {
+                return Err("sentinel_token is empty (unset it to disable)".to_string());
+            }
+            if principals.iter().any(|p| p.name == "sentinel") {
+                return Err(
+                    "sentinel_token conflicts with an auth_principals entry named \
+                     \"sentinel\"; rename the principal"
+                        .to_string(),
+                );
+            }
+            let token_hash = sha256_hex(token.as_bytes());
+            if principals.iter().any(|p| p.token_hash == token_hash) {
+                return Err(
+                    "sentinel_token duplicates another principal's token; use a \
+                     dedicated secret"
+                        .to_string(),
+                );
+            }
+            principals.push(build_principal(
+                "sentinel".to_string(),
+                Role::Sentinel,
+                None,
+                token_hash,
+                None,
+                64,
+                None,
+            ));
+        }
         Ok(Self {
             principals: Arc::new(principals),
         })
@@ -464,8 +531,25 @@ impl AuthzPolicy {
 /// Map an HTTP request to an action; admin surfaces require Admin.
 pub fn http_action(method: &Method, path: &str) -> Action {
     let m = method.as_str();
+    // sentinel 控制面（EE M1）：独立动作，admin 隐含放行，sentinel 角色只此一项。
+    // lease 的 GET 用于观察租约，也归控制面（不暴露给普通 reader）。
+    // EN: sentinel control surface (EE M1) — admin implies it, the sentinel
+    // role gets exactly this set; even the lease GET stays off the reader role.
+    if path == "/v1/version" {
+        return Action::Meta;
+    }
+    if matches!(
+        path,
+        "/v1/admin/lease"
+            | "/v1/admin/demote"
+            | "/v1/admin/promote"
+            | "/v1/admin/replication/status"
+    ) {
+        return Action::Sentinel;
+    }
     if path.starts_with("/v1/admin")
         || path.ends_with("/ha_level")
+        || path.ends_with("/compact")
         || path == "/metrics"
         || matches!(
             path,
@@ -494,12 +578,29 @@ pub fn http_collection(path: &str) -> Option<&str> {
     (!name.is_empty()).then_some(name)
 }
 
-/// 该 HTTP 路径是否可能隐式新建 collection：当前只有 upsert。
-/// 检索/删除/改 HA 对未知名字不会创建，配额不得把它们当成新建。
-/// EN: only upsert can implicitly create a collection; other collection
-/// endpoints never create and must not be quota-gated.
-pub fn http_creates_collection(path: &str) -> bool {
-    http_collection(path).is_some() && path.ends_with("/upsert")
+/// 该 HTTP 请求是否可能新建 collection：显式 `PUT /v1/collections/{name}`
+/// 与隐式 `POST /v1/collections/{name}/upsert`。
+///
+/// 检索/删除/改 HA 对未知名字不会创建，配额不得把它们当成新建——否则
+/// `DELETE` 未知名字会先得到 429 而非 404（OCR 批次三十四）。
+/// EN: explicit `PUT /v1/collections/{name}` and implicit upsert both create;
+/// search/delete/ha_level never do, so quota must not count them as creations.
+pub fn http_creates_collection(method: &Method, path: &str) -> bool {
+    let Some(name) = http_collection(path) else {
+        return false;
+    };
+    // collection 名之后的剩余路径：空前缀即 collection 根。尾斜杠 `/v1/collections/x/`
+    // 不是建集合：axum 0.8（matchit）不做尾斜杠归一，路由器只注册了
+    // `/v1/collections/{name}`，该请求本就 404；若把它算作新建，配额满时会在
+    // 路由前先返回 429，与「429 不得替代 404」的既有纪律冲突（OCR #38）。
+    // EN: remainder after the name; an empty rest is the collection root.
+    // A trailing slash (`/v1/collections/x/`) is not a creation: axum 0.8
+    // (matchit) does not normalize trailing slashes and the router only
+    // registers `/v1/collections/{name}`, so such a request is a 404; counting
+    // it as a creation would return 429 at quota before routing, violating the
+    // "429 must not replace 404" discipline (OCR #38).
+    let rest = &path["/v1/collections/".len() + name.len()..];
+    (method == Method::PUT && rest.is_empty()) || (method == Method::POST && rest == "/upsert")
 }
 
 /// 全局数据资源（主索引/嵌入/管理面）：带作用域主体默认不可访问。
@@ -520,6 +621,9 @@ pub fn http_global_data(path: &str) -> bool {
 #[derive(Debug, Clone)]
 pub struct AuthenticatedPrincipal {
     pub name: String,
+    /// 角色（whoami 端点展示；审计仍以主体名为准）。
+    /// EN: role (shown by whoami; audit still keys on the principal name).
+    pub role: Role,
     /// None = 全部；列表过滤与配额判定使用。
     /// EN: None = all; used by list filtering and quota checks.
     pub collections: Option<Vec<String>>,
@@ -530,6 +634,7 @@ impl AuthenticatedPrincipal {
     fn from_principal(p: &Principal) -> Self {
         Self {
             name: p.name.clone(),
+            role: p.role,
             collections: p.collections.clone(),
             max_collections: p.max_collections,
         }
@@ -624,7 +729,7 @@ pub async fn require_auth(
     // DELETE 未知名字得到 429 而非 404（OCR 批次三十四）。
     // EN: only endpoints that can create (upsert) are quota-gated — a delete
     // of an unknown name must stay a 404, not a 429.
-    if action == Action::Write && http_creates_collection(path) {
+    if action == Action::Write && http_creates_collection(req.method(), path) {
         if let (Some(name), Some(collections)) = (collection, &state.collections) {
             if collections.get(name).is_none() {
                 let existing = collections.list();
@@ -634,11 +739,13 @@ pub async fn require_auth(
             }
         }
     }
-    // 在途配额：许可覆盖 handler 生成响应的全过程（RAII）。当前所有处理器
-    // 返回缓冲体，响应生成即传输完成；若将来引入流式/SSE 响应，必须把
-    // permit 移进 body wrapper，否则计数窗口会提前结束。
-    // EN: the permit spans response *generation*; all handlers return buffered
-    // bodies today. Streaming responses must move the permit into the body.
+    // 在途配额：许可必须在响应体写完前一直持有。缓冲体在 handler 返回时
+    // 即已生成，但流式响应（如 collection 导出）返回的只是 body 流；把
+    // permit 移进 body wrapper，保证慢客户端读流的全过程都计入在途。
+    // EN: the permit must live until the response body is fully written. A
+    // buffered body is complete when the handler returns, but streaming
+    // responses (e.g. collection export) only return the body stream — moving
+    // the permit into the body wrapper counts slow-client streaming too.
     let permit = if principal.has_inflight_limit() {
         match principal.try_acquire_inflight() {
             Some(p) => Some(p),
@@ -654,9 +761,23 @@ pub async fn require_auth(
     let mut req = req;
     req.extensions_mut().insert(auth_ext.clone());
     let mut response = next.run(req).await;
-    drop(permit);
     response.extensions_mut().insert(auth_ext);
-    response
+    response.map(|body| body_holding_permit(body, permit))
+}
+
+/// 把在途许可挂到响应体上：body 耗尽或丢弃时许可才释放。
+/// EN: attach the in-flight permit to the body; it is released only when the
+/// body is exhausted or dropped.
+fn body_holding_permit(body: Body, permit: Option<tokio::sync::OwnedSemaphorePermit>) -> Body {
+    let Some(permit) = permit else {
+        return body;
+    };
+    let stream = body.into_data_stream();
+    let guarded =
+        futures_util::stream::unfold((stream, permit), |(mut stream, permit)| async move {
+            stream.next().await.map(|item| (item, (stream, permit)))
+        });
+    Body::from_stream(guarded)
 }
 
 /// 提取全部候选凭据（Bearer 与 X-Api-Key 都尝试，scheme 大小写不敏感，
@@ -754,6 +875,8 @@ pub fn authorize_sql(principal: &Principal, sql: &str) -> Result<(), (String, St
                     Action::Read => "read",
                     Action::Write => "write",
                     Action::Admin => "administer",
+                    Action::Sentinel => "run sentinel control on",
+                    Action::Meta => "inspect",
                 },
                 collection
                     .as_deref()
@@ -807,6 +930,48 @@ mod tests {
             !debug.contains(&sha256_hex(b"ingest-token")),
             "token hash must be redacted in Debug"
         );
+    }
+
+    /// sentinel 角色只有控制面动作；数据面读写与 admin 全部拒绝。
+    /// EN: the sentinel role has control-plane actions only.
+    #[test]
+    fn sentinel_principal_is_control_plane_only() {
+        let p = AuthzPolicy::from_config_with_sentinel(
+            Some("legacy-token"),
+            &[cfg("ingest", "writer", "ingest-token", Some(&["docs"]))],
+            Some("sentinel-secret"),
+        )
+        .expect("valid policy");
+        let sentinel = p.resolve("sentinel-secret").expect("sentinel token");
+        assert_eq!(sentinel.name, "sentinel");
+        assert_eq!(sentinel.role, Role::Sentinel);
+        assert!(sentinel.allows(Action::Sentinel, None, true));
+        assert!(!sentinel.allows(Action::Read, Some("docs"), false));
+        assert!(!sentinel.allows(Action::Write, Some("docs"), false));
+        assert!(!sentinel.allows(Action::Admin, None, true));
+        // admin 仍隐含控制面权限。
+        // EN: Admin still implies control-plane access.
+        assert!(p
+            .resolve("legacy-token")
+            .unwrap()
+            .allows(Action::Sentinel, None, true));
+        // 空 sentinel token / 与既有 token 重复 / 与同名主体冲突都 fast-fail。
+        // EN: A blank sentinel token, a duplicate token, or a name clash with an
+        // existing principal all fail fast.
+        assert!(AuthzPolicy::from_config_with_sentinel(None, &[], Some("")).is_err());
+        assert!(
+            AuthzPolicy::from_config_with_sentinel(None, &[], Some("dup")).is_ok(),
+            "unique secret is accepted"
+        );
+        let dup =
+            AuthzPolicy::from_config_with_sentinel(Some("same-secret"), &[], Some("same-secret"));
+        assert!(dup.unwrap_err().contains("duplicates"));
+        let name_conflict = AuthzPolicy::from_config_with_sentinel(
+            None,
+            &[cfg("sentinel", "reader", "reader-token", None)],
+            Some("sentinel-secret"),
+        );
+        assert!(name_conflict.unwrap_err().contains("named"));
     }
 
     #[test]
@@ -889,13 +1054,82 @@ mod tests {
             Action::Admin
         );
         assert_eq!(
+            http_action(&Method::POST, "/v1/collections/docs/compact"),
+            Action::Admin
+        );
+        assert_eq!(
             http_action(&Method::POST, "/v1/admin/promote"),
+            Action::Sentinel
+        );
+        assert_eq!(
+            http_action(&Method::POST, "/v1/admin/lease"),
+            Action::Sentinel
+        );
+        assert_eq!(
+            http_action(&Method::GET, "/v1/admin/replication/status"),
+            Action::Sentinel
+        );
+        assert_eq!(
+            http_action(&Method::POST, "/v1/admin/demote"),
+            Action::Sentinel
+        );
+        // 查询分析端点仍是 admin，不下放给 sentinel 角色。
+        // EN: Query-analysis endpoints stay admin-only; the sentinel role gets
+        // nothing here.
+        assert_eq!(
+            http_action(&Method::GET, "/v1/admin/query-log"),
+            Action::Admin
+        );
+        assert_eq!(http_action(&Method::GET, "/v1/version"), Action::Meta);
+        // DELETE 落在 /v1/admin/*：管理动作，writer/reader 一律 403。
+        // EN: DELETE under /v1/admin/* is an admin action (writer/reader get 403).
+        assert_eq!(
+            http_action(&Method::DELETE, "/v1/admin/collections/docs"),
             Action::Admin
         );
         assert_eq!(http_collection("/v1/collections/docs/search"), Some("docs"));
         assert_eq!(http_collection("/v1/collections"), None);
         assert!(http_global_data("/v1/vectors/upsert"));
         assert!(!http_global_data("/v1/collections/docs/search"));
+        // PUT collection 根是写动作；只有显式建/隐式 upsert 计入新建配额。
+        // EN: PUT on a collection root is a write; only explicit create and
+        // implicit upsert count as creations for the quota.
+        assert_eq!(
+            http_action(&Method::PUT, "/v1/collections/docs"),
+            Action::Write
+        );
+        assert!(http_creates_collection(
+            &Method::PUT,
+            "/v1/collections/docs"
+        ));
+        assert!(http_creates_collection(
+            &Method::POST,
+            "/v1/collections/docs/upsert"
+        ));
+        assert!(!http_creates_collection(
+            &Method::GET,
+            "/v1/collections/docs"
+        ));
+        assert!(!http_creates_collection(
+            &Method::DELETE,
+            "/v1/collections/docs"
+        ));
+        assert!(!http_creates_collection(
+            &Method::PUT,
+            "/v1/collections/docs/search"
+        ));
+        assert!(!http_creates_collection(
+            &Method::POST,
+            "/v1/collections/docs/ha_level"
+        ));
+        // 尾斜杠不是建集合：路由器不归一尾斜杠，该路径只会 404；
+        // 配额不得把它提前变成 429（OCR #38）。
+        // EN: A trailing slash is not a creation: the router does not normalize
+        // it, so the path only ever 404s; quota must not turn it into 429 (OCR #38).
+        assert!(!http_creates_collection(
+            &Method::PUT,
+            "/v1/collections/docs/"
+        ));
     }
 
     /// 中间件端到端：角色 + collection 作用域 + 401/403 区分。
@@ -903,7 +1137,7 @@ mod tests {
     #[tokio::test]
     async fn rbac_middleware_allows_and_denies() {
         use axum::body::Body;
-        use axum::routing::{get, post};
+        use axum::routing::{delete, get, post};
         use axum::Router;
         use tower::ServiceExt;
 
@@ -912,6 +1146,7 @@ mod tests {
             .route("/v1/collections/{name}/upsert", post(|| async { "ok" }))
             .route("/v1/collections/{name}/search", post(|| async { "ok" }))
             .route("/v1/collections", get(|| async { "list" }))
+            .route("/v1/admin/collections/{name}", delete(|| async { "ok" }))
             .route("/v1/admin/audit/verify", get(|| async { "admin" }))
             .route("/v1/vectors/upsert", post(|| async { "ok" }))
             .layer(axum::middleware::from_fn_with_state(
@@ -1015,6 +1250,38 @@ mod tests {
             call(&app, "GET", "/v1/admin/audit/verify", Some("ops-token")).await,
             StatusCode::OK
         );
+        // 整库删除只有 admin 能做；writer/reader 均 403，admin 放行。
+        // EN: whole-collection drop is admin-only; writer/reader are 403.
+        assert_eq!(
+            call(
+                &app,
+                "DELETE",
+                "/v1/admin/collections/docs",
+                Some("analytics-token")
+            )
+            .await,
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            call(
+                &app,
+                "DELETE",
+                "/v1/admin/collections/docs",
+                Some("ingest-token")
+            )
+            .await,
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            call(
+                &app,
+                "DELETE",
+                "/v1/admin/collections/docs",
+                Some("ops-token")
+            )
+            .await,
+            StatusCode::OK
+        );
 
         // 过期 Bearer 不得遮蔽有效的 X-Api-Key（兼容性回归）。
         // EN: An invalid Bearer must not shadow a valid X-Api-Key (compat regression).
@@ -1105,6 +1372,61 @@ mod tests {
             }],
         );
         assert!(zero.unwrap_err().contains("max_collections"));
+    }
+
+    /// 流式响应的在途许可：必须持有到 body 读完，不能随 handler 返回释放。
+    /// EN: a streaming response holds its in-flight permit until the body is
+    /// drained, not just until the handler returns.
+    #[tokio::test]
+    async fn inflight_permit_spans_streaming_bodies() {
+        use axum::routing::get;
+        use axum::Router;
+        use tower::ServiceExt;
+
+        let policy = AuthzPolicy::from_config(
+            None,
+            &[PrincipalConfig {
+                name: "streamer".into(),
+                role: "reader".into(),
+                token: Some("stream-token".into()),
+                token_sha256: None,
+                collections: None,
+                max_collections: None,
+                max_inflight: Some(1),
+                writes_per_sec: None,
+            }],
+        )
+        .expect("policy");
+        let state = Arc::new(AuthzState::new(Arc::new(policy), None));
+        let app = Router::new()
+            .route(
+                "/v1/collections/{name}/export",
+                get(|| async {
+                    let stream = futures_util::stream::once(async {
+                        Ok::<_, std::convert::Infallible>(axum::body::Bytes::from_static(b"row\n"))
+                    });
+                    Body::from_stream(stream)
+                }),
+            )
+            .layer(axum::middleware::from_fn_with_state(state, require_auth));
+
+        let request = || {
+            Request::builder()
+                .uri("/v1/collections/docs/export")
+                .header(header::AUTHORIZATION, "Bearer stream-token")
+                .body(Body::empty())
+                .unwrap()
+        };
+        let first = app.clone().oneshot(request()).await.expect("first");
+        assert_eq!(first.status(), StatusCode::OK);
+        // body 未读：许可仍被占用。 / EN: the body is not drained yet.
+        let second = app.clone().oneshot(request()).await.expect("second");
+        assert_eq!(second.status(), StatusCode::TOO_MANY_REQUESTS);
+        let _ = axum::body::to_bytes(first.into_body(), 1024)
+            .await
+            .expect("body");
+        let third = app.clone().oneshot(request()).await.expect("third");
+        assert_eq!(third.status(), StatusCode::OK);
     }
 
     /// 中间件集合配额：已有 1 个、上限 1 时，新建第二个返回 429，更新已有放行。

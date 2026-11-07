@@ -16,8 +16,8 @@ portable = ["houyi-vector/portable"]
 simd-neon = ["houyi-vector/simd-neon"]
 
 [dependencies]
-houyi-vector = { path = "../houyi-vector", version = "0.2.0-beta.5", default-features = false, features = ["portable", "simd-neon"] }
-houyi-core = { path = "../houyi-core", version = "0.2.0-beta.5", default-features = false, features = ["portable"] }
+houyi-vector = { path = "../houyi-vector", version = "0.2.0-beta.8", default-features = false, features = ["portable", "simd-neon"] }
+houyi-core = { path = "../houyi-core", version = "0.2.0-beta.8", default-features = false, features = ["portable"] }
 ahash = "0.8"
 
 [dev-dependencies]

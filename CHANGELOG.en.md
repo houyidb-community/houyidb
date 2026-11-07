@@ -2,6 +2,136 @@
 
 > [中文](CHANGELOG.md)
 
+## v0.2.0-beta.8 (2026-11-07)
+
+### Added
+- **`DELETE /v1/admin/collections/{name}`**: unconditional whole-collection
+  drop (admin `Action::Admin`, audited automatically). Deletion is WAL-first:
+  a `collection_drop` record is appended before the in-memory removal, so
+  crash replay and follower live apply both converge to "gone". A same-name
+  recreate starts empty and never resurrects the old vectors. Responds with
+  `{"deleted":true,"collection":"<name>"}`; unknown/already-dropped 404,
+  delete races 409, follower/read-only 503. `/v1/version` advertises
+  `collection_delete`.
+- **Six-language SDKs + MCP**: the Rust/Go/Python/TypeScript/.NET/Java clients
+  gain an optional admin token (attached only to `/v1/admin/*` requests) and a
+  `delete_collection` / `DeleteCollection` API; `houyidb-mcp` gains a
+  `delete_collection` tool (registered only in read-write mode, requires
+  `HOUYI_ADMIN_TOKEN`, and still honors the allowlist).
+- **`PUT /v1/collections/{name}` explicit creation** (normal write permission,
+  `Action::Write`): fixes `dims` / `metric` / `index_type` / the HNSW triple in
+  one shot; parameters are validated before the WAL append. An existing name
+  yields 409, and metric/backend are immutable afterwards. `/v1/version`
+  advertises `collection_create` / `collection_metric`.
+- **Collection-level distance metrics**: `l2` / `cosine` / `ip` / `l1` (the
+  kernel always uses "smaller = closer"; HTTP scores convert at the single
+  edge: cosine `1-d` clamped to [-1,1], l2/l1 `1-d` unclamped, ip the raw dot
+  product). Support matrix: hnsw / flat / clustered / flat-clustered support
+  all four; pq-flat only l2; hii-l0 only cosine. Collection/hybrid search
+  responses gain a `metric` field (the benchmark path stays byte-identical).
+- **Six-language SDK + MCP creation APIs**: `create_collection` /
+  `createCollection` / `CreateCollection` / `CreateCollectionAsync` accept
+  metric/backend/HNSW options and echo the effective parameters; the MCP server
+  gains a `create_collection` tool that uses the normal `HOUYI_AUTH_TOKEN` and
+  never the admin token.
+
+### Changed
+- **Replication protocol v8**: extends v7 (`collection_drop`) with
+  `collection_create` metric/HNSW semantics (wire format unchanged). The
+  fail-fast version gate isolates v8 from older deployments because old binaries
+  silently skip unknown ops and rebuild create records as cosine (resurrected
+  drops plus silent metric drift); upgrades must be coordinated cluster-wide.
+- **Collection snapshot v2**: carries `metric` plus optional HNSW parameters;
+  v1 decodes to the backend default metric. Graph snapshots carry the metric
+  and reject mismatches; `collection_create` WAL records carry metric/HNSW too,
+  so cold replay never resets historical collections to cosine.
+- **Snapshots/retention**: a collection being dropped no longer aborts the
+  snapshot cycle (it is skipped); after dropping everything the empty manifest
+  commits `safe_checkpoint_lsn = global_barrier_lsn` so the WAL can be
+  truncated; a collection created after the barrier has a strictly greater
+  Create LSN, keeping truncation safe. Followers **never** publish empty-name
+  manifests: their local WAL appends before apply, so `next_lsn - 1` may
+  outrun a not-yet-applied create/upsert; they keep the previous manifest
+  (temporarily using more local WAL) until a collection lands or they are
+  promoted to leader.
+
+### Upgrade
+- Replication protocol **v8 is not rolling-compatible with v7 or earlier
+  (beta.7 = v6)**: stop replication, upgrade every replica, then resume.
+- **No downgrade**: never cold-replay v8 WAL with a v7 binary—it skips
+  `collection_drop` and ignores the metric fields on create records,
+  resurrecting dropped collections and silently drifting to cosine. Fall back
+  to a backup or a delete-and-recreate (recreate with the original metric).
+
+## v0.2.0-beta.7 (2026-11-02)
+
+### Added
+- `GET /v1/collections/{name}/export`: streaming NDJSON logical export
+  (header + id-sorted records + footer). Built vectors are shared via `Arc`
+  instead of cloned; payloads use last-write-wins and tombstones are skipped.
+  `/v1/version` advertises `collection_export`.
+- Collection list/status expose a read-only `ha_level` (changes still go
+  through `POST /v1/collections/{name}/ha_level`, WAL-first).
+
+### Fixed
+- The concurrent-build regression test now adaptively waits for the queue to
+  drain, removing a flaky Linux CI failure under load.
+
+## v0.2.0-beta.6 (2026-10-30) — P5.0 storage lifecycle
+
+### Added
+- **Collections snapshots + manifest** (HOUYISNAP/HOUYIMAN): cold start skips
+  records covered by a checkpoint; a truncated history without a manifest is
+  fatal instead of replaying a gapped log.
+- **Segmented WAL with bounded retention**: default 16 × 64 MiB, whole segments
+  only; `/v1/wal/status`, `/metrics` and
+  `POST /v1/admin/collections/compact` expose and drive retention.
+- **Replication protocol v6**: handshakes carry the follower's earliest readable
+  LSN, manifest checkpoint and stable follower_id; ANCHOR/HNDA negotiation;
+  `BEHIND_RETAINED` with a full-resync runbook; the retention floor follows
+  active followers' durable LSN (configurable disconnect grace).
+- **In-memory scalar compaction**: checked every 10 minutes and compacted at
+  ≥50% stale rows; status exposes physical/live/stale/tombstone counts;
+  `POST /v1/collections/{name}/compact` triggers it manually.
+- Promote replays the local WAL tail above each collection's `applied_lsn` and
+  refuses to promote on failure.
+- **Sentinel control-plane primitives (EE prerequisite, not paywalled)**:
+  `cluster_state.json` persists the term (monotonic, corruption is fatal);
+  leader leases with write fencing (`--require-leader-lease`, expiry returns
+  503 `lease_expired` / pgwire 25006); `POST/DELETE/GET /v1/admin/lease`,
+  `POST /v1/admin/demote`, `GET /v1/admin/replication/status`,
+  `GET /v1/version`, `GET /v1/admin/whoami`, `GET /v1/admin/diagnostics`;
+  promote accepts an optional `{term, ttl_ms}` to grant atomically; demote
+  accepts `follower_of` (the new leader's replication address) to convert the
+  old leader back into a follower at runtime and catch up without a restart.
+  With everything off, behavior matches manual promote.
+- **Replication quorum waits**: `--replication-sync-quorum N` (0 = any ACK,
+  the default). With N > 0 a sync write waits until N active followers have
+  DURABLE ≥ the write LSN (K-th largest).
+- **Query log and stats**: `--query-log-capacity` / `--query-log-sample-every`
+  (off by default). A bounded ring buffer records metadata only (no vectors,
+  payloads or SQL); `GET /v1/admin/query-log` and
+  `GET /v1/admin/query-stats` (p50/p95/p99).
+- **Sentinel RBAC role**: a dedicated `sentinel_token` (ENV/TOML only, never
+  a CLI flag) may only call lease/demote/promote/replication-status; admin
+  keeps everything.
+- Fuzz target `collection_snapshot_decode`.
+
+### Changed
+- **Behavior change (filtering)**: after compaction a filter matches only the
+  last row per id (append-only pages previously let stale rows match).
+- Startup self-check probes use reserved IDs and are removed; the benchmark
+  `/v1/index/status` reports effective `distance_metric`, `hnsw_m` and
+  `hnsw_ef_construction`.
+
+### Upgrade
+- Replication **v6 is not rolling-compatible with v5**: upgrade all replicas
+  together.
+- After the first WAL truncation, downgrading to an older binary is unsafe; use
+  a backup or the full-resync path instead.
+- Run `POST /v1/admin/collections/compact` once before upgrading so old history
+  is covered by a snapshot.
+
 ## v0.2.0-beta.5 (2026-10-25)
 
 ### Added

@@ -8,7 +8,7 @@
 ## Installation (Standalone)
 
 ```bash
-# Default image: ghcr.io/houyidb-community/houyidb:v0.2.0-beta.5
+# Default image: ghcr.io/houyidb-community/houyidb:v0.2.0-beta.8
 helm install houyi ./deploy/helm/houyidb \
   --namespace houyidb --create-namespace \
   --set persistence.size=100Gi
@@ -17,11 +17,11 @@ helm install houyi ./deploy/helm/houyidb \
 To use a self-built image, override `image.repository` / `image.tag`:
 
 ```bash
-docker build -t registry.example.com/houyidb:v0.2.0-beta.5 .
-docker push registry.example.com/houyidb:v0.2.0-beta.5
+docker build -t registry.example.com/houyidb:v0.2.0-beta.8 .
+docker push registry.example.com/houyidb:v0.2.0-beta.8
 helm install houyi ./deploy/helm/houyidb -n houyidb \
   --set image.repository=registry.example.com/houyidb \
-  --set image.tag=v0.2.0-beta.5
+  --set image.tag=v0.2.0-beta.8
 ```
 
 ## Primary/Standby (Manual Failover)

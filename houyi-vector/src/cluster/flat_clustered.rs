@@ -4,9 +4,9 @@
 //! 适合: 每分区向量数 < 5K、频繁全量更新、NUMA 多节点部署。
 //! Ideal for: <5K vectors per cluster, frequent full reloads, NUMA-aware deploys.
 
+use super::boundary::dist_fn;
 use super::kmeans;
 use super::router;
-use crate::distance;
 use crate::DistanceMetric;
 use rayon::prelude::*;
 
@@ -155,14 +155,6 @@ impl FlatClustered {
 
     pub fn num_clusters(&self) -> usize {
         self.num_clusters
-    }
-}
-
-#[inline]
-fn dist_fn(metric: DistanceMetric, a: &[f32], b: &[f32]) -> f32 {
-    match metric {
-        DistanceMetric::L2 => distance::l2_squared(a, b),
-        DistanceMetric::Cosine => distance::cosine(a, b),
     }
 }
 

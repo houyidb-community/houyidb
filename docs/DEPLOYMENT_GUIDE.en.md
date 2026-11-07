@@ -2,7 +2,7 @@
 
 > [中文](DEPLOYMENT_GUIDE.md)
 
-> Applies to v0.2.0-beta.5. HouyiDB is a **single-node, memory-first** vector database;
+> Applies to v0.2.0-beta.8. HouyiDB is a **single-node, memory-first** vector database;
 > high availability is manual leader/follower promotion, with no automatic election.
 > During beta, use it first for functional validation and non-critical workloads.
 
@@ -149,7 +149,7 @@ helm install houyi ./deploy/helm/houyidb -n houyidb --create-namespace \
   --set persistence.size=100Gi
 ```
 
-The default image is `ghcr.io/houyidb-community/houyidb:v0.2.0-beta.5`;
+The default image is `ghcr.io/houyidb-community/houyidb:v0.2.0-beta.8`;
 override `image.repository` / `image.tag` for a self-built image.
 
 Primary/standby uses **two releases** (v1 has no automatic election; increasing
@@ -240,8 +240,9 @@ sudo tar czf houyidb-backup-$(date +%F).tgz \
 sudo systemctl start houyidb
 ```
 
-- The directory must include the WAL, `*.collections.wal`, sidecar files, `snapshots/`, and
-  the keyring (if encryption is enabled);
+- The directory must include the WAL, `*.collections.wal` with its `*.wal.archived.*`
+  segments, `*.wal.next_lsn`, `snapshots/` (including `collections.manifest`), the
+  follower's `replication.follower_id`, and the keyring (if encryption is enabled);
 - While running, WAL and snapshot files are still changing; a hot copy **cannot guarantee
   cross-file consistency**; for critical data use stop-write backups, or use primary/standby
   (after the follower catches up, back up/promote on it);
@@ -287,6 +288,43 @@ curl -fsS -X POST http://<follower>:7000/v1/admin/promote \
 - v1 has no automatic election/quorum: monitor replication lag, then promote manually after
   human judgment.
 
+### 10.1 Sentinel control-plane primitives (EE prerequisite, off by default)
+
+Automatic election lives in the enterprise edition, but **the safety primitives — term, lease and
+write fencing — ship in the community edition** (no paywall: without them a partitioned old leader
+keeps writing and loses data):
+
+```bash
+# 1. Enable write fencing (a leader needs a valid lease to write)
+houyi-server --role follower --require-leader-lease \
+  --replication-sync-quorum 1 ...     # quorum optional; 0 = any ACK
+
+# 2. The sentinel secret is ENV/TOML only (never a CLI flag) and requires a
+#    data-plane credential (HOUYI_AUTH_TOKEN or [[auth_principals]])
+export HOUYI_SERVER_SENTINEL_TOKEN=...
+
+# 3. Grant a lease (terms only increase), then promote with a lease
+curl -X POST http://<follower>:7000/v1/admin/lease \
+  -H "Authorization: Bearer $SENTINEL_TOKEN" \
+  -H "Content-Type: application/json" -d '{"term":7,"ttl_ms":10000}'
+curl -X POST http://<follower>:7000/v1/admin/promote \
+  -H "Authorization: Bearer $SENTINEL_TOKEN" \
+  -H "Content-Type: application/json" -d '{"term":7,"ttl_ms":10000}'
+
+# 4. Demote the old leader to read-only (detached; rejoin requires a restart)
+curl -X POST http://<old-leader>:7000/v1/admin/demote \
+  -H "Authorization: Bearer $SENTINEL_TOKEN" \
+  -H "Content-Type: application/json" -d '{"term":7}'
+```
+
+- The term is persisted in `cluster_state.json` beside the WAL (atomic write + fsync); corruption is
+  fatal at startup — the node never writes with an unknown term;
+- Lease expiry does not flip the role by itself; the write path returns 503 `lease_expired`
+  (pgwire 25006) and the sentinel or an operator demotes explicitly, avoiding renew/flip races;
+- `GET /v1/admin/replication/status` exposes role/term/lease/follower progress/quorum;
+  `GET /v1/version` lets clients probe capabilities;
+- After demote the node is `detached_readonly`; runtime follower conversion lands in M3.
+
 ## 11. Observability
 
 | Endpoint | Purpose |
@@ -297,6 +335,10 @@ curl -fsS -X POST http://<follower>:7000/v1/admin/promote \
 | `GET /v1/index/status` | Main index status |
 | `GET /v1/collections/{name}/status` | Status of a single collection |
 | `GET /v1/pgwire/status` | pgwire session statistics |
+| `GET /v1/admin/replication/status` | Role/term/lease/follower progress |
+| `GET /v1/admin/diagnostics` | Structured diagnostic state (no secrets/vectors) |
+| `GET /v1/admin/query-log` | Recent query metadata (query log must be enabled) |
+| `GET /v1/admin/query-stats` | Per-collection p50/p95/p99 |
 
 - Alert rules: `deploy/prometheus/houyidb-alerts.yml`, each alert carries a runbook link
   (`docs/runbooks/`);
@@ -309,12 +351,16 @@ curl -fsS -X POST http://<follower>:7000/v1/admin/promote \
 1. Back up the data directory first (see §9);
 2. Single node: stop the service → replace the binary/image → start → verify `/v1/health` and
    sample retrievals;
-3. Primary/standby: upgrade the follower first and confirm it has caught up → promote → upgrade
-   the old leader → clear its data and reconnect as a follower;
+3. Primary/standby: replication **v6 is not rolling-compatible with v5**, so the old
+   "upgrade the follower first" flow is invalid. Quiesce writes (or stop writes), upgrade
+   **all replicas together**, then start the leader followed by its followers. Before upgrading,
+   run `POST /v1/admin/collections/compact {"rotate":true}` to commit a full snapshot and
+   shorten the first-start WAL replay.
 4. The first start after an upgrade replays WAL/graph snapshots as needed; the time grows with
    data volume;
-5. **No downgrade compatibility is promised**: restore the pre-upgrade backup before rolling
-   back; do not open new-format data directly with the old binary.
+5. **No downgrade compatibility is promised**: after the first collections WAL truncation the
+   old binary cannot safely open the new data; restore the pre-upgrade backup instead, or rebuild
+   the baseline with `scripts/collections_resync.sh`.
 
 ## 13. Troubleshooting
 

@@ -1,8 +1,13 @@
 //! 边界点检测与跨聚类复制。
 //! Boundary detection and cross-cluster replication.
 //!
-//! 当向量到次近中心的距离 ≤ 到最近中心 × α 时，判定为边界点，复制到次近聚类。
-//! 这消除了聚类方法的主要 recall 损失来源（边界效应）。
+//! 当向量到次近中心的距离 ≤ 最近距离 + |最近距离| × (α - 1) 时，判定为边界点，
+//! 复制到次近聚类。这消除了聚类方法的主要 recall 损失来源（边界效应）。加性
+//! 余量在最近距离非负时与乘法形式等价，且对 IP 的负值距离（内积取负）方向正确。
+//! EN: A vector is a boundary point when its second-nearest distance ≤ nearest +
+//! |nearest| × (α - 1), and is copied to the second cluster. The additive margin
+//! is equivalent to the multiplicative form for non-negative distances and stays
+//! direction-correct for negative IP distances (-dot).
 
 use crate::distance;
 use crate::DistanceMetric;
@@ -56,9 +61,12 @@ pub fn assign_with_boundary(
                     dist_fn(metric, v, &centroids[primary * dims..(primary + 1) * dims]);
                 let d_sec = dist_fn(metric, v, &centroids[sec * dims..(sec + 1) * dims]);
 
-                // 边界条件：次近距离 ≤ 最近距离 × α
-                // EN: Boundary condition: second-nearest distance ≤ nearest distance × α.
-                if alpha > 0.0 && d_sec <= d_primary * alpha {
+                // 边界条件见 `is_boundary`：构建期与插入期共用同一判定，
+                // 避免两条路径对 IP 正负号/度量距离的处理分叉（OCR 195e6be #04）。
+                // EN: The boundary condition lives in `is_boundary`, shared by the
+                // build and insert paths so IP sign handling and metric-specific
+                // distances cannot drift between them (OCR 195e6be #04).
+                if is_boundary(d_primary, d_sec, alpha) {
                     vec![sec]
                 } else {
                     Vec::new()
@@ -140,11 +148,43 @@ pub fn replication_overhead(assignments: &[BoundaryAssignment]) -> f64 {
     (total_copies - primary_count) as f64 / primary_count as f64
 }
 
+/// 边界判定：次近距离 ≤ 最近距离 + |最近距离| × (α - 1)。
+/// EN: Boundary test: second-nearest ≤ nearest + |nearest| × (α - 1).
+///
+/// IP 距离为 -dot（可为负）：直接乘 α 会把负值变得更负、方向反转（次近“更
+/// 相似”的反而复制，真正边缘点漏掉）；加性形式对正负号都正确，且
+/// `d_primary ≥ 0` 时与旧式 `d_primary × α` 等价（OCR #14）。
+/// EN: IP distances are -dot and may be negative; multiplying directly by α makes
+/// larger-magnitude negatives even more negative (reversing the direction: truly
+/// similar secondaries get copied while borderline points are missed). The
+/// additive form is sign-correct and equals `d_primary × α` whenever
+/// `d_primary ≥ 0` (OCR #14).
+///
+/// 构建期（`assign_with_boundary`）与插入期（`ClusteredHnsw::insert`）必须共用
+/// 本函数：任一侧单独硬编码旧式乘法都会让两条路径的复制集合不一致（OCR
+/// 195e6be #04）。
+/// EN: Build time (`assign_with_boundary`) and insert time
+/// (`ClusteredHnsw::insert`) must share this predicate; hardcoding the old
+/// multiplicative test on either side makes the replicated sets disagree
+/// (OCR 195e6be #04).
 #[inline]
-fn dist_fn(metric: DistanceMetric, a: &[f32], b: &[f32]) -> f32 {
+pub(crate) fn is_boundary(d_primary: f32, d_sec: f32, alpha: f32) -> bool {
+    alpha > 0.0 && d_sec <= d_primary + d_primary.abs() * (alpha - 1.0)
+}
+
+/// 按度量计算两点距离：聚类内所有路径（构建、插入、路由、K-Means、
+/// FlatClustered 检索）共用这一份分发，未来度量语义变化只改这里。
+/// EN: Distance between two points under the given metric: every clustering
+/// path (build, insert, routing, K-Means, FlatClustered search) shares this
+/// single dispatch, so a future metric-semantics change is made in one place
+/// (OCR cf1d19f #03).
+#[inline]
+pub(crate) fn dist_fn(metric: DistanceMetric, a: &[f32], b: &[f32]) -> f32 {
     match metric {
         DistanceMetric::L2 => distance::l2_squared(a, b),
         DistanceMetric::Cosine => distance::cosine(a, b),
+        DistanceMetric::InnerProduct => distance::inner_product_distance(a, b),
+        DistanceMetric::L1 => distance::l1_distance(a, b),
     }
 }
 
@@ -182,6 +222,38 @@ mod tests {
         assert_eq!(assignments.len(), 1);
         // 不应该有次要聚类
         // EN: It should have no secondary clusters.
+        assert!(assignments[0].secondaries.is_empty());
+    }
+
+    #[test]
+    fn test_boundary_detection_inner_product_uses_additive_margin() {
+        // OCR #14：IP 距离为 -dot（负值）。旧式 `d_primary × α` 把 -1 变成
+        // -1.2，方向反转：d_sec=-0.9 的真正的边缘点被判为非边界。加性余量
+        // 得到阈值 -0.8，正确复制；远点（d_sec=0）仍不复制。
+        // EN: OCR #14 — IP distances are -dot (negative). The old `d_primary × α`
+        // turned -1 into -1.2 (direction reversed), missing a genuine borderline
+        // point at d_sec=-0.9. The additive margin yields -0.8 and copies it,
+        // while the far point (d_sec=0) is still not copied.
+        let dims = 2;
+        // c0=(1,0) 与 c1=(0.9,0.1)：v=(1,0) 时 d0=-1，d1=-0.9。
+        // EN: c0=(1,0), c1=(0.9,0.1): for v=(1,0), d0=-1 and d1=-0.9.
+        let centroids = vec![1.0_f32, 0.0, 0.9, 0.1];
+        let vectors = vec![1.0_f32, 0.0];
+        let assignments = assign_with_boundary(
+            &vectors,
+            dims,
+            &centroids,
+            1.2,
+            DistanceMetric::InnerProduct,
+        );
+        assert_eq!(assignments[0].primary, 0);
+        assert_eq!(assignments[0].secondaries, vec![1]);
+
+        // c1=(0,1)：d1=0，远不构成边界。
+        // EN: c1=(0,1): d1=0, far from the boundary.
+        let far = vec![1.0_f32, 0.0, 0.0, 1.0];
+        let assignments =
+            assign_with_boundary(&vectors, dims, &far, 1.2, DistanceMetric::InnerProduct);
         assert!(assignments[0].secondaries.is_empty());
     }
 

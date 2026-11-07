@@ -103,7 +103,8 @@ impl ReplicationApply for CollectionsApplySink {
 mod tests {
     use super::*;
     use houyi_persistence::collection_wal::{
-        encode_collection_create, encode_collection_upsert_batch, CollectionWalItem,
+        encode_collection_create, encode_collection_drop, encode_collection_upsert_batch,
+        CollectionWalItem,
     };
 
     fn rig() -> (Arc<CollectionManager>, CollectionsApplySink) {
@@ -138,6 +139,41 @@ mod tests {
         crate::recovery::drain_pending_builder(&col.backend).await;
         let indexed = col.backend.indexed_count().await;
         assert_eq!(indexed, 1, "applied vector must be searchable after drain");
+        assert_eq!(
+            col.applied_lsn(),
+            1,
+            "applied_lsn must advance to the last successfully applied record"
+        );
+    }
+
+    /// follower 实时 apply 整库删除：从本地 manager 摘除；重复/未知目标幂等跳过，
+    /// 且不得追加本地 WAL（apply sink 只改内存）。
+    /// EN: The follower drops the collection locally on a live apply; duplicate
+    /// or unknown targets are idempotent skips, and the sink never appends to
+    /// the local WAL (it only mutates memory).
+    #[tokio::test]
+    async fn sink_applies_collection_drop_idempotently() {
+        let (manager, sink) = rig();
+        sink.apply(0, &encode_collection_create("c", 4, "hnsw").unwrap())
+            .await
+            .unwrap();
+        assert!(manager.get("c").is_some());
+
+        let drop = encode_collection_drop("c").unwrap();
+        sink.apply(1, &drop).await.unwrap();
+        assert!(
+            manager.get("c").is_none(),
+            "follower must drop the collection"
+        );
+
+        // 重复 apply 与未知目标均幂等跳过（不改变 manager、不报错）。
+        // EN: Duplicate apply and unknown targets are idempotent skips.
+        sink.apply(2, &drop).await.unwrap();
+        sink.apply(3, &encode_collection_drop("ghost").unwrap())
+            .await
+            .unwrap();
+        assert!(manager.get("c").is_none());
+        assert!(manager.get("ghost").is_none());
     }
 
     /// 未知 op / 非 JSON 记录兼容跳过（新版 leader → 旧版 follower）；

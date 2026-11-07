@@ -36,6 +36,15 @@ pub struct GraphSnapshotMetrics {
     /// 写出的 payload 字节数（不含信封头）。
     /// EN: Payload bytes written (envelope header excluded).
     pub bytes_written_total: AtomicU64,
+    /// P5.0.2：manifest 成功提交次数。
+    /// EN: P5.0.2 — successful manifest commits.
+    pub manifest_writes_total: AtomicU64,
+    /// P5.0.2：manifest 写失败/被拒次数。
+    /// EN: P5.0.2 — manifest write failures/rejections.
+    pub manifest_rejects_total: AtomicU64,
+    /// P5.0.2：快照周期失败次数（不含 unsupported backend）。
+    /// EN: P5.0.2 — snapshot cycle failures (excluding unsupported backends).
+    pub failures_total: AtomicU64,
 }
 
 impl GraphSnapshotMetrics {
@@ -51,6 +60,18 @@ impl GraphSnapshotMetrics {
 
     pub fn inc_rejects(&self) {
         self.rejects_total.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn inc_manifest_writes(&self) {
+        self.manifest_writes_total.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn inc_manifest_rejects(&self) {
+        self.manifest_rejects_total.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn inc_failures(&self) {
+        self.failures_total.fetch_add(1, Ordering::Relaxed);
     }
 }
 
@@ -264,11 +285,27 @@ pub async fn apply_collection_graph_snapshots_with_encryption(
 ///   快照、WAL 截断同语义。drain 后取 wal max_lsn 会被在途写击穿——并发写
 ///   append 完 WAL（lsn ≤ max）却尚未 insert_batch，该向量不进图却被跳过
 ///   重放，重启即丢。
-/// - collections 无 sidecar：checkpoint = collections.wal next_lsn-1，随后逐
-///   collection write_lock 过一遍（写锁覆盖「WAL append → insert_batch」复合
-///   写，锁传递完成后所有 lsn ≤ checkpoint 的写必然已入待构图队列），再逐
-///   collection drain。反向竞态（图中向量 lsn > checkpoint）无害——重放幂等
-///   补插。
+/// - collection manifest 快照（P5.0.2）：每个 collection 在 `write_lock` 内
+///   取 `applied_lsn`（apply 完成水位）作为 checkpoint，再 drain、编码。follower
+///   的本地 WAL 是 append 先于 apply，用全局 next_lsn-1 会把未应用记录声明为
+///   「已在快照里」，重启重放随即跳过它们。
+/// - legacy 逐 collection 图快照（manifest 不可用时的回退）：先取全局
+///   next_lsn-1，再逐 collection 取 write_lock 完成锁传递（覆盖「WAL append →
+///   insert_batch」复合写），编码前把 checkpoint 钳到
+///   `min(barrier, col.applied_lsn())`——同为 follower 的 append/apply 不对称。
+///   反向竞态（图中向量 lsn > checkpoint）无害——重放幂等补插。
+///
+/// EN: - collection-manifest snapshots (P5.0.2) take each collection's
+///   `applied_lsn` (apply-completion watermark) under `write_lock`, then drain
+///   and encode. A follower appends to its local WAL before apply, so the global
+///   `next_lsn - 1` would claim unapplied records are already snapshotted and
+///   restart replay would skip them.
+/// - Legacy per-collection graph snapshots (fallback when the manifest is
+///   unavailable) take the global `next_lsn - 1`, then pass each collection's
+///   `write_lock` (covering the compound "WAL append → insert_batch" write) and
+///   clamp the checkpoint to `min(barrier, col.applied_lsn())` before encoding —
+///   the same follower append/apply asymmetry. The reverse race (a graph vector
+///   with lsn > checkpoint) is harmless: replay re-inserts idempotently.
 ///
 /// 并发纪律：调用方（周期任务/关停）用 tokio Mutex 互斥本例程；快照期间持图
 /// 读锁编码，client 写不受阻（走 WAL + 热缓冲）。
@@ -283,6 +320,15 @@ pub struct GraphSnapshotWriter {
     /// 静态加密句柄（P4.7.3）：Some 时快照写成加密 v2 信封。
     /// EN: when set, snapshots are written as encrypted v2 envelopes.
     pub encryption: Option<std::sync::Arc<Encryption>>,
+    /// manifest checkpoint 缓存（P5.0.4）：成功提交后刷新，供 follower 握手读取。
+    /// EN: manifest checkpoint cache (P5.0.4), refreshed on commit for followers.
+    pub lifecycle: std::sync::Arc<crate::collection_lifecycle::CollectionLifecycleState>,
+    /// 运行态角色：follower 不得提交空名单 manifest（append 先于 apply，
+    /// barrier 会越过未应用记录，见 `write_collection_snapshots` 文档）。
+    /// EN: Runtime role: followers must not commit empty-name manifests
+    /// (append precedes apply, so the barrier outruns applied state — see
+    /// `write_collection_snapshots`).
+    pub roles: crate::types::RoleState,
 }
 
 impl GraphSnapshotWriter {
@@ -348,6 +394,56 @@ impl GraphSnapshotWriter {
     }
 
     async fn write_collections(&self) {
+        // P5.0.2：优先写 collection 快照 + manifest；不支持的后端或失败时回退
+        // 旧的逐 collection 图快照（重启仍可加速，但不产生可截断 checkpoint）。
+        // EN: Prefer collection snapshots + manifest; unsupported backends or
+        // failures fall back to legacy per-collection graph snapshots (restart
+        // acceleration without a truncatable checkpoint).
+        // follower 禁写空名单 manifest：见函数文档与 `roles` 字段。
+        // EN: followers never publish empty-name manifests — see the function
+        // docs and the `roles` field.
+        let allow_empty_manifest = !self.roles.is_follower();
+        let outcome = crate::collection_lifecycle::write_collection_snapshots(
+            &self.collections,
+            &self.collections_wal,
+            &self.collections_wal_path,
+            self.encryption.clone(),
+            &self.metrics,
+            allow_empty_manifest,
+        )
+        .await;
+        if let Some(manifest) = &outcome.manifest {
+            self.lifecycle
+                .set_manifest_checkpoint(manifest.safe_checkpoint_lsn);
+            return;
+        }
+        // follower 空名单是预期状态（等待 create/upsert 应用落地，含刚引导的
+        // 空 leader 副本），不是故障：每轮 warn 会淹没日志，legacy 回退在无名单
+        // 时也是空操作。生命周期侧已保证 follower 的空名单统一归到该原因
+        // （先于「有无旧 manifest」判定），按共享常量匹配，改名不会静默失配。
+        // EN: an empty follower list is expected (waiting for create/upsert to
+        // apply — including a freshly bootstrapped empty-leader replica), not a
+        // fault: a warn every cycle floods the log, and the legacy fallback is a
+        // no-op when the list is empty. The lifecycle side guarantees every
+        // empty follower list lands on this reason (checked before the
+        // prior-manifest test); matching via the shared constant means a rename
+        // cannot silently break the suppression.
+        if outcome.blocked_reason.as_deref()
+            == Some(crate::collection_lifecycle::BLOCKED_NO_COLLECTIONS_FOLLOWER)
+        {
+            tracing::debug!(
+                "collection snapshots: follower keeps previous manifest (empty applied list)"
+            );
+            return;
+        }
+        tracing::warn!(
+            reason = ?outcome.blocked_reason,
+            "collection snapshots: manifest not committed; using legacy graph snapshots"
+        );
+        self.write_legacy_collection_graph_snapshots().await;
+    }
+
+    async fn write_legacy_collection_graph_snapshots(&self) {
         let names = self.collections.list();
         if names.is_empty() {
             return;
@@ -388,7 +484,27 @@ impl GraphSnapshotWriter {
             // EN: Lock hand-off: wait for all writes appended before the checkpoint to
             // EN: finish insert_batch.
             drop(col.write_lock.lock().await);
+            // 删除在 write_lock 内完成 append→mark→remove：拿到锁后若已删，绝不
+            // 编码孤儿——否则快照会以 checkpoint ≥ drop LSN 落盘，重启时
+            // stale-drop 规则会跳过真正的删除，已删 collection 带旧数据复活。
+            // EN: A drop appends/marks/removes under write_lock. If it already
+            // completed when we acquire the lock, never encode the orphan: the
+            // file would carry a checkpoint >= the drop LSN, and restart would
+            // skip the genuine drop as stale — resurrecting deleted data.
+            if col.is_deleted() {
+                continue;
+            }
             drain_pending_builder(&col.backend).await;
+            // checkpoint 不得越过本 collection 真正 apply 到的 LSN：follower 是
+            // append 先于 apply（本地 WAL 的 next_lsn 跑在状态前面），用全局
+            // barrier 会声明「未 apply 的记录也已在快照里」，重启重放随即跳过它们
+            // 造成丢数据。leader 写路径 apply 先于 append，min 不改变其行为。
+            // EN: The checkpoint must not exceed what this collection actually
+            // applied: followers append before apply (local next_lsn runs ahead
+            // of state), so the global barrier would claim unapplied records are
+            // already in the snapshot and restart replay would skip them. On a
+            // leader apply precedes append, so the min is a no-op there.
+            let col_checkpoint = checkpoint.min(col.applied_lsn());
             let Some(payload) = col.backend.encode_graph_snapshot().await else {
                 continue; // 非 HNSW 后端。
             };
@@ -401,7 +517,7 @@ impl GraphSnapshotWriter {
             match tokio::task::spawn_blocking(move || {
                 write_graph_snapshot_atomic_with_encryption(
                     &path,
-                    checkpoint,
+                    col_checkpoint,
                     &payload,
                     encryption.as_deref(),
                 )
@@ -412,7 +528,7 @@ impl GraphSnapshotWriter {
                     self.metrics.inc_writes(bytes);
                     tracing::info!(
                         collection = %name,
-                        checkpoint_lsn = checkpoint,
+                        checkpoint_lsn = col_checkpoint,
                         payload_bytes = bytes,
                         "houyi-vector: collection graph snapshot written"
                     );
@@ -475,7 +591,28 @@ pub async fn apply_vector_snapshot_if_present_with_encryption(
             format!("vector snapshot: unknown metric {:?}", snap.metric),
         )
     })?;
-    if file_metric != expected_metric {
+    // pq-flat 的历史快照头写的是名义 cosine（旧实现把 pq-flat 报告为 cosine），
+    // 新实现如实报告 L2；为兼容旧快照，pq-flat 后端同时接受这两种头。其余不符
+    // 一律 fail-fast：索引类型/度量切换属于配置变更，绝不可能静默按错误度量加载。
+    // EN: Legacy pq-flat snapshots carry a nominal cosine header (the old code
+    // reported pq-flat as cosine) while the index now reports L2 truthfully; the
+    // pq-flat backend accepts both headers for backward compatibility. Any other
+    // mismatch stays fatal: switching index type/metric is a config change and
+    // loading under the wrong metric must never happen silently.
+    //
+    // 别名必须同时要求 expected_metric == L2：它表达的是「旧 pq-flat 名义写
+    // cosine、实际按 L2 评分」这一条历史事实，而不是「pq-flat 接受任意头」。
+    // 否则 pq-flat 在 expected=IP/L1 时也会静默加载 cosine 快照，绕过下面的
+    // fail-fast（OCR 195e6be #06）。
+    // EN: The alias must also require expected_metric == L2: it encodes the
+    // historical fact "legacy pq-flat nominally wrote cosine but scored L2",
+    // not "pq-flat accepts any header". Without the clause a pq-flat index with
+    // expected=IP/L1 would silently load a cosine snapshot, bypassing the
+    // fail-fast below (OCR 195e6be #06).
+    let pq_flat_legacy_alias = matches!(index, IndexBackend::PqFlat { .. })
+        && expected_metric == DistanceMetric::L2
+        && file_metric == DistanceMetric::Cosine;
+    if file_metric != expected_metric && !pq_flat_legacy_alias {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             format!(
@@ -633,6 +770,16 @@ pub struct CollectionsReplayStats {
     /// 重建的墓碑数。
     /// EN: Rebuilt tombstones.
     pub tombstones: usize,
+    /// 因整条记录 ≤ collection checkpoint 而跳过的记录数：manifest 模式为全部
+    /// 记录类型，legacy 模式仅 stale drop（其余记录按 legacy 语义重建）。
+    /// EN: Whole records skipped as at-or-below the collection checkpoint: every
+    /// record type in manifest mode; only stale drops in legacy mode (other
+    /// records are rebuilt with legacy semantics).
+    pub records_skipped_snapshot: usize,
+    /// 应用的整库删除记录数（目标缺失的幂等跳过不计）。
+    /// EN: Applied whole-collection drop records (idempotent skips for a missing
+    /// target are not counted).
+    pub collections_dropped: usize,
 }
 
 /// 冷启动重放 collections WAL：按 LSN 顺序重建全部 Collection（向量 + 标量页 + 墓碑）。
@@ -640,32 +787,56 @@ pub struct CollectionsReplayStats {
 /// (vectors + scalar pages + tombstones).
 ///
 /// 语义与写入侧严格对偶：
-/// - `Create` → `get_or_create`（幂等；index_type 以 Manager 装配默认值为准——v1 全部
-///   Collection 共享服务端默认后端，记录里的 index_type 仅作向前兼容留档）；
+/// - `Create` → `get_or_create_typed`（幂等；按记录里的 index_type 建后端，配置变更
+///   不会把旧 collection 静默换成另一种索引）；
 /// - `UpsertBatch` → 向量进索引 + label/payload 经 [`crate::scalar_json::build_collection_scalar_row`]
 ///   重建标量行（与写入侧同一函数，逐字节语义等价）；裸向量不建行（同写入侧约定）；
 /// - `Delete` → 墓碑 + 向量删除。目标 collection 缺失的 Delete（如 WAL 被手工截断）
-///   跳过不炸——重放必须对不完整历史保持韧性。
+///   跳过不炸——重放必须对不完整历史保持韧性；
+/// - `Drop` → 从 manager 摘除整个 collection。目标缺失同样幂等跳过；与其它记录
+///   同规则参与 checkpoint 跳过——**stale drop 绝不能作用于同名重建后的新**
+///   collection（见下方 `skip_covered_records` 说明）。
 ///
-/// EN: Strict dual of the write path. `Create` is idempotent; v1 collections all share
-/// the server default backend, so the recorded index_type is kept only for forward
-/// compatibility. `UpsertBatch` re-inserts vectors and rebuilds scalar rows through
+/// EN: Strict dual of the write path. `Create` is idempotent and builds the backend
+/// recorded in the WAL, so a config change cannot silently switch an existing
+/// collection. `UpsertBatch` re-inserts vectors and rebuilds scalar rows through
 /// the same `build_collection_scalar_row` used by writes; bare vectors get no row.
 /// `Delete` replays as tombstone + vector delete; a Delete for a missing collection
 /// (e.g. hand-truncated WAL) is skipped, not fatal — replay must tolerate
-/// incomplete history.
-/// `graph_checkpoints`：collection 名 → 图快照 checkpoint_lsn（collections.wal LSN 空间）。
-/// LSN ≤ checkpoint 的记录跳过后端向量插入/删除（图快照已含，含墓碑），但标量行与
-/// 标量墓碑仍全量重建——标量 PAX 页是纯内存 O(N) 结构，重建便宜，由此省掉标量序列化。
-/// EN: `graph_checkpoints` maps collection name → snapshot checkpoint_lsn (in the
-/// collections.wal LSN space). Records with LSN ≤ checkpoint skip backend vector
-/// insert/delete (the graph snapshot already carries them, tombstones included)
-/// but still rebuild scalar rows/tombstones — scalar PAX pages are in-memory and
-/// O(N) to rebuild, which avoids serializing scalars into the snapshot.
+/// incomplete history. `Drop` removes the whole collection from the manager;
+/// a missing target is an idempotent skip. Drops follow the same per-name
+/// checkpoint rule as every other record: a snapshot checkpoint above a stale
+/// drop LSN means the manifest holds the **recreated** collection, so replaying
+/// the old drop would delete data the snapshot proves exists.
+/// `graph_checkpoints`：collection 名 → 快照 checkpoint_lsn（collections.wal LSN 空间）。
+/// `skip_covered_records`：
+/// - true（manifest 模式）：LSN ≤ checkpoint 的记录**整条跳过**（向量、标量、墓碑、
+///   HA、整库删除都已在快照内）；
+/// - false（legacy 图快照模式）：只跳过后端向量插入/删除，标量行/墓碑仍全量重建；
+///   stale drop 例外，两种模式都必须跳过（重放它会删掉快照证明存在的新 collection）。
+///
+/// EN: `graph_checkpoints` maps collection name → snapshot checkpoint_lsn.
+/// With `skip_covered_records = true` (manifest mode), a record at or below the
+/// collection checkpoint is skipped entirely (vectors, scalars, tombstones, HA,
+/// whole-collection drops). Legacy graph snapshots pass false: only the vector
+/// side is skipped and scalar rows/tombstones are still rebuilt — except stale
+/// drops, which are skipped in both modes (they would delete a recreated
+/// collection the snapshot proves exists).
 pub async fn replay_collections_wal_into_manager(
     entries: &[WalEntry],
     manager: &crate::collection::CollectionManager,
     graph_checkpoints: &HashMap<String, u64>,
+) -> std::io::Result<CollectionsReplayStats> {
+    replay_collections_wal_into_manager_with_mode(entries, manager, graph_checkpoints, false).await
+}
+
+/// 带 manifest/legacy 模式的冷重放（P5.0.2）。
+/// EN: Cold replay with an explicit manifest/legacy mode (P5.0.2).
+pub async fn replay_collections_wal_into_manager_with_mode(
+    entries: &[WalEntry],
+    manager: &crate::collection::CollectionManager,
+    graph_checkpoints: &HashMap<String, u64>,
+    skip_covered_records: bool,
 ) -> std::io::Result<CollectionsReplayStats> {
     use houyi_persistence::collection_wal::decode_collection_wal_payload;
 
@@ -680,6 +851,34 @@ pub async fn replay_collections_wal_into_manager(
                 return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, err));
             }
         };
+        // 所有记录（含整库删除）统一按 per-name checkpoint 整条跳过。
+        // Drop 不能豁免：`create→drop→create→snapshot` 后，旧 drop 的 LSN 必然
+        // ≤ 重建后 collection 的 checkpoint；若强行重放旧 drop，会把快照证明
+        // 存在的新 collection 删掉（数据丢失）。真实未重建的删除没有快照条目
+        // （快照不收录已删集合），拿不到 checkpoint → 照常 apply。
+        // stale drop 的保护在 legacy 模式（skip_covered_records=false）同样生效：
+        // 该模式只把 checkpoint 用于「后端向量插入/删除」跳过，drop 的破坏性
+        // 远大于重建标量行，不能留给险性不同的模式分支。
+        // EN: Every record (drops included) obeys the per-name checkpoint skip.
+        // Drops must not be exempt: after `create→drop→create→snapshot`, the old
+        // drop LSN is necessarily <= the recreated collection's checkpoint, and
+        // replaying it would delete a collection the snapshot proves exists. A
+        // genuinely never-recreated drop has no snapshot entry (drops are not
+        // snapshotted), so it has no checkpoint and is still applied.
+        // The stale-drop guard also applies in legacy mode
+        // (skip_covered_records = false), where checkpoints only gate backend
+        // vector inserts/deletes; a drop is too destructive to leave ungated.
+        if let Some(checkpoint) = graph_checkpoints.get(record.collection_name()) {
+            let covered = e.lsn <= *checkpoint;
+            let is_drop = matches!(
+                &record,
+                houyi_persistence::collection_wal::CollectionWalRecord::Drop { .. }
+            );
+            if covered && (skip_covered_records || is_drop) {
+                stats.records_skipped_snapshot += 1;
+                continue;
+            }
+        }
         apply_collection_wal_record(
             manager,
             e.lsn,
@@ -731,10 +930,74 @@ pub(crate) async fn apply_collection_wal_record(
 ) -> std::io::Result<()> {
     use houyi_persistence::collection_wal::CollectionWalRecord;
     match record {
-        CollectionWalRecord::Create { name, dims, .. } => {
-            let (_, created) = manager
-                .get_or_create_flagged(&name, Some(dims))
+        CollectionWalRecord::Create {
+            name,
+            dims,
+            index_type,
+            options,
+        } => {
+            // 记录里的 index_type/metric/HNSW 参数是创建时的事实；重放按它建后端，
+            // 避免配置变更后把旧 collection 静默换成另一种索引或度量。旧记录没有
+            // metric 字段：按 index_type 的历史语义推断（pq-flat → L2，其余 Cosine）。
+            // EN: The recorded index_type/metric/HNSW parameters are creation-time
+            // truth; replay them so a config change cannot silently switch an
+            // existing collection's backend or metric. Legacy records carry no
+            // metric: infer it from the index type's historical semantics
+            // (pq-flat → L2, others Cosine).
+            let metric = match options.metric.as_deref() {
+                Some(raw) => {
+                    Some(houyi_vector::DistanceMetric::parse_str(raw).ok_or_else(|| {
+                        std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            format!("collection_create has unparsable metric {raw:?}"),
+                        )
+                    })?)
+                }
+                None => None,
+            };
+            let hnsw = match (
+                options.hnsw_m,
+                options.hnsw_ef_construction,
+                options.hnsw_ef_search,
+            ) {
+                (Some(m), Some(efc), Some(efs)) => Some(crate::collection::HnswParams {
+                    m,
+                    ef_construction: efc,
+                    ef_search: efs,
+                }),
+                // 解码侧已保证全有/全无，这里 None 即旧记录。
+                // EN: The decoder already guarantees all-or-none; None means legacy.
+                _ => None,
+            };
+            // 重放入口不严格比对 HNSW 参数：快照恢复会把运行期调参写回后端，
+            // 而记录保存的是创建时参数，严格比对会让合法的冷启动失败
+            // （OCR 195e6be #11）。
+            // EN: The replay entry does not strictly compare HNSW parameters:
+            // snapshot restore writes runtime-tuned values back into the backend
+            // while the record holds creation-time parameters, so a strict check
+            // would reject a legitimate cold start (OCR 195e6be #11).
+            let (col, created) = manager
+                .get_or_create_replayed(&name, dims, &index_type, metric, hnsw)
                 .map_err(std::io::Error::other)?;
+            // 与快照/压实共用写锁：Create 也要参与 applied_lsn 的串行推进。
+            // 已删的旧 Arc（并发删除）告警跳过，不写入孤儿。
+            // EN: Share the write lock with snapshot/compaction; Create also
+            // advances applied_lsn under the same serialization. A concurrently
+            // dropped old Arc is skipped with a warning instead of writing to
+            // an orphan.
+            let Ok(_write) = col.begin_write().await else {
+                tracing::warn!(
+                    collection = %name,
+                    lsn,
+                    "[houyi-recovery] collection_create for a concurrently dropped collection skipped"
+                );
+                return Ok(());
+            };
+            col.note_applied_lsn(lsn);
+            // 记录本身就在 WAL 中：标记已落盘，后续实时写不必重复补落。
+            // EN: the record is already in the WAL — mark it logged so later live
+            // writes do not append a duplicate create record.
+            col.mark_create_logged();
             if created {
                 stats.creates += 1;
             }
@@ -752,6 +1015,19 @@ pub(crate) async fn apply_collection_wal_record(
                     ),
                 ));
             }
+            // 写锁覆盖「后端插入 + 标量行」整段，snapshot/compaction 看到的
+            // applied_lsn 与内存状态一致；follower 实时 apply 也走这里。
+            // EN: The write lock spans backend insert + scalar rows so snapshots
+            // and compaction see applied_lsn consistent with memory; live follower
+            // apply uses this same path.
+            let Ok(_write) = col.begin_write().await else {
+                tracing::warn!(
+                    collection = %name,
+                    lsn,
+                    "[houyi-recovery] upsert batch for a concurrently dropped collection skipped"
+                );
+                return Ok(());
+            };
             let covered = checkpoint_of(&name).is_some_and(|c| lsn <= c);
             if covered {
                 // 图快照已含该批向量（及当时墓碑）：跳过后端插入，仅重建标量行。
@@ -789,6 +1065,7 @@ pub(crate) async fn apply_collection_wal_record(
                     stats.scalar_rows += 1;
                 }
             }
+            col.note_applied_lsn(lsn);
         }
         CollectionWalRecord::Delete { name, ids } => {
             let Some(col) = manager.get(&name) else {
@@ -797,6 +1074,14 @@ pub(crate) async fn apply_collection_wal_record(
                     ids = ids.len(),
                     "[houyi-recovery] collections WAL delete for unknown collection \
                      skipped — truncated history?"
+                );
+                return Ok(());
+            };
+            let Ok(_write) = col.begin_write().await else {
+                tracing::warn!(
+                    collection = %name,
+                    lsn,
+                    "[houyi-recovery] vector delete for a concurrently dropped collection skipped"
                 );
                 return Ok(());
             };
@@ -816,6 +1101,7 @@ pub(crate) async fn apply_collection_wal_record(
                 // backend delete (scalar tombstone rebuilt above).
                 stats.delete_batches_skipped_snapshot += 1;
                 stats.tombstones += ids.len();
+                col.note_applied_lsn(lsn);
                 return Ok(());
             }
             for id in &ids {
@@ -832,6 +1118,7 @@ pub(crate) async fn apply_collection_wal_record(
             }
             stats.delete_batches += 1;
             stats.tombstones += ids.len();
+            col.note_applied_lsn(lsn);
         }
         CollectionWalRecord::SetHaLevel { name, ha_level } => {
             // 元数据记录无 checkpoint 分界（图快照不覆盖 ha_level——它只活在
@@ -853,7 +1140,37 @@ pub(crate) async fn apply_collection_wal_record(
                 );
                 return Ok(());
             };
+            let Ok(_write) = col.begin_write().await else {
+                tracing::warn!(
+                    collection = %name,
+                    lsn,
+                    "[houyi-recovery] set_ha_level for a concurrently dropped collection skipped"
+                );
+                return Ok(());
+            };
             col.set_ha_level(ha_level);
+            col.note_applied_lsn(lsn);
+        }
+        CollectionWalRecord::Drop { name } => {
+            // 幂等：目标缺失（历史截断或重复 apply）告警跳过。
+            // EN: Idempotent: a missing target (truncated history or duplicate
+            // apply) is skipped with a warning.
+            let Some(col) = manager.get(&name) else {
+                tracing::warn!(
+                    collection = %name,
+                    lsn,
+                    "[houyi-recovery] collection_drop for unknown collection skipped — \
+                     truncated history or already applied"
+                );
+                return Ok(());
+            };
+            let Ok(_write) = col.begin_write().await else {
+                // 已删：无需重复摘除。 / EN: Already dropped — nothing to remove.
+                return Ok(());
+            };
+            col.mark_deleted();
+            manager.remove_if_same(&name, &col);
+            stats.collections_dropped += 1;
         }
     }
     Ok(())
@@ -1048,6 +1365,75 @@ mod tests {
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].0, 2);
         assert!(hits[0].1.abs() < 1e-6, "good row must remain searchable");
+
+        let _ = std::fs::remove_file(snapshot_path_for_wal(&wal_path));
+        let _ = std::fs::remove_file(wal_path);
+    }
+
+    /// 回归（OCR HIGH）：pq-flat 的历史 JSON 快照头写的是名义 cosine，新实现
+    /// 如实报告 L2 后必须以索引实际度量（L2）加载，并接受旧 cosine 头；其他度量头
+    /// 继续 fail-fast。冷启动调用方传 `index.distance_metric()`，见 main.rs。
+    /// EN: Legacy pq-flat JSON snapshots carry a nominal cosine header; the loader
+    /// now expects L2 (from `index.distance_metric()`) and must accept the legacy
+    /// cosine alias, while other headers remain fatal.
+    #[tokio::test]
+    async fn pq_flat_snapshot_accepts_legacy_cosine_and_l2_headers() {
+        let wal_path = unique_wal_path("pqflat-metric");
+        let index = IndexBackend::new_pq_flat(4);
+        let items = vec![houyi_persistence::vector_wal::VectorItem {
+            id: 7,
+            values: vec![0.5, 0.5, 0.5, 0.5],
+        }];
+
+        // 旧二进制写出的头（名义 cosine）必须能恢复。
+        // EN: A legacy header (nominal cosine) must still load.
+        let legacy = encode_vector_snapshot_v1(4, "cosine", 9, items.clone()).unwrap();
+        write_vector_snapshot_atomic(&wal_path, &legacy).unwrap();
+        let cp = apply_vector_snapshot_if_present(&wal_path, &index, 4, DistanceMetric::L2)
+            .await
+            .expect("legacy cosine header must load on pq-flat");
+        assert_eq!(cp, Some(9));
+        // 聚类后端（含 pq-flat）的 apply 只把行放进缓冲；构图是显式的 optimize_build。
+        // EN: clustered backends (incl. pq-flat) only buffer rows on apply; building is
+        // an explicit optimize_build.
+        assert_eq!(index.optimize_build().await, 1);
+        assert_eq!(index.indexed_count().await, 1);
+
+        // 新二进制写出的头（真实 L2）必须能恢复。换新索引，避免 built 状态掩盖载入。
+        // EN: The new truthful L2 header must load. Use a fresh index so the built flag
+        // cannot mask ingestion.
+        let index_l2 = IndexBackend::new_pq_flat(4);
+        let current = encode_vector_snapshot_v1(4, "l2", 11, items).unwrap();
+        write_vector_snapshot_atomic(&wal_path, &current).unwrap();
+        let cp = apply_vector_snapshot_if_present(&wal_path, &index_l2, 4, DistanceMetric::L2)
+            .await
+            .expect("L2 header must load on pq-flat");
+        assert_eq!(cp, Some(11));
+        assert_eq!(index_l2.optimize_build().await, 1);
+
+        // pq-flat 不接受其他度量头：那意味着快照与后端语义不符。
+        // EN: pq-flat rejects other metric headers — the snapshot would not match
+        // the backend's actual scoring semantics.
+        let index_l1 = IndexBackend::new_pq_flat(4);
+        let wrong = encode_vector_snapshot_v1(4, "l1", 13, Vec::new()).unwrap();
+        write_vector_snapshot_atomic(&wal_path, &wrong).unwrap();
+        let err = apply_vector_snapshot_if_present(&wal_path, &index_l1, 4, DistanceMetric::L2)
+            .await
+            .expect_err("l1 header must be rejected for pq-flat");
+        assert!(err.to_string().contains("metric"), "got: {err}");
+
+        // cosine 别名只在 expected_metric == L2 时成立：pq-flat 以 IP 期望加载
+        // 时旧 cosine 头不得被静默接受，否则绕过 fail-fast（OCR 195e6be #06）。
+        // EN: The cosine alias holds only when expected_metric == L2: with an IP
+        // expectation a pq-flat legacy cosine header must not be silently
+        // accepted, which would bypass the fail-fast (OCR 195e6be #06).
+        let index_ip = IndexBackend::new_pq_flat(4);
+        write_vector_snapshot_atomic(&wal_path, &legacy).unwrap();
+        let err =
+            apply_vector_snapshot_if_present(&wal_path, &index_ip, 4, DistanceMetric::InnerProduct)
+                .await
+                .expect_err("cosine alias must not apply when expected metric is IP");
+        assert!(err.to_string().contains("metric"), "got: {err}");
 
         let _ = std::fs::remove_file(snapshot_path_for_wal(&wal_path));
         let _ = std::fs::remove_file(wal_path);
@@ -1781,6 +2167,10 @@ mod tests {
             collections_wal_path: collections_wal_path.clone(),
             metrics: std::sync::Arc::clone(&metrics),
             encryption: None,
+            lifecycle: std::sync::Arc::new(
+                crate::collection_lifecycle::CollectionLifecycleState::for_test(),
+            ),
+            roles: crate::types::RoleState::new(crate::types::ReplicationRole::Disabled),
         };
         writer.write_all().await;
 
@@ -1819,13 +2209,22 @@ mod tests {
             1
         );
 
-        // collection 快照：collections.wal 无写入 → next_lsn-1 = 0。
-        // EN: Collection snapshot: no collections.wal writes -> next_lsn-1 = 0.
-        let col_snap = read_graph_snapshot(
-            &collection_snapshots_dir(&collections_wal_path).join("docs.graph_snapshot.bin"),
+        // collection 快照：manifest 覆盖 docs，checkpoint 为 applied_lsn（无写 → 0）。
+        // EN: Collection snapshot: the manifest covers docs with checkpoint =
+        // applied_lsn (no writes -> 0).
+        let snap_dir = collection_snapshots_dir(&collections_wal_path);
+        let manifest = houyi_persistence::collection_snapshot_file::read_collection_manifest(
+            &snap_dir.join("collections.manifest"),
         )
         .unwrap()
-        .expect("collection snapshot written");
+        .expect("collection manifest written");
+        assert_eq!(manifest.collections.len(), 1);
+        let entry = &manifest.collections[0];
+        assert_eq!(entry.name, "docs");
+        assert_eq!(entry.checkpoint_lsn, 0);
+        let col_snap = read_graph_snapshot(&snap_dir.join(&entry.file))
+            .unwrap()
+            .expect("collection snapshot payload written");
         assert_eq!(col_snap.checkpoint_lsn, 0);
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -1846,7 +2245,9 @@ mod tests {
 
         let index = IndexBackend::new_flat(4);
         index.insert_batch(vec![(1, vec4(1))]).await.unwrap();
-        let manager = crate::collection::CollectionManager::new(4, "flat");
+        // clustered 不在 P5.0.2 压缩范围：manifest 不写，legacy 图快照也无。
+        // EN: clustered is outside P5.0.2 compaction: no manifest, no legacy graph.
+        let manager = crate::collection::CollectionManager::new(4, "clustered");
         let col = manager.get_or_create("docs", Some(4)).unwrap();
         col.backend.insert_batch(vec![(1, vec4(1))]).await.unwrap();
 
@@ -1860,6 +2261,10 @@ mod tests {
             collections_wal_path: collections_wal_path.clone(),
             metrics: std::sync::Arc::clone(&metrics),
             encryption: None,
+            lifecycle: std::sync::Arc::new(
+                crate::collection_lifecycle::CollectionLifecycleState::for_test(),
+            ),
+            roles: crate::types::RoleState::new(crate::types::ReplicationRole::Disabled),
         };
         writer.write_all().await;
 
@@ -1870,10 +2275,135 @@ mod tests {
             0
         );
         assert!(graph_snapshot_path_for_wal(&wal_path).metadata().is_err());
-        assert!(!collection_snapshots_dir(&collections_wal_path)
-            .join("docs.graph_snapshot.bin")
-            .exists());
+        let snap_dir = collection_snapshots_dir(&collections_wal_path);
+        assert!(!snap_dir.join("docs.graph_snapshot.bin").exists());
+        assert!(!snap_dir.join("collections.manifest").exists());
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// legacy 图快照的 checkpoint 不得超过 collection 的 applied_lsn：follower
+    /// 的本地 next_lsn 领先于 apply，用全局 barrier 会把未应用记录标成「已在
+    /// 快照」，重启重放随即跳过、丢数据。
+    /// EN: Legacy graph snapshot checkpoints must not exceed the collection's
+    /// applied LSN: a follower's local next_lsn runs ahead of apply, so the
+    /// global barrier would mark unapplied records as snapshotted and restart
+    /// replay would skip them.
+    #[tokio::test]
+    async fn legacy_graph_snapshot_clamps_checkpoint_to_applied_lsn() {
+        let dir = unique_snap_dir("legacy-applied-clamp");
+        let wal_path = dir.join("bench.wal");
+        let applied_sidecar = houyi_persistence::wal_sidecar::sidecar_path_for_wal(&wal_path);
+        let collections_wal_path = dir.join("collections.wal");
+        let (collections_wal, _entries) =
+            crate::types::WalHandle::open(&collections_wal_path, crate::types::WalWriteMode::Sync)
+                .unwrap();
+        // 本地 WAL 有 3 条记录（next_lsn=3，全局 checkpoint=2），但 collection
+        // 只 apply 到 1——模拟 follower 的 append 领先 apply。
+        // EN: 3 local records (next_lsn=3, global checkpoint=2) while the
+        // collection applied only through 1 — a follower's append-ahead-apply.
+        for _ in 0..3 {
+            collections_wal.append(b"{}".to_vec()).unwrap();
+        }
+        let manager = crate::collection::CollectionManager::new(4, "hnsw");
+        let col = manager.get_or_create("docs", Some(4)).unwrap();
+        col.backend
+            .insert_batch(vec![(10, vec4(10))])
+            .await
+            .unwrap();
+        col.note_applied_lsn(1);
+
+        let metrics = std::sync::Arc::new(GraphSnapshotMetrics::default());
+        let writer = GraphSnapshotWriter {
+            index: IndexBackend::new_hnsw(4),
+            wal_path: wal_path.clone(),
+            applied_sidecar,
+            collections: std::sync::Arc::new(manager),
+            collections_wal: std::sync::Arc::new(collections_wal),
+            collections_wal_path: collections_wal_path.clone(),
+            metrics: std::sync::Arc::clone(&metrics),
+            encryption: None,
+            lifecycle: std::sync::Arc::new(
+                crate::collection_lifecycle::CollectionLifecycleState::for_test(),
+            ),
+            roles: crate::types::RoleState::new(crate::types::ReplicationRole::Disabled),
+        };
+        writer.write_legacy_collection_graph_snapshots().await;
+
+        let snap_path =
+            collection_snapshots_dir(&collections_wal_path).join("docs.graph_snapshot.bin");
+        let snap = read_graph_snapshot(&snap_path)
+            .unwrap()
+            .expect("legacy snapshot written");
+        assert_eq!(
+            snap.checkpoint_lsn, 1,
+            "checkpoint must be clamped to applied_lsn, not the global barrier"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// legacy 图快照不得编码已删除的 collection：删除在写锁内完成
+    /// append→mark→remove，拿到锁后仍见 deleted 说明删除已完成。继续编码会以
+    /// ≥ drop LSN 的 checkpoint 写孤儿，重启时 stale-drop 规则跳过真实删除，
+    /// 已删 collection 带旧数据复活。
+    /// EN: Legacy graph snapshots must not encode a dropped collection: a drop
+    /// completes append/mark/remove under the write lock, so seeing `deleted`
+    /// after the hand-off means it is done. Encoding the orphan would stamp a
+    /// checkpoint >= the drop LSN, and restart would skip the genuine drop as
+    /// stale, resurrecting the deleted collection with old data.
+    #[tokio::test]
+    async fn legacy_graph_snapshot_skips_deleted_collection() {
+        let dir = unique_snap_dir("legacy-deleted-skip");
+        let wal_path = dir.join("bench.wal");
+        let applied_sidecar = houyi_persistence::wal_sidecar::sidecar_path_for_wal(&wal_path);
+        let collections_wal_path = dir.join("collections.wal");
+        let (collections_wal, _entries) =
+            crate::types::WalHandle::open(&collections_wal_path, crate::types::WalWriteMode::Sync)
+                .unwrap();
+        collections_wal.append(b"{}".to_vec()).unwrap();
+        let manager = crate::collection::CollectionManager::new(4, "hnsw");
+        let col = manager.get_or_create("docs", Some(4)).unwrap();
+        col.backend
+            .insert_batch(vec![(10, vec4(10))])
+            .await
+            .unwrap();
+        col.note_applied_lsn(0);
+        // 模拟 drop 已完成但 Arc 仍被名单持住（list→lock 间隙只剩 deleted 标志）；
+        // 故意不从 manager 移除，让 names/get 仍能选中它，直接验证锁后检查。
+        // EN: emulate a completed drop whose Arc is still named (only the deleted
+        // flag remains across the list-to-lock gap); intentionally keep it in the
+        // manager so names/get still select it, isolating the post-lock check.
+        col.mark_deleted();
+
+        let metrics = std::sync::Arc::new(GraphSnapshotMetrics::default());
+        let writer = GraphSnapshotWriter {
+            index: IndexBackend::new_hnsw(4),
+            wal_path: wal_path.clone(),
+            applied_sidecar,
+            collections: std::sync::Arc::new(manager),
+            collections_wal: std::sync::Arc::new(collections_wal),
+            collections_wal_path: collections_wal_path.clone(),
+            metrics: std::sync::Arc::clone(&metrics),
+            encryption: None,
+            lifecycle: std::sync::Arc::new(
+                crate::collection_lifecycle::CollectionLifecycleState::for_test(),
+            ),
+            roles: crate::types::RoleState::new(crate::types::ReplicationRole::Disabled),
+        };
+        writer.write_legacy_collection_graph_snapshots().await;
+
+        let snap_path =
+            collection_snapshots_dir(&collections_wal_path).join("docs.graph_snapshot.bin");
+        assert!(
+            !snap_path.exists(),
+            "deleted collection must not be encoded into a legacy snapshot"
+        );
+        assert_eq!(
+            metrics
+                .writes_total
+                .load(std::sync::atomic::Ordering::Relaxed),
+            0
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1910,16 +2440,20 @@ mod tests {
             collections_wal_path: collections_wal_path.clone(),
             metrics: std::sync::Arc::clone(&metrics),
             encryption: None,
+            lifecycle: std::sync::Arc::new(
+                crate::collection_lifecycle::CollectionLifecycleState::for_test(),
+            ),
+            roles: crate::types::RoleState::new(crate::types::ReplicationRole::Disabled),
         };
         writer.write_all().await;
 
         assert!(graph_snapshot_path_for_wal(&wal_path).metadata().is_err());
-        assert!(
-            collection_snapshots_dir(&collections_wal_path)
-                .join("docs.graph_snapshot.bin")
-                .exists(),
-            "collection snapshot survives main-index failure"
-        );
+        let manifest = houyi_persistence::collection_snapshot_file::read_collection_manifest(
+            &collection_snapshots_dir(&collections_wal_path).join("collections.manifest"),
+        )
+        .unwrap()
+        .expect("collection manifest survives main-index failure");
+        assert_eq!(manifest.collections.len(), 1);
         assert_eq!(
             metrics
                 .writes_total
@@ -2054,6 +2588,176 @@ mod tests {
         assert_eq!(stats.upsert_batches, 1);
         assert!(manager.get("orphan").is_some(), "upsert auto-created");
         assert!(manager.get("ghost").is_none(), "unknown delete skipped");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// 整库删除：drop 后重放同名 create/upsert 只保留重建后的数据；未知目标的
+    /// drop（历史截断/重复 apply）幂等跳过。
+    /// EN: Whole-collection drop: after the drop, a same-name create/upsert
+    /// replays to only the newly written data; a drop for an unknown target
+    /// (truncated history/duplicate apply) is skipped idempotently.
+    #[tokio::test]
+    async fn collections_wal_replay_drop_then_recreate_starts_clean() {
+        let path = unique_wal_path("collections-drop");
+        let _ = std::fs::remove_file(&path);
+        {
+            let (mut wal, _) = FileWal::open(&path).unwrap();
+            let old = vec![wal_item(
+                1,
+                vec![1.0, 0.0, 0.0, 0.0],
+                Some("old"),
+                Some(serde_json::json!({"tag": "p0"})),
+            )];
+            wal.append(encode_collection_upsert_batch("docs", 4, &old).unwrap());
+            wal.append(houyi_persistence::collection_wal::encode_collection_drop("docs").unwrap());
+            // 重建同名 collection 并写入新数据。
+            // EN: Recreate the same-name collection and write new data.
+            let new = vec![wal_item(
+                1,
+                vec![1.0, 0.0, 0.0, 0.0],
+                Some("new"),
+                Some(serde_json::json!({"tag": "p1"})),
+            )];
+            wal.append(encode_collection_upsert_batch("docs", 4, &new).unwrap());
+            // 未知目标的 drop：幂等跳过。
+            // EN: Drop of an unknown target: idempotent skip.
+            wal.append(houyi_persistence::collection_wal::encode_collection_drop("ghost").unwrap());
+        }
+        let (_wal, entries) = FileWal::open(&path).unwrap();
+        let manager = crate::collection::CollectionManager::new(4, "flat");
+        let stats = replay_collections_wal_into_manager(&entries, &manager, &HashMap::new())
+            .await
+            .unwrap();
+        assert_eq!(stats.collections_dropped, 1);
+        assert_eq!(stats.upsert_batches, 2);
+
+        let col = manager.get("docs").expect("recreated collection exists");
+        let hits = col.backend.search(&[1.0, 0.0, 0.0, 0.0], 4, None).await;
+        assert_eq!(
+            hits,
+            vec![1],
+            "only the recreated vector survives: {hits:?}"
+        );
+        let payloads = col.scalars.lock().unwrap().payloads_for(&[1]);
+        assert_eq!(
+            payloads.get(&1).and_then(|r| r.get("label")),
+            Some(&houyi_core::ScalarValue::Text("new".to_string())),
+            "only the post-drop scalar row remains"
+        );
+        assert!(manager.get("ghost").is_none());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// stale drop 不得删除同名重建后的 collection：`upsert→drop→upsert→snapshot`
+    /// 之后，旧 drop 的 LSN（2）≤ 重建后 checkpoint（3），重放必须跳过它，否则
+    /// 快照里活着的 collection 会在重启后凭空消失。反方向也要成立：没有快照
+    /// 条目（未重建）的 drop 必须照常生效。manifest 与 legacy 两种模式都覆盖。
+    /// EN: a stale drop must not delete a same-name recreation: after
+    /// `upsert→drop→upsert→snapshot`, the old drop LSN (2) is <= the recreated
+    /// checkpoint (3), so replay must skip it — otherwise a live collection
+    /// vanishes on restart. The dual must hold too: a drop with no snapshot entry
+    /// (never recreated) is still applied. Covers manifest and legacy modes.
+    #[tokio::test]
+    async fn collections_wal_replay_skips_stale_drop_below_recreated_checkpoint() {
+        let path = unique_wal_path("collections-stale-drop");
+        let _ = std::fs::remove_file(&path);
+        {
+            let (mut wal, _) = FileWal::open(&path).unwrap();
+            wal.append(
+                encode_collection_upsert_batch(
+                    "docs",
+                    4,
+                    &[wal_item(1, vec![1.0, 0.0, 0.0, 0.0], None, None)],
+                )
+                .unwrap(),
+            );
+            wal.append(houyi_persistence::collection_wal::encode_collection_drop("docs").unwrap());
+            wal.append(
+                encode_collection_upsert_batch(
+                    "docs",
+                    4,
+                    &[wal_item(2, vec![0.0, 1.0, 0.0, 0.0], None, None)],
+                )
+                .unwrap(),
+            );
+            // 没有快照条目的 collection：其 drop 必须照常生效（LSN 4/5）。
+            // EN: a collection with no snapshot entry: its drop must still apply.
+            wal.append(
+                encode_collection_upsert_batch(
+                    "gone",
+                    4,
+                    &[wal_item(3, vec![1.0, 0.0, 0.0, 0.0], None, None)],
+                )
+                .unwrap(),
+            );
+            wal.append(houyi_persistence::collection_wal::encode_collection_drop("gone").unwrap());
+        }
+        let (_wal, entries) = FileWal::open(&path).unwrap();
+        let checkpoints = HashMap::from([("docs".to_string(), 3u64)]);
+        let seed_docs = || async {
+            let manager = crate::collection::CollectionManager::new(4, "flat");
+            let restored = manager.get_or_create("docs", Some(4)).unwrap();
+            restored
+                .backend
+                .insert_batch(vec![(7, vec![0.0, 0.0, 1.0, 0.0])])
+                .await
+                .unwrap();
+            manager
+        };
+
+        // manifest 模式：docs 的 3 条记录被 checkpoint 跳过，gone 的 upsert+drop 生效。
+        // EN: manifest mode: docs' three records are checkpoint-skipped; gone's
+        // upsert+drop apply.
+        let manager = seed_docs().await;
+        let stats =
+            replay_collections_wal_into_manager_with_mode(&entries, &manager, &checkpoints, true)
+                .await
+                .unwrap();
+        assert_eq!(stats.records_skipped_snapshot, 3);
+        assert_eq!(stats.collections_dropped, 1);
+        assert!(
+            manager.get("gone").is_none(),
+            "drop of a never-recreated collection must apply"
+        );
+        let col = manager
+            .get("docs")
+            .expect("recreated collection from the snapshot must survive");
+        let hits = col.backend.search(&[0.0, 0.0, 1.0, 0.0], 4, None).await;
+        assert_eq!(hits, vec![7], "restored vector must remain: {hits:?}");
+
+        // legacy 模式（skip=false）：只跳过 stale drop；其余记录按 legacy 语义重建。
+        // EN: legacy mode (skip=false): only the stale drop is skipped; other
+        // records follow legacy semantics.
+        let legacy_manager = seed_docs().await;
+        let legacy_stats = replay_collections_wal_into_manager_with_mode(
+            &entries,
+            &legacy_manager,
+            &checkpoints,
+            false,
+        )
+        .await
+        .unwrap();
+        assert_eq!(legacy_stats.records_skipped_snapshot, 1);
+        assert_eq!(legacy_stats.collections_dropped, 1);
+        assert!(legacy_manager.get("gone").is_none());
+        // 只断言集合句柄存在几乎恒真：旧 drop 若被重放，后续 upsert 会立刻
+        // 重建同名集合。真正的信号是快照里的向量 7 必须存活——legacy 模式
+        // 不会重新插入它。
+        // EN: Asserting only that the handle exists is nearly tautological:
+        // replaying the stale drop is immediately followed by an upsert that
+        // recreates the name. The real signal is that snapshot vector 7 must
+        // survive — legacy replay never re-inserts it.
+        let legacy_col = legacy_manager
+            .get("docs")
+            .expect("legacy replay must not delete the recreated collection");
+        let legacy_hits = legacy_col
+            .backend
+            .search(&[0.0, 0.0, 1.0, 0.0], 4, None)
+            .await;
+        assert!(
+            legacy_hits.contains(&7),
+            "snapshot vector must survive legacy replay: {legacy_hits:?}"
+        );
         let _ = std::fs::remove_file(&path);
     }
 

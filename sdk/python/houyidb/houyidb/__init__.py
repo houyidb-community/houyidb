@@ -16,6 +16,7 @@ from .client import (
     Filter,
     HouyiClient,
     HouyiError,
+    HnswParams,
     SearchHit,
     SearchResult,
     Vector,
@@ -27,10 +28,11 @@ __all__ = [
     "Filter",
     "HouyiClient",
     "HouyiError",
+    "HnswParams",
     "SearchHit",
     "SearchResult",
     "Vector",
     "stable_id",
 ]
 
-__version__ = "0.2.0b5"
+__version__ = "0.2.0b8"

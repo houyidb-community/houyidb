@@ -3,14 +3,19 @@
 //!
 //! 与服务端的契约要点：
 //! EN: Contract notes with the server:
-//! - collection 在首次 upsert 时隐式创建，维度由首个向量定型；
+//! - collection 在首次 upsert 时隐式创建，维度由首个向量定型；也可用
+//!   [`Client::create_collection`]（PUT）显式定型 dims/metric/后端/HNSW 参数；
 //!   EN: a collection is created implicitly on first upsert and its dimension is
-//!   fixed by the first vector;
+//!   fixed by the first vector; [`Client::create_collection`] (PUT) may also
+//!   create it explicitly with fixed dims/metric/backend/HNSW parameters;
 //! - payload 键 `label` 为保留列，占用会 400（用顶层 `label` 字段）；
 //!   EN: the payload key `label` is reserved (using it returns 400; use the
 //!   top-level `label` field instead);
-//! - 检索响应的 `score` 是相似度（1 - cosine_distance，越大越相似）；
-//!   EN: search `score` is similarity (1 - cosine_distance, higher is closer);
+//! - 检索响应的 `score` 按创建时的度量换算：cosine/l2/l1 为 `1 - 内部距离`
+//!   （cosine 夹到 [-1, 1]），ip 为原始点积；数值越大越近，但量纲随度量变化。
+//!   EN: search `score` follows the collection metric: cosine/l2/l1 convert the
+//!   kernel distance as `1 - d` (cosine clamped to [-1, 1]) and ip exposes the
+//!   raw dot product; larger is closer, but the scale depends on the metric;
 //! - [`stable_id`] 与 Python/TS/Go SDK、服务端 OpenAI 网关同一算法
 //!   （BLAKE2b-8 大端 & 2^63-1），删除可跨 SDK 重放。
 //!   EN: [`stable_id`] uses the same algorithm as the Python/TS/Go SDKs and the
@@ -169,6 +174,61 @@ impl SearchResponse {
     }
 }
 
+/// 建集合时的 HNSW 参数三元组（必须三个全给，否则服务端 400）。
+/// EN: HNSW parameter triple for explicit creation (all three or the server
+/// returns 400).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HnswConfig {
+    pub m: usize,
+    pub ef_construction: usize,
+    pub ef_search: usize,
+}
+
+/// 显式建集合的选项（`Default` 等价服务端默认：余弦 + 默认后端 + 默认 HNSW）。
+///
+/// 显式创建把 dims/metric/后端/HNSW 参数一次定型：metric 与后端不可变，
+/// 之后要改只能删除重建（旧图按旧度量构建，混用会让排序失去意义）。
+/// EN: Options for explicit creation (`Default` equals server defaults: cosine,
+/// default backend, default HNSW). Explicit creation fixes dims/metric/backend
+/// and HNSW parameters at once; metric and backend are immutable afterwards —
+/// changing them requires drop-and-recreate (old graphs were built under the old
+/// metric, and mixing them would make ordering meaningless).
+#[derive(Debug, Clone, Default)]
+pub struct CreateCollectionOptions {
+    /// `l2` / `cosine` / `ip` / `l1`（大小写不敏感，常用别名见服务端）。
+    /// EN: l2/cosine/ip/l1 (case-insensitive; server accepts common aliases).
+    pub metric: Option<String>,
+    /// 后端类型：hnsw / pq-flat / flat / clustered / flat-clustered / hii-l0。
+    /// 缺省取服务启动配置的默认后端。pq-flat 仅支持 l2、hii-l0 仅支持 cosine
+    /// （不匹配服务端返回 400）。
+    /// EN: Backend kind: hnsw / pq-flat / flat / clustered / flat-clustered /
+    /// hii-l0. Omitted means the server's startup default backend. pq-flat is
+    /// L2-only and hii-l0 Cosine-only (mismatches return 400).
+    pub index_type: Option<String>,
+    /// HNSW 三元组：仅 `index_type = Some("hnsw")` 时有效，三个字段必须全给；
+    /// 与其他后端组合会被服务端拒绝（400）。
+    /// EN: HNSW triple: valid only with `index_type = Some("hnsw")`, and all
+    /// three fields are required; combining it with another backend is rejected
+    /// by the server (400).
+    pub hnsw: Option<HnswConfig>,
+}
+
+/// 建集合响应：服务端回显实际生效的参数（同名已存在返回 409）。
+/// EN: Creation response: the server echoes the effective parameters (an
+/// existing name yields 409).
+#[derive(Debug, Clone, Deserialize)]
+pub struct CreateCollectionResult {
+    pub created: bool,
+    pub collection: String,
+    pub dims: usize,
+    pub metric: String,
+    pub index_type: String,
+    /// 仅 `index_type=hnsw` 时存在。
+    /// EN: Present only for `index_type=hnsw`.
+    #[serde(default)]
+    pub hnsw: Option<HnswConfig>,
+}
+
 /// 检索/混合检索可选参数（`Default` 即全默认）。
 /// EN: Optional search/hybrid-search parameters (`Default` means all defaults).
 #[derive(Debug, Clone, Default)]
@@ -185,9 +245,30 @@ pub struct SearchOptions {
 pub struct Client {
     agent: ureq::Agent,
     base_url: String,
+    /// 可选管理 token：只附在 `/v1/admin/*` 请求上，普通读写请求绝不携带。
+    /// EN: Optional admin token: attached only to `/v1/admin/*` requests, never to
+    /// normal read/write calls.
+    admin_token: Option<String>,
 }
 
 impl Client {
+    /// 附加管理 token（仅用于管理端点，如删除整个 collection）。
+    ///
+    /// token 存于客户端，只在管理请求上发送 `Authorization: Bearer <token>`；
+    /// 空串等价于未配置（不发送空凭据），未配置时管理请求照常发出（由服务端
+    /// 401/403 决定，不在客户端 fail-fast——服务端可能未启用鉴权）。
+    /// EN: Attach an admin token (used only by admin endpoints such as dropping a
+    /// whole collection). It is stored on the client and sent as
+    /// `Authorization: Bearer <token>` on admin requests only; an empty token
+    /// means "unset" (no header), so the request still goes out and the server
+    /// decides 401/403 (no client-side fail-fast — the server may run without
+    /// auth).
+    pub fn with_admin_token(mut self, token: impl Into<String>) -> Self {
+        let token = token.into();
+        self.admin_token = (!token.is_empty()).then_some(token);
+        self
+    }
+
     /// 构造客户端；`base_url` 如 `http://127.0.0.1:7000`。
     /// EN: Constructs a client; `base_url` such as `http://127.0.0.1:7000`.
     pub fn new(base_url: &str) -> Self {
@@ -211,6 +292,7 @@ impl Client {
         Self {
             agent,
             base_url: base_url.trim_end_matches('/').to_string(),
+            admin_token: None,
         }
     }
 
@@ -254,6 +336,74 @@ impl Client {
     /// observability).
     pub fn index_status(&self) -> Result<serde_json::Value, HouyiError> {
         self.get("/v1/index/status")
+    }
+
+    /// 显式创建 collection（可指定度量/后端/HNSW 参数；需要写权限）。
+    ///
+    /// 与隐式创建（首次 upsert）不同，这里把 dims、metric、后端与 HNSW 参数
+    /// 一次定型并由服务端回显；调用的都是普通写路径，不带管理 token。
+    /// 同名已存在返回 409，参数非法返回 400，follower/只读返回 503。
+    /// EN: Explicitly create a collection (metric/backend/HNSW parameters are
+    /// settable; requires write permission). Unlike implicit creation (first
+    /// upsert), dims, metric, backend and HNSW parameters are fixed here and
+    /// echoed back. This is a normal write path, so the admin token is not
+    /// attached. An existing name yields 409, invalid parameters 400, and
+    /// followers/read-only nodes 503.
+    pub fn create_collection(
+        &self,
+        name: &str,
+        dims: usize,
+        opts: &CreateCollectionOptions,
+    ) -> Result<CreateCollectionResult, HouyiError> {
+        let mut body = serde_json::json!({ "dims": dims });
+        let map = body.as_object_mut().expect("request is an object");
+        if let Some(metric) = &opts.metric {
+            map.insert("metric".to_string(), serde_json::json!(metric));
+        }
+        if let Some(index_type) = &opts.index_type {
+            map.insert("index_type".to_string(), serde_json::json!(index_type));
+        }
+        if let Some(hnsw) = &opts.hnsw {
+            map.insert("hnsw_m".to_string(), serde_json::json!(hnsw.m));
+            map.insert(
+                "hnsw_ef_construction".to_string(),
+                serde_json::json!(hnsw.ef_construction),
+            );
+            map.insert(
+                "hnsw_ef_search".to_string(),
+                serde_json::json!(hnsw.ef_search),
+            );
+        }
+        checked(
+            self.agent
+                .put(&format!(
+                    "{}/v1/collections/{}",
+                    self.base_url,
+                    quote_path_segment(name)
+                ))
+                .send_json(body),
+        )
+    }
+
+    /// 删除整个 collection（不可逆；需要 admin 权限）。
+    ///
+    /// 服务端是 WAL-first 删除：记录先落盘，崩溃后重放与 follower 复制都能
+    /// 收敛到「已删除」；对不存在/已删除的 collection 返回 404。
+    /// EN: Drop an entire collection (irreversible; admin permission required).
+    /// The server deletes WAL-first, so crash replay and follower replication
+    /// converge to "gone"; an unknown/already-dropped collection yields 404.
+    pub fn delete_collection(&self, name: &str) -> Result<(), HouyiError> {
+        let url = format!(
+            "{}/v1/admin/collections/{}",
+            self.base_url,
+            quote_path_segment(name)
+        );
+        let mut req = self.agent.delete(&url);
+        if let Some(token) = &self.admin_token {
+            req = req.header("Authorization", &format!("Bearer {token}"));
+        }
+        let _: serde_json::Value = checked(req.call())?;
+        Ok(())
     }
 
     fn get<T: serde::de::DeserializeOwned>(&self, path: &str) -> Result<T, HouyiError> {
@@ -467,5 +617,158 @@ mod tests {
         assert_eq!(quote_path_segment("docs"), "docs");
         assert_eq!(quote_path_segment("a/b?c#d"), "a%2Fb%3Fc%23d");
         assert_eq!(quote_path_segment("空 间"), "%E7%A9%BA%20%E9%97%B4");
+    }
+
+    /// 起一个只服务一次请求的本地监听器，返回 (base_url, 请求原文 join handle)。
+    ///
+    /// 按 Content-Length 读满请求体再应答：只停在 header 结束会让 PUT/POST
+    /// 的 body 断言依赖 TCP 分片时机（偶发截断）。
+    /// EN: One-shot local listener returning (base_url, join handle with the raw
+    /// request). It reads the full body per Content-Length before replying:
+    /// stopping at the header terminator would make PUT/POST body assertions
+    /// depend on TCP segmentation timing (flaky truncation).
+    fn serve_one_request(body: &'static str) -> (String, std::thread::JoinHandle<String>) {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("local_addr");
+        let handle = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept");
+            let mut request = Vec::new();
+            let mut buf = [0u8; 4096];
+            loop {
+                let n = stream.read(&mut buf).expect("read request");
+                if n == 0 {
+                    break;
+                }
+                request.extend_from_slice(&buf[..n]);
+                let Some(head_end) = request.windows(4).position(|w| w == b"\r\n\r\n") else {
+                    continue;
+                };
+                let header_len = head_end + 4;
+                let content_length = String::from_utf8_lossy(&request[..header_len])
+                    .lines()
+                    .find_map(|line| {
+                        let (name, value) = line.split_once(':')?;
+                        (name.eq_ignore_ascii_case("content-length"))
+                            .then(|| value.trim().parse::<usize>().ok())?
+                    })
+                    .unwrap_or(0);
+                if request.len() >= header_len + content_length {
+                    break;
+                }
+            }
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            stream
+                .write_all(response.as_bytes())
+                .expect("write response");
+            String::from_utf8_lossy(&request).to_string()
+        });
+        (format!("http://{addr}"), handle)
+    }
+
+    /// 显式建集合：PUT 普通写路径（不带管理 token），metric/后端/HNSW 三元组
+    /// 逐个落进 wire body，响应回显实际生效的度量。
+    /// EN: explicit create uses the normal PUT write path (no admin token) and
+    /// lands metric/backend/HNSW triple in the wire body; the response echoes
+    /// the effective metric.
+    #[test]
+    fn create_collection_sends_metric_backend_and_hnsw() {
+        let (base, server) = serve_one_request(
+            r#"{"created":true,"collection":"docs","dims":4,"metric":"ip","index_type":"hnsw","hnsw":{"m":16,"ef_construction":100,"ef_search":32}}"#,
+        );
+        let result = Client::new(&base)
+            .with_admin_token("tok")
+            .create_collection(
+                "docs",
+                4,
+                &CreateCollectionOptions {
+                    metric: Some("ip".to_string()),
+                    index_type: Some("hnsw".to_string()),
+                    hnsw: Some(HnswConfig {
+                        m: 16,
+                        ef_construction: 100,
+                        ef_search: 32,
+                    }),
+                },
+            )
+            .expect("create");
+        assert_eq!(result.metric, "ip");
+        assert_eq!(result.hnsw.map(|h| h.m), Some(16));
+        let request = server.join().expect("server thread");
+        assert!(
+            request.starts_with("PUT /v1/collections/docs"),
+            "unexpected request line: {request}"
+        );
+        let body: serde_json::Value =
+            serde_json::from_str(request.split_once("\r\n\r\n").expect("body separator").1)
+                .expect("request body is JSON");
+        assert_eq!(body["dims"], 4);
+        assert_eq!(body["metric"], "ip");
+        assert_eq!(body["index_type"], "hnsw");
+        assert_eq!(body["hnsw_m"], 16);
+        assert_eq!(body["hnsw_ef_construction"], 100);
+        assert_eq!(body["hnsw_ef_search"], 32);
+        assert!(
+            !request.to_ascii_lowercase().contains("authorization:"),
+            "create is a normal write and must not carry the admin token: {request}"
+        );
+    }
+
+    /// 空 token 等价未配置（不发空 Authorization）；非空 token 只出现在管理请求上。
+    /// EN: an empty token means unset (no empty Authorization header); a non-empty
+    /// token is sent on admin requests.
+    #[test]
+    fn admin_token_empty_means_unset() {
+        let (base, server) = serve_one_request(r#"{"deleted":true,"collection":"docs"}"#);
+        Client::new(&base)
+            .with_admin_token("")
+            .delete_collection("docs")
+            .expect("empty-token drop");
+        let request = server.join().expect("server thread");
+        assert!(
+            request.starts_with("DELETE /v1/admin/collections/docs"),
+            "unexpected request line: {request}"
+        );
+        assert!(
+            !request.to_ascii_lowercase().contains("authorization:"),
+            "empty admin token must not produce an Authorization header: {request}"
+        );
+
+        let (base, server) = serve_one_request(r#"{"deleted":true,"collection":"docs"}"#);
+        Client::new(&base)
+            .with_admin_token("tok")
+            .delete_collection("docs")
+            .expect("token drop");
+        let request = server.join().expect("server thread");
+        assert!(
+            request
+                .to_ascii_lowercase()
+                .contains("authorization: bearer tok"),
+            "admin token missing from request: {request}"
+        );
+    }
+
+    /// 普通读写请求绝不可携带管理 token：把 Authorization 挪进通用 `get`
+    /// 之类的回退必须被抓住。
+    /// EN: normal read/write requests must never carry the admin token; a
+    /// regression that attaches Authorization inside the shared `get` path must
+    /// be caught.
+    #[test]
+    fn admin_token_withheld_from_normal_requests() {
+        let (base, server) = serve_one_request(r#"{"deleted":true,"collection":"docs"}"#);
+        let _ = Client::new(&base).with_admin_token("tok").health();
+        let request = server.join().expect("server thread");
+        assert!(
+            request.starts_with("GET /v1/health"),
+            "unexpected request line: {request}"
+        );
+        assert!(
+            !request.to_ascii_lowercase().contains("authorization:"),
+            "admin token must not leak onto normal requests: {request}"
+        );
     }
 }

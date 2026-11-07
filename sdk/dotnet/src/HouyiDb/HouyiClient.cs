@@ -1,4 +1,5 @@
 using System.Net;
+using System.Net.Http.Headers;
 using System.Net.Http.Json;
 using System.Text.Json;
 
@@ -7,11 +8,13 @@ namespace HouyiDb;
 /// <summary>
 /// HouyiDB 客户端入口（async，内部复用一个 <see cref="HttpClient"/>）。
 /// 契约要点：collection 首次 upsert 隐式创建，维度由首个向量定型；payload 键
-/// "label" 为保留列；检索响应 score 为相似度（1 - cosine_distance，越大越相似）。
+/// "label" 为保留列；检索响应 score 按 collection 度量换算（cosine 为 1 - d
+/// 且钳制 [-1,1]；l2/l1 为 1 - d 不钳制；ip 为原始点积），越大越相似。
 /// EN: HouyiDB client entry point (async, reusing one <see cref="HttpClient"/>).
 /// Contract: a collection is created implicitly on first upsert and its dimension
 /// is fixed by the first vector; payload key "label" is reserved; search score is
-/// similarity (1 - cosine_distance, higher is closer).
+/// converted per the collection metric (cosine is 1 - d clamped to [-1,1]; l2/l1
+/// are 1 - d unclamped; ip is the raw dot product), higher is closer.
 /// </summary>
 public sealed class HouyiClient
 {
@@ -19,35 +22,75 @@ public sealed class HouyiClient
 
     private readonly HttpClient _http;
     private readonly string _baseUrl;
+    private readonly string? _adminToken;
 
     /// <summary>
     /// 构造客户端；<paramref name="baseUrl"/> 如 http://127.0.0.1:7000。
     /// EN: Constructs a client; <paramref name="baseUrl"/> such as http://127.0.0.1:7000.
     /// </summary>
-    public HouyiClient(string baseUrl) : this(baseUrl, null, null) { }
+    public HouyiClient(string baseUrl) : this(baseUrl, null, null, null) { }
 
     /// <summary>
     /// 构造客户端并指定单次请求超时。
     /// EN: Constructs a client with a per-request timeout.
     /// </summary>
-    public HouyiClient(string baseUrl, TimeSpan timeout) : this(baseUrl, null, timeout) { }
+    public HouyiClient(string baseUrl, TimeSpan timeout) : this(baseUrl, null, timeout, null) { }
 
     /// <summary>
     /// 构造客户端并复用外部 HttpClient（如 IHttpClientFactory 托管实例）。
     /// EN: Constructs a client reusing an external HttpClient (e.g. an
     /// IHttpClientFactory-managed instance).
     /// </summary>
-    public HouyiClient(string baseUrl, HttpClient httpClient) : this(baseUrl, httpClient, null) { }
+    public HouyiClient(string baseUrl, HttpClient httpClient) : this(baseUrl, httpClient, null, null) { }
 
-    private HouyiClient(string baseUrl, HttpClient? httpClient, TimeSpan? timeout)
+    /// <summary>
+    /// 构造客户端并复用外部 HttpClient，同时绑定可选管理 token：只附在
+    /// /v1/admin/* 请求上，普通读写绝不携带。未配置时管理请求照常发出，由服务端
+    /// 401/403 决定（服务端可能未启用鉴权）。
+    /// EN: Constructs a client reusing an external HttpClient with an optional
+    /// admin token attached only to /v1/admin/* requests. When absent the request
+    /// still goes out and the server decides 401/403.
+    /// </summary>
+    /// <remarks>
+    /// 不提供 `(string, string?)` / 可选 token 重载：那会让既有
+    /// `new HouyiClient(url, null)` 与 `(string, HttpClient)` 重载二义。本构造的
+    /// 4 个参数都必填（不设默认值），2 参调用仍只命中既有重载；只要 token 的
+    /// 场景用 <see cref="WithAdminToken"/> 工厂。
+    /// EN: No `(string, string?)` / optional-token overload: it would make the
+    /// existing `new HouyiClient(url, null)` ambiguous with
+    /// `(string, HttpClient)`. All four parameters here are required (no
+    /// defaults), so two-argument calls still bind the existing overloads; use
+    /// the <see cref="WithAdminToken"/> factory when only a token is needed.
+    /// </remarks>
+    public HouyiClient(string baseUrl, HttpClient? httpClient, TimeSpan? timeout, string? adminToken)
     {
-        _http = httpClient ?? new HttpClient { Timeout = timeout ?? DefaultTimeout };
+        // 外部 HttpClient 归调用方所有：不改它的 Timeout（共享实例上改动会影响
+        // 其他使用者，且首次请求后再改会抛 InvalidOperationException）。两者同时
+        // 提供属于调用方混淆，直接报错而不是静默忽略。
+        // EN: an injected HttpClient is caller-owned: never mutate its Timeout (that
+        // leaks into other users of a shared instance, and post-first-request
+        // changes throw InvalidOperationException). Supplying both is a caller
+        // mistake, so fail loudly instead of silently ignoring one.
         if (httpClient is not null && timeout is not null)
         {
-            _http.Timeout = timeout.Value;
+            throw new ArgumentException(
+                "timeout applies only to clients that create their own HttpClient; " +
+                "configure the injected HttpClient's Timeout instead.",
+                nameof(timeout));
         }
+        _http = httpClient ?? new HttpClient { Timeout = timeout ?? DefaultTimeout };
         _baseUrl = baseUrl.TrimEnd('/');
+        _adminToken = adminToken;
     }
+
+    /// <summary>
+    /// 创建绑定管理 token 的客户端（内部自建 HttpClient）：token 只附在
+    /// /v1/admin/* 请求上，普通读写绝不携带；空串/null 等价未配置。
+    /// EN: Creates a client bound to an admin token (private HttpClient); the
+    /// token is attached only to /v1/admin/* requests, and null/empty means unset.
+    /// </summary>
+    public static HouyiClient WithAdminToken(string baseUrl, string? adminToken, TimeSpan? timeout = null) =>
+        new(baseUrl, null, timeout, adminToken);
 
     /// <summary>
     /// 返回一个 named collection 的操作句柄。
@@ -85,6 +128,70 @@ public sealed class HouyiClient
     /// </summary>
     public Task<JsonDocument> IndexStatusAsync(CancellationToken ct = default) =>
         GetJsonAsync("/v1/index/status", ct);
+
+    /// <summary>
+    /// 显式创建 collection（可指定度量/后端/HNSW 参数；需要写权限）。
+    ///
+    /// 与隐式创建（首次 upsert）不同，dims、metric、后端与 HNSW 参数在这里
+    /// 一次定型并由服务端回显。普通写路径不带管理 token；同名已存在抛
+    /// <see cref="HouyiException"/>（409）、参数非法 400、follower/只读 503。
+    /// EN: Explicitly creates a collection (metric/backend/HNSW parameters are
+    /// settable; requires write permission). Unlike implicit creation (first
+    /// upsert), dims, metric, backend and HNSW parameters are fixed here and
+    /// echoed back. This is the normal write path without the admin token; an
+    /// existing name throws <see cref="HouyiException"/> (409), invalid
+    /// parameters 400, and followers/read-only nodes 503.
+    /// </summary>
+    public async Task<CreateCollectionResult> CreateCollectionAsync(
+        string name, int dims, CreateCollectionOptions? options = null, CancellationToken ct = default)
+    {
+        var body = new Dictionary<string, object> { ["dims"] = dims };
+        if (options?.Metric is not null)
+        {
+            body["metric"] = options.Metric;
+        }
+        if (options?.IndexType is not null)
+        {
+            body["index_type"] = options.IndexType;
+        }
+        if (options?.Hnsw is { } hnsw)
+        {
+            body["hnsw_m"] = hnsw.M;
+            body["hnsw_ef_construction"] = hnsw.EfConstruction;
+            body["hnsw_ef_search"] = hnsw.EfSearch;
+        }
+        using var resp = await _http
+            .PutAsJsonAsync($"{_baseUrl}/v1/collections/{Escape(name)}", body, ct)
+            .ConfigureAwait(false);
+        using var doc = await ReadJsonAsync(resp, ct).ConfigureAwait(false);
+        return doc.RootElement.Deserialize<CreateCollectionResult>()
+            ?? throw new HouyiException((int)resp.StatusCode, "empty response body");
+    }
+
+    /// <summary>
+    /// 删除整个 collection（不可逆；需要 admin 权限）。
+    ///
+    /// 服务端 WAL-first：记录先落盘，崩溃重放与 follower 复制都收敛到「已删除」；
+    /// 不存在/已删除的 collection 抛 <see cref="HouyiException"/>（404）。
+    /// EN: Drops an entire collection (irreversible; admin permission required).
+    /// WAL-first on the server, so crash replay and follower replication converge to
+    /// "gone"; unknown/already-dropped collections throw <see cref="HouyiException"/>
+    /// (404).
+    /// </summary>
+    public async Task DeleteCollectionAsync(string name, CancellationToken ct = default)
+    {
+        using var req = new HttpRequestMessage(
+            HttpMethod.Delete,
+            $"{_baseUrl}/v1/admin/collections/{Escape(name)}");
+        // 管理请求才携带 Authorization；普通读写请求绝不上报 admin token。
+        // EN: only admin requests carry Authorization; normal calls never do.
+        if (!string.IsNullOrEmpty(_adminToken))
+        {
+            req.Headers.Authorization = new AuthenticationHeaderValue("Bearer", _adminToken);
+        }
+        using var resp = await _http.SendAsync(req, ct).ConfigureAwait(false);
+        using var doc = await ReadJsonAsync(resp, ct).ConfigureAwait(false);
+    }
 
     internal async Task<JsonDocument> GetJsonAsync(string path, CancellationToken ct)
     {

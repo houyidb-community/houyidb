@@ -7,6 +7,8 @@
 //! 用途：运维可见性、未来 WAL 截断/检查点；**当前**冷启动仍 **全量重放** WAL（空索引），不依赖本字段跳过记录。
 //! Use: observability; future truncation/checkpoint. Cold start still does full WAL replay into an empty index.
 
+use std::fs::File;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 /// 与 `wal` 同目录、同主名：`foo.wal` → `foo.applied_lsn`.
@@ -53,12 +55,20 @@ pub fn write_wal_next_lsn_meta_atomic(wal_path: &Path, next_lsn: u64) -> std::io
         .file_name()
         .and_then(|s| s.to_str())
         .unwrap_or("wal.next_lsn");
-    let tmp = path
-        .parent()
-        .unwrap_or_else(|| Path::new("."))
-        .join(format!("{name}.tmp"));
-    std::fs::write(&tmp, format!("{next_lsn}\n"))?;
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let tmp = parent.join(format!("{name}.tmp"));
+    // P5.0.2：保留可能删掉最后一个归档段，活动文件只剩头——此时 next_lsn
+    // 侧车是唯一的 LSN 来源，必须 fsync 文件与父目录后才能删除归档。
+    // EN: Retention may delete the last archive leaving a header-only active
+    // segment; the next_lsn sidecar is then the only source and must be durable
+    // (file + parent dir) before archives are removed.
+    {
+        let mut f = File::create(&tmp)?;
+        f.write_all(format!("{next_lsn}\n").as_bytes())?;
+        f.sync_all()?;
+    }
     std::fs::rename(&tmp, &path)?;
+    crate::sync_parent_dir(&path)?;
     Ok(())
 }
 

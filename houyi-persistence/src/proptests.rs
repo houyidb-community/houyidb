@@ -8,15 +8,15 @@
 //!   校验失败点即终点），tail 增量模式下腐坏（完整记录 CRC 不匹配）必须
 //!   报错而非静默停等；`append_entry_no_flush` 拒绝 LSN 空洞/回退且失败
 //!   不消耗 LSN。
-//! - collections WAL：四种记录 encode→decode roundtrip；任意字节不 panic；
+//! - collections WAL：五种记录 encode→decode roundtrip；任意字节不 panic；
 //!   未知 op / v≠1 静默跳过（Ok(None)）；已知 op 腐败 fail-fast（Err）。
 //! - 复制帧：全帧型 roundtrip；任意字节不 panic；64MB payload 守卫与
 //!   ACK stage / ERROR kind 校验不被绕过。
 
 use crate::collection_wal::{
-    decode_collection_wal_payload, encode_collection_create, encode_collection_delete,
-    encode_collection_set_ha_level, encode_collection_upsert_batch, CollectionWalItem,
-    CollectionWalRecord, COLLECTION_WAL_VERSION,
+    decode_collection_wal_payload, encode_collection_create_with_options, encode_collection_delete,
+    encode_collection_drop, encode_collection_set_ha_level, encode_collection_upsert_batch,
+    CollectionCreateOptions, CollectionWalItem, CollectionWalRecord, COLLECTION_WAL_VERSION,
 };
 use crate::ha_level::HaLevel;
 use crate::wal_replication::{
@@ -293,8 +293,8 @@ proptest! {
     // ── collections WAL（collection WAL 属性）────────────────────
     // EN: collections WAL section.
 
-    /// 四种 collection 记录的 encode → decode roundtrip。
-    /// EN: encode → decode roundtrip for all four collection record kinds.
+    /// 五种 collection 记录的 encode → decode roundtrip。
+    /// EN: encode → decode roundtrip for all five collection record kinds.
     #[test]
     fn collection_wal_roundtrip(record in arb_collection_wal_record()) {
         let encoded = encode_record_for(&record);
@@ -323,7 +323,7 @@ proptest! {
         // EN: Known ops are out of scope here (covered by roundtrip and corruption tests).
         prop_assume!(!matches!(
             op.as_str(),
-            "collection_create" | "collection_upsert_batch" | "collection_delete" | "collection_set_ha_level"
+            "collection_create" | "collection_upsert_batch" | "collection_delete" | "collection_set_ha_level" | "collection_drop"
         ));
         let decoded = decode_collection_wal_payload(payload.to_string().as_bytes())
             .expect("valid JSON with unknown op must not fail");
@@ -351,7 +351,7 @@ proptest! {
     /// EN: Known op + corrupt fields → fail-fast Err (JSON parsability is the WAL
     /// frame's only corruption detector; a silent skip means silent data loss on replay).
     #[test]
-    fn collection_wal_corrupt_known_op_fails(op_idx in 0usize..4) {
+    fn collection_wal_corrupt_known_op_fails(op_idx in 0usize..5) {
         // 构造 op 合法但必填字段缺失/错型的信封。版本号取常量而非字面量：
         // 版本 bump 时本用例必须跟着走「已知 op」分支，硬编码会静默退化成
         // 「版本不匹配 → Ok(None)」的假通过。
@@ -364,7 +364,8 @@ proptest! {
             0 => serde_json::json!({"v": v, "op": "collection_create", "name": "c"}),
             1 => serde_json::json!({"v": v, "op": "collection_upsert_batch", "name": "c", "dims": 4}),
             2 => serde_json::json!({"v": v, "op": "collection_delete", "name": "c"}),
-            _ => serde_json::json!({"v": v, "op": "collection_set_ha_level", "name": "c"}),
+            3 => serde_json::json!({"v": v, "op": "collection_set_ha_level", "name": "c"}),
+            _ => serde_json::json!({"v": v, "op": "collection_drop"}),
         };
         prop_assert!(decode_collection_wal_payload(payload.to_string().as_bytes()).is_err(),
             "known op with missing required fields must fail fast");
@@ -387,11 +388,19 @@ proptest! {
         kind in prop::sample::select(ERROR_KINDS),
         msg in ".{0,128}",
     ) {
-        let hs = encode_handshake(resume_lsn, 1, log_hash, "tok")?;
+        let follower_id = [0x5Au8; 16];
+        let hs = encode_handshake(resume_lsn, 1, log_hash, 0, 0, follower_id, "tok")?;
         let prefix = decode_handshake_prefix(&hs).unwrap();
         prop_assert_eq!(
-            (prefix.resume_lsn, prefix.stream_mask, prefix.log_hash),
-            (resume_lsn, 1, log_hash)
+            (
+                prefix.resume_lsn,
+                prefix.stream_mask,
+                prefix.log_hash,
+                prefix.log_start_lsn,
+                prefix.snapshot_checkpoint,
+                prefix.follower_id,
+            ),
+            (resume_lsn, 1, log_hash, 0, 0, follower_id)
         );
         prop_assert_eq!(prefix.token_len, 3);
         prop_assert_eq!(
@@ -399,8 +408,10 @@ proptest! {
             "tok"
         );
 
-        let wl = encode_welcome(leader_next);
-        prop_assert_eq!(decode_welcome(&wl).unwrap(), leader_next);
+        let wl = encode_welcome(leader_next, 0);
+        let welcome = decode_welcome(&wl).unwrap();
+        prop_assert_eq!(welcome.leader_next_lsn, leader_next);
+        prop_assert_eq!(welcome.leader_first_available_lsn, 0);
 
         let dh = encode_data_header(stream, lsn, payload_len);
         prop_assert_eq!(
@@ -537,13 +548,51 @@ fn arb_payload_map() -> impl Strategy<Value = serde_json::Map<String, serde_json
     })
 }
 
+/// 创建选项生成器：覆盖默认、仅度量、完整 HNSW 三元组三种合法形态，
+/// 让属性测试同时打新字段的 roundtrip 与「hnsw 必须带度量/仅 hnsw 后端」
+/// 的编码约束（非法组合由下方单元测试的点测覆盖，不进 roundtrip 生成器）。
+/// EN: Create-options generator covering the three legal shapes — default,
+/// metric-only, and the full HNSW triple — so the property test exercises the
+/// new fields' roundtrip plus the encoder's "HNSW requires a metric / only on
+/// the hnsw backend" constraints. Invalid combinations stay in the focused
+/// unit tests rather than the roundtrip generator.
+fn arb_create_options() -> impl Strategy<Value = CollectionCreateOptions> {
+    let metric = prop::sample::select(vec!["cosine", "l2", "ip", "l1"]);
+    prop_oneof![
+        Just(CollectionCreateOptions::default()),
+        // Select 不实现 Copy：复用同一策略必须显式 clone。
+        // EN: Select is not Copy, so reuse requires an explicit clone.
+        metric.clone().prop_map(|m| CollectionCreateOptions {
+            metric: Some(m.to_string()),
+            ..Default::default()
+        }),
+        metric.prop_flat_map(|m| {
+            (
+                Just(m.to_string()),
+                2usize..=1024,
+                1usize..=65_536,
+                1usize..=65_536,
+            )
+                .prop_map(|(metric, m, efc, efs)| CollectionCreateOptions {
+                    metric: Some(metric),
+                    hnsw_m: Some(m),
+                    hnsw_ef_construction: Some(efc),
+                    hnsw_ef_search: Some(efs),
+                })
+        }),
+    ]
+}
+
 fn arb_collection_wal_record() -> impl Strategy<Value = CollectionWalRecord> {
     prop_oneof![
-        (arb_collection_name(), 1usize..64).prop_map(|(name, dims)| CollectionWalRecord::Create {
-            name,
-            dims,
-            index_type: "hnsw".to_string(),
-        }),
+        (arb_collection_name(), 1usize..64, arb_create_options()).prop_map(
+            |(name, dims, options)| CollectionWalRecord::Create {
+                name,
+                dims,
+                index_type: "hnsw".to_string(),
+                options,
+            }
+        ),
         (
             arb_collection_name(),
             prop::collection::vec(
@@ -583,6 +632,7 @@ fn arb_collection_wal_record() -> impl Strategy<Value = CollectionWalRecord> {
                 ha_level: HaLevel::from_code(code).expect("0..=2 are all valid levels"),
             }
         }),
+        arb_collection_name().prop_map(|name| CollectionWalRecord::Drop { name }),
     ]
 }
 
@@ -595,7 +645,8 @@ fn encode_record_for(record: &CollectionWalRecord) -> Vec<u8> {
             name,
             dims,
             index_type,
-        } => encode_collection_create(name, *dims, index_type).unwrap(),
+            options,
+        } => encode_collection_create_with_options(name, *dims, index_type, options).unwrap(),
         CollectionWalRecord::UpsertBatch { name, dim, items } => {
             encode_collection_upsert_batch(name, *dim, items).unwrap()
         }
@@ -603,6 +654,7 @@ fn encode_record_for(record: &CollectionWalRecord) -> Vec<u8> {
         CollectionWalRecord::SetHaLevel { name, ha_level } => {
             encode_collection_set_ha_level(name, *ha_level).unwrap()
         }
+        CollectionWalRecord::Drop { name } => encode_collection_drop(name).unwrap(),
     }
 }
 

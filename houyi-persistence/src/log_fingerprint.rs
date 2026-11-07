@@ -33,12 +33,48 @@
 //! 两侧都从 LSN 0 起哈希同一条连续历史。若将来引入 stream 0 截断，指纹必须
 //! 改为「可校验的子区间」并同步升级协议版本。
 
-use std::io::{self, Read};
+use std::io;
 use std::path::Path;
 
 /// 空日志的指纹（FNV-1a 64 偏移基值）。
 /// Fingerprint of an empty log (FNV-1a 64 offset basis).
 pub const LOG_HASH_SEED: u64 = 0xCBF2_9CE4_8422_2325;
+
+/// 范围指纹错误（P5.0.2）：调用方必须区分「保留范围之外」「历史不连续」「腐坏」。
+/// EN: Range-fingerprint error (P5.0.2): callers must distinguish
+/// out-of-retention, non-contiguous history, and corruption.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FingerprintError {
+    /// 请求起点早于本地最早可读 LSN，或历史不足到 `upto_lsn`。
+    /// Requested start predates the earliest readable LSN, or history is short.
+    Unavailable { first_available_lsn: u64 },
+    /// 区间内 LSN 不连续。
+    /// EN: Non-contiguous LSNs in the requested range.
+    NonContiguous { got: u64, expect: u64 },
+    /// 段读取/CRC 失败。
+    /// EN: Segment read/CRC failure.
+    Corrupt(String),
+}
+
+impl std::fmt::Display for FingerprintError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Unavailable {
+                first_available_lsn,
+            } => write!(
+                f,
+                "log fingerprint: requested range unavailable (first_available_lsn={first_available_lsn})"
+            ),
+            Self::NonContiguous { got, expect } => write!(
+                f,
+                "log fingerprint: non-contiguous history (got lsn {got}, expect {expect})"
+            ),
+            Self::Corrupt(msg) => write!(f, "log fingerprint: corrupt history: {msg}"),
+        }
+    }
+}
+
+impl std::error::Error for FingerprintError {}
 
 /// 把一条记录混入指纹 / Fold one record into the fingerprint.
 /// EN: Folds one record into the fingerprint.
@@ -83,34 +119,77 @@ pub fn prefix_hash_with_encryption(
     upto_lsn: u64,
     encryption: Option<&crate::encryption::Encryption>,
 ) -> io::Result<u64> {
-    if upto_lsn == 0 {
+    range_hash_with_encryption(path, 0, upto_lsn, encryption).map_err(|e| match e {
+        FingerprintError::NonContiguous { got, expect } => non_contiguous(got, expect),
+        other => io::Error::new(io::ErrorKind::InvalidData, other.to_string()),
+    })
+}
+
+/// 计算 `[from_lsn, upto_lsn)` 的指纹（P5.0.2），跨全部归档段与活动段。
+/// Compute the fingerprint of `[from_lsn, upto_lsn)` across all archive and
+/// active segments (P5.0.2).
+///
+/// 调用方必须保证 `from_lsn` 之后的历史连续；起点早于本地最早可读 LSN 或历史
+/// 不足时返回 [`FingerprintError::Unavailable`]——复制层据此返回 BEHIND_RETAINED，
+/// 而不是拿一个「看起来正常」的哈希继续。
+/// EN: Callers need contiguous history from `from_lsn`; a start below the local
+/// earliest readable LSN (or a short history) returns `Unavailable`, which the
+/// replication layer maps to BEHIND_RETAINED instead of trusting a bogus hash.
+pub fn range_hash_with_encryption(
+    path: &Path,
+    from_lsn: u64,
+    upto_lsn: u64,
+    encryption: Option<&crate::encryption::Encryption>,
+) -> Result<u64, FingerprintError> {
+    if from_lsn >= upto_lsn {
         return Ok(LOG_HASH_SEED);
     }
-    let mut data = Vec::new();
-    std::fs::File::open(path)?.read_to_end(&mut data)?;
-    let (entries, _) = crate::parse_wal_file_entries_with_len(&data, encryption)?;
+    let mut paths = crate::list_archived_segments(path)
+        .map_err(|e| FingerprintError::Corrupt(e.to_string()))?;
+    if path.exists() {
+        paths.push(path.to_path_buf());
+    }
+    let mut entries = Vec::new();
+    for p in &paths {
+        let mut segment = crate::read_records_from_path(p, encryption)
+            .map_err(|e| FingerprintError::Corrupt(e.to_string()))?;
+        entries.append(&mut segment);
+    }
+    entries.sort_by_key(|e| e.lsn);
+    let first_available_lsn = entries.first().map(|e| e.lsn).unwrap_or(0);
+    if from_lsn < first_available_lsn {
+        return Err(FingerprintError::Unavailable {
+            first_available_lsn,
+        });
+    }
     let mut h = LOG_HASH_SEED;
-    let mut next = 0u64;
+    let mut next = from_lsn;
     for entry in &entries {
+        if entry.lsn < from_lsn {
+            continue;
+        }
         if entry.lsn >= upto_lsn {
             if next != upto_lsn {
-                // 边界洞：前缀里缺记录，紧接着的下一条已越过 upto。
-                // EN: Boundary hole: a record is missing and the next one exceeds upto.
-                return Err(non_contiguous(entry.lsn, next));
+                return Err(FingerprintError::NonContiguous {
+                    got: entry.lsn,
+                    expect: next,
+                });
             }
             break;
         }
         if entry.lsn != next {
-            return Err(non_contiguous(entry.lsn, next));
+            return Err(FingerprintError::NonContiguous {
+                got: entry.lsn,
+                expect: next,
+            });
         }
         h = fold(h, entry.lsn, &entry.payload);
         next += 1;
     }
     if next != upto_lsn {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("log fingerprint: history shorter than resume_lsn ({next} < {upto_lsn})"),
-        ));
+        return Err(FingerprintError::Unavailable {
+            first_available_lsn,
+        });
     }
     Ok(h)
 }
@@ -138,16 +217,30 @@ pub async fn prefix_hash_blocking_with_encryption(
     upto_lsn: u64,
     encryption: Option<std::sync::Arc<crate::encryption::Encryption>>,
 ) -> io::Result<u64> {
+    range_hash_blocking_with_encryption(path, 0, upto_lsn, encryption)
+        .await
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))
+}
+
+/// 阻塞池范围指纹（P5.0.2 复制握手入口）。
+/// EN: Blocking-pool range fingerprint (the P5.0.2 replication handshake entry).
+#[cfg(not(loom))]
+pub async fn range_hash_blocking_with_encryption(
+    path: std::path::PathBuf,
+    from_lsn: u64,
+    upto_lsn: u64,
+    encryption: Option<std::sync::Arc<crate::encryption::Encryption>>,
+) -> Result<u64, FingerprintError> {
     let sem = FINGERPRINT_BUDGET.get_or_init(|| tokio::sync::Semaphore::new(64));
     let _permit = sem
         .acquire()
         .await
-        .map_err(|_| io::Error::other("fingerprint budget closed"))?;
+        .map_err(|_| FingerprintError::Corrupt("fingerprint budget closed".to_string()))?;
     tokio::task::spawn_blocking(move || {
-        prefix_hash_with_encryption(&path, upto_lsn, encryption.as_deref())
+        range_hash_with_encryption(&path, from_lsn, upto_lsn, encryption.as_deref())
     })
     .await
-    .map_err(|e| io::Error::other(format!("fingerprint join failed: {e}")))?
+    .map_err(|e| FingerprintError::Corrupt(format!("fingerprint join failed: {e}")))?
 }
 
 #[cfg(test)]
@@ -287,5 +380,44 @@ mod tests {
             "boundary hole must be non-contiguous, got: {err}"
         );
         let _ = std::fs::remove_file(&p);
+    }
+}
+
+#[cfg(test)]
+mod range_tests {
+    use super::*;
+    use crate::{FileWal, Wal};
+
+    /// P5.0.2：范围指纹跨归档段；`from=0` 与旧 prefix 哈希逐字节一致。
+    /// EN: P5.0.2 — range hash spans archives; `from=0` matches the legacy prefix hash.
+    #[test]
+    fn range_hash_spans_rotated_segments() {
+        let path = crate::unique_temp_path("fp-range-rotate", "wal");
+        {
+            let (mut wal, _) = FileWal::open(&path).unwrap();
+            let _ = wal.append(b"a".to_vec());
+            let _ = wal.append(b"b".to_vec());
+            let _ = wal.rotate_archive().unwrap();
+            let _ = wal.append(b"c".to_vec());
+            let _ = wal.append(b"d".to_vec());
+        }
+        let prefix = prefix_hash(&path, 4).unwrap();
+        let whole = range_hash_with_encryption(&path, 0, 4, None).unwrap();
+        assert_eq!(prefix, whole);
+        let tail = range_hash_with_encryption(&path, 2, 4, None).unwrap();
+        assert_ne!(tail, whole);
+        let err = range_hash_with_encryption(&path, 5, 6, None).unwrap_err();
+        match err {
+            FingerprintError::Unavailable {
+                first_available_lsn,
+            } => {
+                assert_eq!(first_available_lsn, 0);
+            }
+            other => panic!("expected Unavailable, got {other:?}"),
+        }
+        let _ = std::fs::remove_file(&path);
+        for p in crate::list_archived_segments(&path).unwrap_or_default() {
+            let _ = std::fs::remove_file(p);
+        }
     }
 }

@@ -1,6 +1,7 @@
 //! IndexBackend：HNSW / ClusteredHnsw / FlatClustered 三种索引后端。
 //! EN: IndexBackend: three index backends — HNSW / ClusteredHnsw / FlatClustered.
 
+use houyi_persistence::collection_snapshot_file::SnapshotVectorKind;
 use houyi_vector::cluster::{ClusterConfig, ClusteredHnsw, FlatClustered, PqFlatClustered};
 use houyi_vector::hii::{HiiL0, HiiL0Config};
 use houyi_vector::{
@@ -42,6 +43,10 @@ pub enum IndexBackend {
     Flat {
         data: BufferedRows,
         dims: usize,
+        /// 计分度量：flat 是暴力扫描，直接按该度量计算距离（不再固定余弦）。
+        /// Scoring metric — flat is brute-force, so distances are computed
+        /// directly under this metric instead of a fixed cosine.
+        metric: DistanceMetric,
     },
     PqFlat {
         buf: BufferedRows,
@@ -59,37 +64,69 @@ pub enum IndexBackend {
 }
 
 impl IndexBackend {
+    /// 旧签名兼容入口：默认 Cosine（历史上服务端所有后端的实际度量）。
+    /// EN: Legacy-compatible entry point: Cosine (the historical effective metric).
     pub fn new_hnsw(dims: usize) -> Self {
-        IndexBackend::Hnsw(Arc::new(HotBufferIndex::new_with_metric(
-            dims,
-            DistanceMetric::Cosine,
-        )))
+        Self::new_hnsw_with_metric(dims, DistanceMetric::Cosine)
+    }
+    pub fn new_hnsw_with_metric(dims: usize, metric: DistanceMetric) -> Self {
+        IndexBackend::Hnsw(Arc::new(HotBufferIndex::new_with_metric(dims, metric)))
     }
     pub fn new_clustered(dims: usize) -> Self {
+        Self::new_clustered_with_metric(dims, DistanceMetric::Cosine)
+    }
+    pub fn new_clustered_with_metric(dims: usize, metric: DistanceMetric) -> Self {
         IndexBackend::Clustered {
             buf: Arc::new(Mutex::new(Vec::new())),
             index: Arc::new(Mutex::new(None)),
             dims,
             built: Arc::new(Mutex::new(false)),
-            metric: DistanceMetric::Cosine,
+            metric,
         }
     }
     pub fn new_flat_clustered(dims: usize) -> Self {
+        Self::new_flat_clustered_with_metric(dims, DistanceMetric::Cosine)
+    }
+    pub fn new_flat_clustered_with_metric(dims: usize, metric: DistanceMetric) -> Self {
         IndexBackend::FlatClustered {
             buf: Arc::new(Mutex::new(Vec::new())),
             index: Arc::new(Mutex::new(None)),
             dims,
             built: Arc::new(Mutex::new(false)),
-            metric: DistanceMetric::Cosine,
+            metric,
         }
     }
     pub fn new_flat(dims: usize) -> Self {
+        Self::new_flat_with_metric(dims, DistanceMetric::Cosine)
+    }
+    pub fn new_flat_with_metric(dims: usize, metric: DistanceMetric) -> Self {
         IndexBackend::Flat {
             data: Arc::new(Mutex::new(Vec::new())),
             dims,
+            metric,
         }
     }
+    /// pq-flat 只支持 L2：内部构建与查表均为平方欧氏，`metric` 形参仅为保持
+    /// 统一构造面；调用方（集合创建/重放）必须先按 [`metric_supported`] 校验。
+    /// EN: pq-flat supports L2 only (training/lookup are squared Euclidean); the
+    /// `metric` parameter just keeps a uniform surface — callers must validate
+    /// via [`metric_supported`] first.
     pub fn new_pq_flat(dims: usize) -> Self {
+        Self::new_pq_flat_with_metric(dims, DistanceMetric::L2)
+    }
+    pub fn new_pq_flat_with_metric(dims: usize, metric: DistanceMetric) -> Self {
+        // 构造期自守不变量：报错型调用面（集合创建）已按 [`metric_supported`]
+        // 校验，这里再断言一次，防止绕过校验的调用方得到一个「按 L2 计分却
+        // 声称别的度量」的后端（OCR #35）。
+        // EN: Enforce the invariant at construction: the validated path already
+        // checks [`metric_supported`]; asserting here prevents a caller that
+        // bypasses validation from getting a backend that scores L2 while claiming
+        // another metric (OCR #35).
+        assert_eq!(
+            metric,
+            DistanceMetric::L2,
+            "pq-flat only supports L2 (got {metric:?})"
+        );
         IndexBackend::PqFlat {
             buf: Arc::new(Mutex::new(Vec::new())),
             index: Arc::new(Mutex::new(None)),
@@ -97,7 +134,20 @@ impl IndexBackend {
             built: Arc::new(Mutex::new(false)),
         }
     }
+    /// hii-l0 只支持 Cosine（写入/查询都做 L2 单位化）；非 Cosine 由调用方拒绝。
+    /// EN: hii-l0 supports Cosine only (writes/queries are L2-normalized); callers
+    /// reject other metrics.
     pub fn new_hii_l0(dims: usize) -> Self {
+        Self::new_hii_l0_with_metric(dims, DistanceMetric::Cosine)
+    }
+    pub fn new_hii_l0_with_metric(dims: usize, metric: DistanceMetric) -> Self {
+        // 与 pq-flat 同理：构造期自守「只接受 Cosine」不变量（OCR #35）。
+        // EN: Same as pq-flat: enforce the Cosine-only invariant at construction (OCR #35).
+        assert_eq!(
+            metric,
+            DistanceMetric::Cosine,
+            "hii-l0 only supports Cosine (got {metric:?})"
+        );
         let config = HiiL0Config {
             dims,
             ..Default::default()
@@ -105,6 +155,26 @@ impl IndexBackend {
         IndexBackend::HiiL0 {
             inner: Arc::new(Mutex::new(HiiL0::new(config))),
             dims,
+        }
+    }
+
+    /// index_type × metric 支持矩阵（集合创建与 WAL/快照恢复共用）。
+    /// pq-flat 仅 L2（PQ 查表恒为平方欧氏）；hii-l0 仅 Cosine（内部单位化）；
+    /// 其余后端支持全部四种度量。
+    /// EN: index_type × metric support matrix shared by creation and replay.
+    /// pq-flat is L2-only (PQ tables are squared Euclidean); hii-l0 is Cosine-only
+    /// (it normalizes internally); every other backend supports all four metrics.
+    pub fn metric_supported(index_type: &str, metric: DistanceMetric) -> Result<(), String> {
+        match index_type {
+            "pq-flat" if metric != DistanceMetric::L2 => Err(format!(
+                "index_type 'pq-flat' supports metric 'l2' only (requested '{}')",
+                metric.as_str()
+            )),
+            "hii-l0" if metric != DistanceMetric::Cosine => Err(format!(
+                "index_type 'hii-l0' supports metric 'cosine' only (requested '{}')",
+                metric.as_str()
+            )),
+            _ => Ok(()),
         }
     }
     /// PqFlat scored 透传：聚类索引自身已返回按距离升序的 (id, dist)；未 build → 空。
@@ -186,25 +256,22 @@ impl IndexBackend {
         }
     }
 
-    /// Flat 暴力 scored 检索：先按 mask 过滤，再按**余弦距离**计分排序。
+    /// Flat 暴力 scored 检索：先按 mask 过滤，再按变体记录的度量计分排序。
     /// EN: Flat brute-force scored search — apply the allow-list mask first, then
-    /// score with cosine distance.
+    /// score by the variant's recorded metric.
     ///
-    /// 为什么从裸 L2² 改成余弦：`distance_metric()` 对 Flat 报告的是 Cosine，
-    /// Collection/HTTP 层统一按余弦把距离换算成 `score = 1 - distance`；旧 flat 用
-    /// `Σ(a-b)²` 排序，在「同向不同模长」向量上会给出与余弦相反的排序，是潜在不一致。
-    /// 与 HotBufferIndex 的 Cosine 路径共用 [`houyi_vector::distance::cosine`]
-    /// （公式内部按范数归一化），因此**存储向量保持原样、仅在计分时归一化**；
-    /// 零向量按余弦约定距离为 1。
-    /// EN: Why cosine instead of raw L2² — `distance_metric()` reports Cosine for
-    /// Flat and the collection/HTTP layers uniformly convert `score = 1 - distance`;
-    /// raw L2² ranks same-direction different-magnitude vectors in the opposite
-    /// order. Shares the same full-cosine formula (norm-normalized internally) as the
-    /// HotBufferIndex Cosine path, so stored vectors are never mutated; zero vectors
-    /// map to distance 1 by the cosine convention.
+    /// 历史背景：旧实现固定余弦，`distance_metric()` 也因此对 Flat 报 Cosine；
+    /// 现在 Flat 直接承载请求度量（Cosine/L2/IP/L1），Cosine 分支与 HotBufferIndex
+    /// 共用同一全余弦公式（内部按范数归一化），**存储向量保持原样**；零向量按
+    /// 余弦约定距离为 1。
+    /// EN: Historic note — the old implementation hard-coded cosine. Flat now carries
+    /// the requested metric (Cosine/L2/IP/L1); the cosine arm shares the full-cosine
+    /// formula (norm-normalized internally) with HotBufferIndex, so stored vectors
+    /// are never mutated; zero vectors map to distance 1 under cosine.
     #[allow(clippy::type_complexity)]
     fn flat_search_scored(
         data: &Mutex<Vec<(u64, Vec<f32>)>>,
+        metric: DistanceMetric,
         q: &[f32],
         k: usize,
         filter: Option<&[VectorId]>,
@@ -223,9 +290,17 @@ impl IndexBackend {
             .iter()
             .filter(|(id, _)| allow.as_ref().is_none_or(|set| set.contains(id)))
             .map(|(id, v)| {
-                // 余弦距离（内部按范数归一化，存储向量不做任何改写）。
-                // Cosine distance (normalized by norm inside; stored vectors untouched).
-                let d: f32 = houyi_vector::distance::cosine(q, v);
+                // 逐度量计分；Cosine 内部按范数归一化，存储向量不做任何改写。
+                // Per-metric scoring; cosine normalizes by norm inside and never
+                // mutates stored vectors.
+                let d: f32 = match metric {
+                    DistanceMetric::Cosine => houyi_vector::distance::cosine(q, v),
+                    DistanceMetric::L2 => houyi_vector::distance::l2_squared(q, v),
+                    DistanceMetric::InnerProduct => {
+                        houyi_vector::distance::inner_product_distance(q, v)
+                    }
+                    DistanceMetric::L1 => houyi_vector::distance::l1_distance(q, v),
+                };
                 (*id, d)
             })
             .collect();
@@ -264,15 +339,17 @@ impl IndexBackend {
     }
 
     /// scored 检索：所有后端统一返回 `(id, 距离)`，按距离升序（越小越近）。
-    /// 距离语义按后端区分：hnsw/clustered/flat-clustered/flat/hii-l0 均为余弦距离
-    /// （HNSW/Clustered 系列构图时即按 Cosine，Flat 计分用全余弦公式，HiiL0 写入即
-    /// 归一化）；**pq-flat 为例外**，返回平方 L2（无 mmap 为 PQ 查表距离和，有
-    /// mmap 为精确 L2² 重排），不是余弦距离。距离→相似度的换算只在 HTTP 边缘做，
-    /// 并由 [`Self::distance_is_cosine`] 告知是否可按 `[-1,1]` 钳制。
+    /// 距离语义 = 各变体 [`Self::distance_metric`] 记录的度量：hnsw/clustered/
+    /// flat-clustered/flat 支持 Cosine/L2/IP/L1；**pq-flat 恒为平方 L2**（PQ 查表
+    /// 距离和 / mmap 精确 L2² 重排）；hii-l0 恒为 Cosine。距离→相似度的换算只在
+    /// HTTP 边缘做，按 [`Self::distance_metric`] 返回的度量逐种换算（仅 Cosine 钳制
+    /// 到 `[-1,1]`；ip 取反为原始内积）。
     /// EN: Scored search across backends: ascending (id, distance), smaller = closer.
-    /// hnsw/clustered/flat-clustered/flat/hii-l0 return cosine distance; pq-flat is the
-    /// explicit exception and returns squared-L2 (PQ table sum / exact L2² rerank).
-    /// The distance→similarity conversion happens only at the HTTP edge.
+    /// The distance semantics are those recorded by [`Self::distance_metric`]:
+    /// hnsw/clustered/flat-clustered/flat support Cosine/L2/IP/L1; pq-flat is always
+    /// squared-L2 (PQ table sum / exact L2² rerank); hii-l0 is always cosine. The
+    /// distance→similarity conversion happens only at the HTTP edge, per metric
+    /// (only Cosine clamps to [-1,1]; ip is negated to the raw inner product).
     #[allow(clippy::type_complexity)]
     pub async fn search_scored_with_ef_override(
         &self,
@@ -289,7 +366,7 @@ impl IndexBackend {
             Self::Hnsw(idx) => idx.search_scored_with_ef_override(q, k, f, ef).await,
             Self::Clustered { index, .. } => Self::search_c_scored(index, q, k),
             Self::FlatClustered { index, .. } => Self::search_fc_scored(index, q, k),
-            Self::Flat { data, .. } => Self::flat_search_scored(data, q, k, f),
+            Self::Flat { data, metric, .. } => Self::flat_search_scored(data, *metric, q, k, f),
             Self::PqFlat { index, .. } => Self::search_pq_scored(index, q, k),
         }
     }
@@ -400,6 +477,12 @@ impl IndexBackend {
         }
     }
 
+    /// 后端类型名（诊断/状态端点用，与 `--index-type` 取值一致）。
+    /// EN: backend kind name for diagnostics; matches `--index-type` values.
+    pub fn index_kind(&self) -> &'static str {
+        self.backend_name()
+    }
+
     pub fn hnsw_m(&self) -> usize {
         match self {
             Self::Hnsw(idx) => idx.hnsw_m(),
@@ -475,6 +558,28 @@ impl IndexBackend {
         }
     }
 
+    /// 共享指针导出（Hnsw 零拷贝主表；其余后端克隆行缓冲）。
+    /// EN: shared-pointer export (Hnsw shares the main table; other backends
+    /// clone their row buffers).
+    pub async fn export_vectors_shared(&self) -> Result<Vec<(u64, Arc<Vec<f32>>)>, String> {
+        match self {
+            Self::Hnsw(idx) => idx.export_vectors_shared().await,
+            _ => {
+                let mut out: Vec<(u64, Arc<Vec<f32>>)> = self
+                    .export_snapshot_vectors()
+                    .await?
+                    .into_iter()
+                    .map(|(id, v)| (id, Arc::new(v)))
+                    .collect();
+                // 非 HNSW 后端按插入顺序返回；导出契约要求 id 升序。
+                // EN: non-HNSW backends return insertion order; the export
+                // contract requires ascending ids.
+                out.sort_by_key(|(id, _)| *id);
+                Ok(out)
+            }
+        }
+    }
+
     pub async fn export_snapshot_vectors(&self) -> Result<Vec<(u64, Vec<f32>)>, String> {
         match self {
             Self::HiiL0 { inner, .. } => Ok(inner.lock().unwrap().export_vectors()),
@@ -524,6 +629,84 @@ impl IndexBackend {
         }
     }
 
+    /// P5.0.2 的 collection WAL 压缩是否支持该后端。
+    /// EN: Whether P5.0.2 collection WAL compaction supports this backend.
+    pub fn supports_collection_snapshot(&self) -> bool {
+        matches!(self, Self::Hnsw(_) | Self::Flat { .. } | Self::HiiL0 { .. })
+    }
+
+    /// 编码 collection 快照向量：HNSW 图字节，Flat/HII L0 原始 f32。
+    /// EN: Encode collection snapshot vectors: HNSW graph bytes, or raw f32 for
+    /// Flat/HII L0.
+    pub async fn encode_collection_snapshot_vectors(
+        &self,
+    ) -> Result<(SnapshotVectorKind, u64, Vec<u8>), String> {
+        match self {
+            Self::Hnsw(idx) => {
+                let bytes = idx.encode_graph_snapshot().await;
+                let count = idx.graph_node_count().await as u64;
+                Ok((SnapshotVectorKind::HnswGraph, count, bytes))
+            }
+            Self::Flat { data, .. } => {
+                let rows = data.lock().unwrap().clone();
+                raw_vectors_payload(&rows)
+            }
+            Self::HiiL0 { inner, .. } => {
+                let rows = inner.lock().unwrap().export_vectors();
+                raw_vectors_payload(&rows)
+            }
+            other => Err(format!(
+                "collection snapshot unsupported for index backend '{}'",
+                other.backend_name()
+            )),
+        }
+    }
+
+    /// 恢复 collection 快照向量：HNSW 图恢复，Flat/HII L0 批量插入并重建。
+    /// EN: Restore collection snapshot vectors: HNSW graph restore, or batch insert
+    /// + rebuild for Flat/HII L0.
+    pub async fn restore_collection_snapshot_vectors(
+        &self,
+        kind: SnapshotVectorKind,
+        count: u64,
+        bytes: &[u8],
+    ) -> Result<(), String> {
+        match kind {
+            SnapshotVectorKind::Empty => {
+                if count != 0 || !bytes.is_empty() {
+                    return Err("empty snapshot vectors require count=0 and no bytes".to_string());
+                }
+                Ok(())
+            }
+            SnapshotVectorKind::HnswGraph => match self.restore_graph_snapshot(bytes).await {
+                Some(Ok(())) => Ok(()),
+                Some(Err(e)) => Err(format!("graph snapshot restore failed: {e}")),
+                None => Err("graph snapshot kind used with non-HNSW backend".to_string()),
+            },
+            SnapshotVectorKind::RawF32 => {
+                let rows = decode_raw_vectors(bytes, count, self.dims())?;
+                self.insert_batch(rows).await?;
+                // HII L0 需要重建小图；Flat 为 no-op。
+                // EN: HII L0 needs a graph rebuild; Flat is a no-op.
+                self.optimize_build().await;
+                Ok(())
+            }
+        }
+    }
+
+    /// 后端维度（快照恢复校验用）。
+    /// EN: Backend dimensions (snapshot restore checks).
+    pub fn dims(&self) -> usize {
+        match self {
+            Self::Hnsw(_) => 0, // HNSW 维度由图快照自带并在 restore 内校验。
+            Self::Clustered { dims, .. }
+            | Self::FlatClustered { dims, .. }
+            | Self::Flat { dims, .. }
+            | Self::PqFlat { dims, .. }
+            | Self::HiiL0 { dims, .. } => *dims,
+        }
+    }
+
     /// 从图快照恢复：仅 `Hnsw` 变体支持（外层 `Some`），失败（结构不符/
     /// 损坏/非空目标）在内层 `Err`，调用方弃用快照全量重放。
     /// EN: Restore from a graph snapshot — `Hnsw` only (outer `Some`); the
@@ -538,23 +721,13 @@ impl IndexBackend {
             _ => None,
         }
     }
-    /// 报告后端的**标称构图度量**（nominal build metric），用于快照头等「按什么度量
-    /// 构建」的元数据场景。
-    /// EN: Reports the backend's *nominal build metric* — metadata for "what metric was
-    /// this index built with" (e.g. snapshot headers).
-    ///
-    /// 重要：本方法的返回值**不保证等于 scored 距离的实际口径**，不能据此决定分数能否
-    /// 钳制到 `[-1, 1]`。唯一的分歧变体是 **pq-flat**：它建表时标称 Cosine（本方法
-    /// 返回 Cosine），但 `search` 实际返回平方 L2 距离（PQ 查表距离和 / 精确 L2² 重排，
-    /// 见 `search_pq_scored` 的已知限制），属于库层 by-design 的口径分离。需要 score
-    /// 语义（余弦 vs L2²）的消费者必须改用 [`Self::distance_is_cosine`]，它对 pq-flat
-    /// 恒为 false。
-    /// EN: The reported metric is NOT guaranteed to match the scored distances' actual
-    /// semantics, so it must not gate score clamping. The sole divergent variant is
-    /// pq-flat: it nominally reports Cosine here, yet `search` returns squared-L2
-    /// distances (PQ table sums / exact L2² rerank — see `search_pq_scored`). Consumers
-    /// that need score semantics (cosine vs L2²) must use [`Self::distance_is_cosine`],
-    /// which is always false for pq-flat.
+    /// 报告后端**实际计分的度量**，用于快照头/状态端点等「按什么度量构建与检索」的
+    /// 元数据场景，也是 HTTP 边缘距离→相似度换算的唯一依据（pq-flat 如实报告 L2，
+    /// HiiL0 报告 Cosine）。
+    /// EN: Reports the metric the backend **actually scores with**, for snapshot
+    /// headers and status endpoints; it is also the sole input to the edge
+    /// distance→similarity conversion (pq-flat truthfully reports L2, HiiL0 reports
+    /// Cosine).
     pub fn distance_metric(&self) -> DistanceMetric {
         match self {
             Self::Hnsw(idx) => idx.distance_metric(),
@@ -562,27 +735,30 @@ impl IndexBackend {
             // Clustered variants report the actual recorded build metric (the library
             // build APIs publicly accept L2).
             Self::Clustered { metric, .. } | Self::FlatClustered { metric, .. } => *metric,
-            // Flat/HiiL0 按余弦计分；PqFlat 建表标称 Cosine（实际 scored 距离为 L2²，
-            // 由 distance_is_cosine 单独显式排除）。
-            // Flat/HiiL0 score with cosine; PqFlat nominally reports Cosine (its scored
-            // distance is L2², excluded explicitly by distance_is_cosine).
-            Self::Flat { .. } | Self::PqFlat { .. } | Self::HiiL0 { .. } => DistanceMetric::Cosine,
+            // Flat 按变体记录度量计分；HiiL0 内部单位化，恒为余弦。
+            // PqFlat 内部恒为平方 L2——现在如实报告 L2（旧实现报名义 Cosine，
+            // 与 scored 距离口径不一致），边缘据此按 `1 - d` 换算，分数数值与旧版
+            // 完全一致（旧版 pq-flat 不钳制）。
+            // EN: Flat scores by its recorded metric; HiiL0 normalizes internally so
+            // it is always cosine. PqFlat is squared-L2 internally and now reports L2
+            // truthfully (the old nominal Cosine disagreed with scored distances);
+            // the edge converts with `1 - d`, numerically identical to the legacy
+            // unclamped pq-flat output.
+            Self::Flat { metric, .. } => *metric,
+            Self::PqFlat { .. } => DistanceMetric::L2,
+            Self::HiiL0 { .. } => DistanceMetric::Cosine,
         }
     }
 
-    /// scored 距离是否为余弦语义：决定 HTTP 边缘 `score = 1 - distance` 能否钳制到
-    /// `[-1, 1]`。pq-flat（平方 L2 重排距离，分数合法越界）恒为 false；HNSW 与
-    /// Clustered/FlatClustered 按构图时的实际度量判定（库层 build 公开接受 L2，
-    /// L2 构图的 scored 距离是 L2²）；Flat/HiiL0 恒为余弦。
-    /// 注意不能只看 [`Self::distance_metric`]——pq-flat 建表时标称 Cosine，
-    /// 但 `search` 实际返回的是 L2²（见 `search_pq_scored` 的已知限制说明）；
-    /// HNSW 看 `HotBufferIndex::new_with_metric` 的实际度量，Clustered 系列看变体
-    /// 记录的构图度量，均不能硬编码为余弦。当前服务器装配只构造 Cosine 索引，L2
-    /// 判定属于库级契约的纵深防御。
-    /// EN: pq-flat reports Cosine at build time yet returns L2² from search, so that
-    /// variant is excluded explicitly; HNSW/Clustered/FlatClustered are decided by their
-    /// actual build metric because the library build APIs publicly accept L2 (server
-    /// assembly constructs Cosine only today).
+    /// scored 距离是否为余弦语义（派生判定，保留给测试与防御性断言）。
+    /// HTTP 边缘的换算已改为直接匹配 [`Self::distance_metric`]（三种度量各自换算）。
+    /// pq-flat（平方 L2 距离，分数合法越界）恒为 false；HNSW、
+    /// Clustered/FlatClustered/Flat 按变体记录的实际度量判定；HiiL0 恒为余弦。
+    /// EN: Derived predicate "are scored distances cosine semantics?" retained for
+    /// tests and defensive assertions. The HTTP edge now converts by matching
+    /// [`Self::distance_metric`] directly. pq-flat (squared L2, legitimately out of
+    /// range) is always false; HNSW/Clustered/FlatClustered/Flat follow their
+    /// recorded metric; HiiL0 is always cosine.
     pub fn distance_is_cosine(&self) -> bool {
         match self {
             // pq-flat 建表标称 Cosine，但 scored search 返回 L2²：必须显式排除。
@@ -599,13 +775,12 @@ impl IndexBackend {
             Self::Clustered { metric, .. } | Self::FlatClustered { metric, .. } => {
                 *metric == DistanceMetric::Cosine
             }
-            // 已知余弦后端正向枚举（WHY: 不用 `_ => true`——未来新增非余弦后端时
-            // 穷尽匹配会在编译期强制显式裁决，杜绝「默认 clamp 改写真实分数」的
-            // fail-open，这正是 pq-flat 这次修掉的 bug 类别）。
-            // EN: Positive enumeration — no catch-all: a future non-cosine backend
-            // fails this exhaustiveness check at compile time instead of silently
-            // getting its out-of-range scores clamped (the pq-flat bug class).
-            Self::Flat { .. } | Self::HiiL0 { .. } => true,
+            // Flat 按记录度量判定（L2/IP/L1 分数都不保证落在 [-1,1]）；
+            // HiiL0 恒余弦。
+            // EN: Flat follows its recorded metric (L2/IP/L1 scores are not bounded
+            // to [-1,1]); HiiL0 is always cosine.
+            Self::Flat { metric, .. } => *metric == DistanceMetric::Cosine,
+            Self::HiiL0 { .. } => true,
         }
     }
 
@@ -741,6 +916,84 @@ impl IndexBackend {
             }
         }
     }
+}
+
+/// 原始 f32 向量段编码：[id u64 BE][dims × f32 BE] 重复 count 次。
+/// EN: Raw f32 vector section: repeated [id u64 BE][dims × f32 BE].
+fn raw_vectors_payload(
+    rows: &[(u64, Vec<f32>)],
+) -> Result<(SnapshotVectorKind, u64, Vec<u8>), String> {
+    if rows.is_empty() {
+        return Ok((SnapshotVectorKind::Empty, 0, Vec::new()));
+    }
+    let dims = rows[0].1.len();
+    if dims == 0 {
+        return Err("collection snapshot: zero-dimension vector".to_string());
+    }
+    let per = 8usize
+        .checked_add(
+            dims.checked_mul(4)
+                .ok_or_else(|| "collection snapshot: dims overflow".to_string())?,
+        )
+        .ok_or_else(|| "collection snapshot: dims overflow".to_string())?;
+    let total = per
+        .checked_mul(rows.len())
+        .ok_or_else(|| "collection snapshot: vector bytes overflow".to_string())?;
+    let mut bytes = Vec::with_capacity(total);
+    for (id, values) in rows {
+        if values.len() != dims {
+            return Err(format!(
+                "collection snapshot: inconsistent dims for id {id} ({} != {dims})",
+                values.len()
+            ));
+        }
+        bytes.extend_from_slice(&id.to_be_bytes());
+        for v in values {
+            bytes.extend_from_slice(&v.to_bits().to_be_bytes());
+        }
+    }
+    Ok((SnapshotVectorKind::RawF32, rows.len() as u64, bytes))
+}
+
+fn decode_raw_vectors(
+    bytes: &[u8],
+    count: u64,
+    dims: usize,
+) -> Result<Vec<(u64, Vec<f32>)>, String> {
+    if dims == 0 {
+        return Err("collection snapshot: zero dimensions".to_string());
+    }
+    let count: usize = count
+        .try_into()
+        .map_err(|_| "collection snapshot: vector count too large".to_string())?;
+    let per = 8usize
+        .checked_add(
+            dims.checked_mul(4)
+                .ok_or_else(|| "collection snapshot: dims overflow".to_string())?,
+        )
+        .ok_or_else(|| "collection snapshot: dims overflow".to_string())?;
+    let expected = per
+        .checked_mul(count)
+        .ok_or_else(|| "collection snapshot: vector bytes overflow".to_string())?;
+    if bytes.len() != expected {
+        return Err(format!(
+            "collection snapshot: raw vector bytes {} != expected {expected}",
+            bytes.len()
+        ));
+    }
+    let mut rows = Vec::with_capacity(count);
+    for chunk in bytes.chunks_exact(per) {
+        let id = u64::from_be_bytes(chunk[..8].try_into().unwrap());
+        let mut values = Vec::with_capacity(dims);
+        for i in 0..dims {
+            let start = 8 + i * 4;
+            values.push(f32::from_bits(u32::from_be_bytes(
+                chunk[start..start + 4].try_into().unwrap(),
+            )));
+        }
+        rows.push((id, values));
+    }
+    Ok(rows)
 }
 
 impl From<Arc<HotBufferIndex>> for IndexBackend {
@@ -885,6 +1138,46 @@ mod tests {
             .search_scored_with_ef_override(&q, 2, Some(&[999]), None)
             .await;
         assert!(empty.is_empty());
+    }
+
+    /// OCR #37：Flat 的 L2/IP/L1 分支必须按各自的原始距离计分且排序方向正确——
+    /// 同一组向量在 L2 与 L1 下顺序不同，可证两个分支没有再共用余弦公式。
+    /// EN: OCR #37 — Flat's L2/IP/L1 arms must score by their own raw distances
+    /// with the right ordering. The same vectors order differently under L2 vs L1,
+    /// proving the arms no longer share the cosine formula.
+    #[tokio::test]
+    async fn flat_scored_l2_ip_l1_use_own_distances() {
+        // q=[1,0]；id=1 的 [5,4]：L2²=32、L1=8、IP=-5；
+        // id=2 的 [1,6]：L2²=36、L1=6、IP=-1。
+        // L2 序 [1,2]，L1 序 [2,1]，IP 序 [1,2]（更负 = 内积更大 = 更近）。
+        // EN: q=[1,0]; id=1 [5,4]: L2²=32, L1=8, IP=-5; id=2 [1,6]: L2²=36,
+        // L1=6, IP=-1. L2 order [1,2], L1 order [2,1], IP order [1,2].
+        let cases = [
+            (DistanceMetric::L2, vec![1_u64, 2], vec![32.0_f32, 36.0]),
+            (DistanceMetric::L1, vec![2, 1], vec![6.0, 8.0]),
+            (DistanceMetric::InnerProduct, vec![1, 2], vec![-5.0, -1.0]),
+        ];
+        for (metric, ids, dists) in cases {
+            let backend = IndexBackend::new_flat_with_metric(2, metric);
+            backend
+                .insert_batch(vec![(1, vec![5.0, 4.0]), (2, vec![1.0, 6.0])])
+                .await
+                .unwrap();
+            let q = vec![1.0, 0.0];
+            let scored = backend
+                .search_scored_with_ef_override(&q, 2, None, None)
+                .await;
+            assert_eq!(scored.len(), 2);
+            let got_ids: Vec<u64> = scored.iter().map(|(id, _)| *id).collect();
+            assert_eq!(got_ids, ids, "{metric:?}: wrong ordering");
+            for ((_, got), want) in scored.iter().zip(dists.iter()) {
+                assert!(
+                    (got - want).abs() < 1e-4,
+                    "{metric:?}: distance {got} != expected {want}"
+                );
+            }
+            assert_eq!(backend.distance_metric(), metric);
+        }
     }
 
     /// HII L0 scored：暴力路径距离升序、精确匹配 ≈ 0、与 id-only 一致。
@@ -1163,5 +1456,58 @@ mod tests {
             "built metric must be L2 (squared-L2 distance > 2), got {}",
             hits[0].1
         );
+    }
+
+    /// P5.0.2：HNSW/Flat/HII L0 的 collection 快照向量 roundtrip；其他后端不支持。
+    /// EN: P5.0.2 — collection-snapshot vector roundtrip for HNSW/Flat/HII L0;
+    /// other backends are unsupported.
+    #[tokio::test]
+    async fn collection_snapshot_vectors_roundtrip_supported_backends() {
+        let rows = vec![
+            (1u64, vec![1.0f32, 0.0, 0.0, 0.0]),
+            (2u64, vec![0.0f32, 1.0, 0.0, 0.0]),
+        ];
+        for backend in [
+            IndexBackend::new_hnsw(4),
+            IndexBackend::new_flat(4),
+            IndexBackend::new_hii_l0(4),
+        ] {
+            assert!(backend.supports_collection_snapshot());
+            backend.insert_batch(rows.clone()).await.unwrap();
+            if matches!(&backend, IndexBackend::Hnsw(_)) {
+                drain_hnsw(&backend).await;
+            }
+            let (kind, count, bytes) = backend.encode_collection_snapshot_vectors().await.unwrap();
+            assert_eq!(count, 2);
+            let restored = match backend {
+                IndexBackend::Hnsw(_) => IndexBackend::new_hnsw(4),
+                IndexBackend::Flat { .. } => IndexBackend::new_flat(4),
+                IndexBackend::HiiL0 { .. } => IndexBackend::new_hii_l0(4),
+                _ => unreachable!(),
+            };
+            restored
+                .restore_collection_snapshot_vectors(kind, count, &bytes)
+                .await
+                .unwrap();
+            if matches!(&restored, IndexBackend::Hnsw(_)) {
+                drain_hnsw(&restored).await;
+            }
+            let hits = restored
+                .search_scored_with_ef_override(&[1.0, 0.0, 0.0, 0.0], 1, None, None)
+                .await;
+            assert_eq!(hits[0].0, 1, "{kind:?} roundtrip must return id 1");
+        }
+
+        for unsupported in [
+            IndexBackend::new_clustered(4),
+            IndexBackend::new_flat_clustered(4),
+            IndexBackend::new_pq_flat(4),
+        ] {
+            assert!(!unsupported.supports_collection_snapshot());
+            assert!(unsupported
+                .encode_collection_snapshot_vectors()
+                .await
+                .is_err());
+        }
     }
 }

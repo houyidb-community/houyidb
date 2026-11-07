@@ -248,11 +248,9 @@ pub fn peek_graph_snapshot_dims_metric(
         return Err(GraphSnapshotError::UnsupportedVersion(version));
     }
     let dims = r.u32()? as usize;
-    let metric = match r.u8()? {
-        0 => DistanceMetric::L2,
-        1 => DistanceMetric::Cosine,
-        b => return Err(GraphSnapshotError::InvalidMetric(b)),
-    };
+    let metric_byte = r.u8()?;
+    let metric = DistanceMetric::from_snapshot_byte(metric_byte)
+        .ok_or(GraphSnapshotError::InvalidMetric(metric_byte))?;
     Ok((dims, metric))
 }
 
@@ -275,10 +273,7 @@ impl HnswGraph {
         w.raw(SNAPSHOT_MAGIC);
         w.u32(SNAPSHOT_VERSION);
         w.u32(self.dims as u32);
-        w.u8(match self.metric {
-            DistanceMetric::L2 => 0,
-            DistanceMetric::Cosine => 1,
-        });
+        w.u8(self.metric.to_snapshot_byte());
         // entry_point 存在性进 flags：u64::MAX 是合法 VectorId，不能当哨兵。
         // EN: entry_point presence goes into flags: u64::MAX is a valid VectorId, not a sentinel.
         w.u8(if self.entry_point.is_some() {
@@ -360,11 +355,9 @@ impl HnswGraph {
             return Err(GraphSnapshotError::UnsupportedVersion(version));
         }
         let dims = r.u32()? as usize;
-        let metric = match r.u8()? {
-            0 => DistanceMetric::L2,
-            1 => DistanceMetric::Cosine,
-            b => return Err(GraphSnapshotError::InvalidMetric(b)),
-        };
+        let metric_byte = r.u8()?;
+        let metric = DistanceMetric::from_snapshot_byte(metric_byte)
+            .ok_or(GraphSnapshotError::InvalidMetric(metric_byte))?;
         let flags = r.u8()?;
         let _reserved = r.u16()?;
         let m = r.u32()? as usize;

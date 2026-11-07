@@ -4,7 +4,11 @@
 
 - collection 在首次 upsert 时隐式创建，维度由首个向量定型；
 - payload 键 ``label`` 为保留列，占用会 400（用顶层 ``label`` 字段）；
-- 检索响应的 ``score`` 是相似度（``1 - cosine_distance``，越大越相似）；
+- 检索响应的 ``score`` 是相似度，按 collection 度量换算（cosine 为
+  ``1 - d`` 且钳制 ``[-1,1]``；l2/l1 为 ``1 - d`` 不钳制；ip 为原始点积），
+  越大越相似；
+- 显式建集合可指定 metric/后端/HNSW 参数；metric 与后端创建后不可变，
+  改参数只能删除重建；
 - ``include_payload=True`` 时响应携带每命中的 label+payload（键为 id 字符串）；
 - delete 按 id 幂等删除，返回真实删除数；
 - collection 的标量页 v1 易失（进程重启后 payload/过滤失效，向量索引不受影响）。
@@ -16,8 +20,11 @@ server contract one-to-one:
   the first vector;
 - the ``label`` payload key is a reserved column; using it returns 400 (use the
   top-level ``label`` field instead);
-- ``score`` in search responses is similarity (``1 - cosine_distance``, larger
-  is more similar);
+- ``score`` in search responses is similarity converted per the collection
+  metric (cosine is ``1 - d`` clamped to ``[-1,1]``; l2/l1 are ``1 - d``
+  unclamped; ip is the raw dot product); larger is more similar;
+- explicit creation can set the metric/backend/HNSW parameters; metric and
+  backend are immutable afterwards, so changing them requires drop-and-recreate;
 - with ``include_payload=True`` each hit carries label+payload (keyed by id
   string);
 - delete is idempotent by id and returns the number actually deleted;
@@ -105,6 +112,19 @@ class Filter:
 
     def to_json(self) -> Dict[str, Any]:
         return {"column": self.column, "op": self.op, "value": self.value}
+
+
+@dataclass(frozen=True)
+class HnswParams:
+    """建集合时的 HNSW 参数三元组（必须三个全给，否则服务端 400）。
+
+    EN: HNSW parameter triple for explicit creation (all three are required or
+    the server returns 400).
+    """
+
+    m: int
+    ef_construction: int
+    ef_search: int
 
 
 @dataclass
@@ -275,6 +295,7 @@ class HouyiClient:
     :param base_url: 服务地址，如 ``http://127.0.0.1:7000``。
     :param timeout: 单次请求超时秒数（连接+读取）。
     :param session: 可选的 ``requests.Session``（连接池复用/自定义适配器）。
+    :param admin_token: 可选管理 token，只附在 ``/v1/admin/*`` 请求上。
 
     EN: HouyiDB client entry point.
 
@@ -282,6 +303,8 @@ class HouyiClient:
     :param timeout: Per-request timeout in seconds (connect + read).
     :param session: Optional ``requests.Session`` (connection pooling/custom
         adapters).
+    :param admin_token: Optional admin token attached only to ``/v1/admin/*``
+        requests.
     """
 
     def __init__(
@@ -290,10 +313,75 @@ class HouyiClient:
         *,
         timeout: float = 30.0,
         session: Optional[requests.Session] = None,
+        admin_token: Optional[str] = None,
     ):
         self._base_url = base_url.rstrip("/")
         self._timeout = timeout
         self._session = session or requests.Session()
+        self._admin_token = admin_token
+
+    def create_collection(
+        self,
+        name: str,
+        dims: int,
+        *,
+        metric: Optional[str] = None,
+        index_type: Optional[str] = None,
+        hnsw: Optional[HnswParams] = None,
+    ) -> Dict[str, Any]:
+        """显式创建 collection（可指定度量/后端/HNSW 参数；需要写权限）。
+
+        与隐式创建（首次 upsert）不同，dims、metric、后端与 HNSW 参数在这里
+        一次定型并由服务端回显；metric 与后端创建后不可变，改参数只能删除
+        重建。普通写路径不带管理 token；同名已存在抛 ``HouyiError(409)``、
+        参数非法 400、follower/只读 503。
+
+        EN: Explicitly create a collection (metric/backend/HNSW parameters are
+        settable; requires write permission). Unlike implicit creation (first
+        upsert), dims, metric, backend and HNSW parameters are fixed here and
+        echoed back; metric and backend are immutable afterwards, so changing
+        them requires drop-and-recreate. This is the normal write path without
+        the admin token; an existing name raises ``HouyiError(409)``, invalid
+        parameters 400, and followers/read-only nodes 503.
+        """
+        # dims 一旦建集合就不可变（只能删除重建），因此绝不做 int() 截断：
+        # 3.9→3、True→1 都会把调用方笔误固化成永久错误的维度。这里与
+        # bool 显式区分（bool 是 int 子类）并在本地 fail-fast（OCR #12）。
+        # EN: dims is immutable once the collection exists (only drop-and-recreate
+        # can change it), so never truncate via int(): 3.9 -> 3 or True -> 1 would
+        # fossilize a caller typo into a permanently wrong dimension. Distinguish
+        # bool explicitly (bool is an int subclass) and fail fast locally (OCR #12).
+        if not isinstance(dims, int) or isinstance(dims, bool) or dims <= 0:
+            raise ValueError(f"dims must be a positive int (got {dims!r})")
+        payload: Dict[str, Any] = {"dims": dims}
+        if metric is not None:
+            payload["metric"] = metric
+        if index_type is not None:
+            payload["index_type"] = index_type
+        if hnsw is not None:
+            payload["hnsw_m"] = hnsw.m
+            payload["hnsw_ef_construction"] = hnsw.ef_construction
+            payload["hnsw_ef_search"] = hnsw.ef_search
+        return self._put(f"/v1/collections/{quote(name, safe='')}", payload)
+
+    def delete_collection(self, name: str) -> None:
+        """删除整个 collection（不可逆；需要 admin 权限）。
+
+        服务端 WAL-first：记录先落盘，崩溃重放与 follower 复制都收敛到
+        「已删除」；不存在或已删除的 collection 抛 ``HouyiError(404)``。
+
+        EN: Drop an entire collection (irreversible; admin permission required).
+        The server is WAL-first, so crash replay and follower replication
+        converge to "gone"; unknown/already-dropped collections raise
+        ``HouyiError(404)``.
+        """
+        path = f"/v1/admin/collections/{quote(name, safe='')}"
+        resp = self._session.delete(
+            f"{self._base_url}{path}",
+            timeout=self._timeout,
+            headers=self._admin_headers(),
+        )
+        self._checked(resp)
 
     def collection(self, name: str) -> Collection:
         return Collection(self, name)
@@ -323,8 +411,23 @@ class HouyiClient:
         resp = self._session.get(f"{self._base_url}{path}", timeout=self._timeout)
         return self._checked(resp)
 
+    def _admin_headers(self) -> Dict[str, str]:
+        """管理请求的 Authorization 头；未配置 token 时返回空表。
+
+        EN: Authorization header for admin requests; empty when no token is set.
+        """
+        if self._admin_token:
+            return {"Authorization": f"Bearer {self._admin_token}"}
+        return {}
+
     def _post(self, path: str, payload: Mapping[str, Any]) -> Any:
         resp = self._session.post(
+            f"{self._base_url}{path}", json=payload, timeout=self._timeout
+        )
+        return self._checked(resp)
+
+    def _put(self, path: str, payload: Mapping[str, Any]) -> Any:
+        resp = self._session.put(
             f"{self._base_url}{path}", json=payload, timeout=self._timeout
         )
         return self._checked(resp)

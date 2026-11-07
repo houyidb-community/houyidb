@@ -146,4 +146,30 @@ describe("integration", () => {
       /ids or filters/,
     );
   });
+
+  it("drops a collection and recreates it empty", async () => {
+    const name = "ts_it_admin_drop";
+    const col = client.collection(name);
+    await col.upsert([{ id: 7, values: fakeEmbed("drop me"), payload: { tag: "drop" } }]);
+
+    await client.deleteCollection(name);
+
+    await expect(col.status()).rejects.toMatchObject({
+      name: "HouyiError",
+      statusCode: 404,
+    });
+
+    // 同名重建：首次写入隐式创建，旧向量不得复活。
+    // EN: recreate by name: the first write implicitly creates it and the old
+    // vectors must not reappear.
+    await col.upsert([{ id: 8, values: fakeEmbed("fresh") }]);
+    await waitFlushed(client, name);
+    expect((await col.status()).indexed_count).toBe(1);
+  });
+
+  it("returns 404 when dropping an unknown collection", async () => {
+    await expect(
+      client.deleteCollection("ts_it_admin_never_created"),
+    ).rejects.toMatchObject({ name: "HouyiError", statusCode: 404 });
+  });
 });

@@ -53,6 +53,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     seed_repl()?;
     seed_pgwire()?;
     seed_graph()?;
+    seed_collection_snapshot()?;
     println!(
         "语料种子已写入 {}",
         Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -194,12 +195,15 @@ fn seed_repl() -> Result<(), Box<dyn std::error::Error>> {
         42,
         proto::STREAM_MASK_COLLECTIONS,
         0xDEAD_BEEF_CAFE_F00D,
+        0,
+        0,
+        [7u8; 16],
         "seed-token",
     )?);
     write_seed(&dir, "handshake", &seed)?;
 
     let mut seed = prefix(0, 0);
-    seed.extend_from_slice(&proto::encode_welcome(43));
+    seed.extend_from_slice(&proto::encode_welcome(43, 0));
     write_seed(&dir, "welcome", &seed)?;
 
     let mut seed = prefix(0, 0);
@@ -330,5 +334,76 @@ fn seed_graph() -> Result<(), Box<dyn std::error::Error>> {
         "envelope_tombstones",
         &encode_graph_snapshot_file(42, &with_tombstones),
     )?;
+    Ok(())
+}
+
+/// 目标 5：真实 collections 快照 payload + manifest 各一份（P5.0.5）。
+/// EN: Target 5: one real collections snapshot payload and manifest (P5.0.5).
+fn seed_collection_snapshot() -> Result<(), Box<dyn std::error::Error>> {
+    use houyi_persistence::collection_snapshot_file::{
+        encode_collection_manifest, encode_collection_snapshot_payload, CollectionManifest,
+        CollectionManifestEntry, CollectionSnapshotPayload, SnapshotScalar, SnapshotScalarRow,
+        SnapshotVectorKind,
+    };
+
+    let dir = corpus_dir("collection_snapshot_decode");
+    let payload = CollectionSnapshotPayload {
+        checkpoint_lsn: 7,
+        name: "docs".to_string(),
+        dims: 4,
+        index_type: "hnsw".to_string(),
+        ha_level: 1,
+        metric: Some(1),
+        hnsw: Some(houyi_persistence::collection_snapshot_file::SnapshotHnswParams {
+            m: 24,
+            ef_construction: 400,
+            ef_search: 256,
+        }),
+        vector_kind: SnapshotVectorKind::Empty,
+        vector_count: 0,
+        vector_bytes: Vec::new(),
+        scalars: vec![
+            SnapshotScalarRow {
+                id: 1,
+                columns: vec![
+                    ("flag".to_string(), SnapshotScalar::Bool(true)),
+                    ("g".to_string(), SnapshotScalar::I64(2)),
+                    ("label".to_string(), SnapshotScalar::Text("label_1p".to_string())),
+                    ("payload".to_string(), SnapshotScalar::JsonText("{\"g\":2}".to_string())),
+                    ("score".to_string(), SnapshotScalar::F64(0.5)),
+                    ("ts".to_string(), SnapshotScalar::Timestamp(1_700_000_000)),
+                ],
+            },
+            SnapshotScalarRow {
+                id: 2,
+                columns: vec![("g".to_string(), SnapshotScalar::I64(0))],
+            },
+        ],
+        tombstones: vec![3, 9],
+    };
+    write_seed(&dir, "payload.bin", &encode_collection_snapshot_payload(&payload)?)?;
+
+    let manifest = CollectionManifest {
+        format_version: 1,
+        manifest_seq: 1,
+        created_at_unix: 1_700_000_000,
+        global_barrier_lsn: 9,
+        safe_checkpoint_lsn: 7,
+        collections: vec![CollectionManifestEntry {
+            name: "docs".to_string(),
+            checkpoint_lsn: 7,
+            dims: 4,
+            index_type: "hnsw".to_string(),
+            ha_level: 1,
+            metric: Some(1),
+            vector_kind: SnapshotVectorKind::Empty as u8,
+            file: "docs.collection_snapshot.7.1.0.bin".to_string(),
+            file_len: 128,
+            payload_crc32: 0x1234_5678,
+            vector_count: 0,
+            scalar_rows: 2,
+        }],
+    };
+    write_seed(&dir, "manifest.bin", &encode_collection_manifest(&manifest)?)?;
     Ok(())
 }

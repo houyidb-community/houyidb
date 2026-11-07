@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { stableId, toVectorId } from "../src/index.js";
+import { SearchResult, stableId, toVectorId } from "../src/index.js";
 import { parseSearchResponse, stringify } from "../src/json.js";
 
 /**
@@ -58,10 +58,25 @@ describe("bigint-safe json", () => {
     // nearby even number.
     const raw =
       '{"ids":[2861735919082615933,42],"scores":[0.99,0.5],' +
-      '"payloads":{"2861735919082615933":{"text":"x"}}}';
+      '"payloads":{"2861735919082615933":{"text":"x"}},"metric":"ip"}';
     const body = parseSearchResponse(raw);
     expect(String(body.ids![0])).toBe("2861735919082615933");
     expect(BigInt(body.ids![0])).toBe(2861735919082615933n);
     expect(body.ids![1]).toBe(42); // 小 id 保持 number EN: small ids stay numbers
+    // 度量回显必须一路带到 SearchResult，调用方才能解释越界分数（OCR #30）。
+    // EN: The echoed metric must reach SearchResult so callers can interpret
+    // out-of-range scores (OCR #30).
+    expect(body.metric).toBe("ip");
+
+    // 契约必须端到端验证到公开类型 SearchResult，而不只是内部解析函数：
+    // 回显 metric 与 benchmark 省略 metric 两条分支都要有断言（OCR 195e6be #00）。
+    // EN: The contract must be verified end-to-end on the public SearchResult type,
+    // not only on the internal parser: assert both the echoed-metric branch and
+    // the benchmark/omitted branch (OCR 195e6be #00).
+    const result = SearchResult.fromRawJson(raw);
+    expect(result.metric).toBe("ip");
+    expect(result.hits[0]?.id).toBe(2861735919082615933n);
+    const noMetric = SearchResult.fromRawJson('{"ids":[42],"scores":[0.5]}');
+    expect(noMetric.metric).toBeUndefined();
   });
 });

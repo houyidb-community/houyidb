@@ -8,7 +8,7 @@
     <LangVersion>latest</LangVersion>
 
     <PackageId>HouyiDb</PackageId>
-    <Version>0.2.0-beta.5</Version>
+    <Version>0.2.0-beta.8</Version>
     <RepositoryUrl>https://github.com/houyidb-community/houyidb</RepositoryUrl>
     <RepositoryType>git</RepositoryType>
     <PackageProjectUrl>https://github.com/houyidb-community/houyidb</PackageProjectUrl>

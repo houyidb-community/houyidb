@@ -155,17 +155,17 @@ gradle publishAllPublicationsToLocalBuildRepository
 Go 没有中心化包上传；发布后打子模块 tag：
 
 ```bash
-git tag sdk/go/houyidb/v0.2.0-beta.5
-git push origin sdk/go/houyidb/v0.2.0-beta.5
+git tag sdk/go/houyidb/v0.2.0-beta.8
+git push origin sdk/go/houyidb/v0.2.0-beta.8
 ```
 
 用户使用：
 
 ```bash
-go get github.com/houyidb-community/houyidb/sdk/go/houyidb@v0.2.0-beta.5
+go get github.com/houyidb-community/houyidb/sdk/go/houyidb@v0.2.0-beta.8
 ```
 
-> 仓库根 tag `v0.2.0-beta.5` 不会自动成为子模块版本；必须使用
+> 仓库根 tag `v0.2.0-beta.8` 不会自动成为子模块版本；必须使用
 > `sdk/go/houyidb/vX.Y.Z` 形式。
 
 ## 8. 发布后验证
@@ -189,7 +189,7 @@ npm install houyidb
 
 - Token 只放 GitHub Secrets 或本机环境变量，绝不进入仓库、日志或截图；
 - 所有平台开启 2FA；Token 最小权限、定期轮换；
-- 发布前确认版本号一致：Python `0.2.0b5`、npm/Java/.NET/Rust
-  `0.2.0-beta.5`、Go tag `v0.2.0-beta.5`；
+- 发布前确认版本号一致：Python `0.2.0b8`、npm/Java/.NET/Rust
+  `0.2.0-beta.8`、Go tag `v0.2.0-beta.8`；
 - 发布是不可逆动作，执行前先 `./scripts/package_sdks.sh` 并检查
   `dist/sdk/` 内容。

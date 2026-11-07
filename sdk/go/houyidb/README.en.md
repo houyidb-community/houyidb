@@ -31,7 +31,7 @@ func main() {
         Payload: map[string]interface{}{"text": "...", "category": "fruit"},
     }})
 
-    // Search (Score is similarity; higher means more similar)
+    // Search (scores are metric-derived; higher means more similar — see "Explicit Creation" below)
     result, _ := col.Search(ctx, queryEmbedding, 5,
         &houyidb.SearchOptions{IncludePayload: true})
 
@@ -44,6 +44,43 @@ func main() {
 
     // Delete (by id and/or filter conditions, idempotent)
     _, _ = col.Delete(ctx, &houyidb.DeleteOptions{IDs: []uint64{houyidb.StableID("doc-1")}})
+}
+```
+
+## Explicit Creation (Dims/Metric/Backend/HNSW Fixed Up Front)
+
+`PUT /v1/collections/{name}` is a normal write path (write permission, no admin
+token). Explicit creation locks dimensionality and metric: an existing name
+yields 409, and metric/backend are immutable afterwards. Zero-value options
+equal server defaults (`cosine` + `hnsw`).
+
+```go
+created, err := client.CreateCollection(ctx, "docs", 768, &houyidb.CreateCollectionOptions{
+    Metric:    "ip",   // l2 / cosine / ip / l1
+    IndexType: "hnsw", // hnsw / flat / clustered / flat-clustered / pq-flat / hii-l0
+    Hnsw:      &houyidb.HnswConfig{M: 16, EFConstruction: 100, EFSearch: 64},
+})
+// created.Metric == "ip"; created.Hnsw echoes the effective HNSW parameters
+```
+
+Metric support matrix: `hnsw` / `flat` / `clustered` / `flat-clustered`
+support all four; `pq-flat` supports `l2` only; `hii-l0` supports `cosine`
+only.
+
+Search scores are metric-derived (higher means more similar): `cosine` →
+`1 - distance` in [-1, 1]; `l2` / `l1` → `1 - distance` (unclamped); `ip` →
+the raw dot product.
+
+## Admin Operation: Dropping a Whole Collection (Irreversible)
+
+Requires server admin permission (RBAC `Action::Admin`). WAL-first, so crash
+replay and follower replication converge to "gone". **Irreversible**; export
+first. A same-name recreate starts empty and never resurrects old vectors.
+
+```go
+client := houyidb.NewClient(url, houyidb.WithAdminToken(adminToken))
+if err := client.DeleteCollection(ctx, "docs"); err != nil {
+    // unknown → *houyidb.HouyiError with StatusCode == 404
 }
 ```
 
