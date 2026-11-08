@@ -31,7 +31,7 @@ no build-time or runtime dependency on it.
 
 Unless a file explicitly states otherwise, contributions accepted into this
 repository are licensed under Apache-2.0. Contributors must sign
-[`CLA.md`](CLA.md) so the project can also use the contribution in the
+[`CLA.en.md`](CLA.en.md) so the project can also use the contribution in the
 commercial edition. This is the standard dual-licensing CLA model; it does not
 transfer copyright ownership.
 
@@ -45,10 +45,10 @@ adding dependencies.
 ## 5. Trademarks
 
 The Apache-2.0 license does not grant trademark rights. See
-[`TRADEMARK.md`](TRADEMARK.md) for the HouyiDB name and logo policy.
+[`TRADEMARK.en.md`](TRADEMARK.en.md) for the HouyiDB name and logo policy.
 
 ## 6. Questions
 
 For commercial licensing, enterprise evaluation, or relicensing requests,
-contact the maintainers (see `CONTRIBUTING.md`). This document is a summary,
+contact the maintainers (see `CONTRIBUTING.en.md`). This document is a summary,
 not legal advice; the signed agreements and `LICENSE` control.

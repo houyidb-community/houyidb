@@ -49,7 +49,7 @@ the community in public spaces.
 
 Report abusive, harassing, or otherwise unacceptable behavior confidentially to
 the maintainers through the private reporting channel described in
-[`SECURITY.md`](SECURITY.md) (mark the report as a conduct issue). All
+[`SECURITY.en.md`](SECURITY.en.md) (mark the report as a conduct issue). All
 complaints will be reviewed and investigated promptly and fairly. Maintainers
 are obligated to respect the privacy and security of the reporter.
 

@@ -61,8 +61,9 @@ against systems you do not own or have permission to test.
 
 ## Security features and verification
 
-- See [`docs/ENTERPRISE_READINESS.md`](docs/ENTERPRISE_READINESS.md) for the
-  control matrix and current evidence.
+- For security configuration and deployment boundaries, see the
+  [Deployment Guide](docs/DEPLOYMENT_GUIDE.en.md); for incident handling, see the
+  [Alert Runbooks](docs/runbooks/README.en.md).
 - Run `./scripts/security_audit.sh` for cargo audit/deny/SBOM locally.
 - Audit chain verification:
   `GET /v1/admin/audit/verify` (Admin token required).

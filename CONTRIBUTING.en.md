@@ -3,11 +3,11 @@
 > [中文](CONTRIBUTING.md)
 
 Thank you for your interest in contributing. HouyiDB is an open-core project: this repository (the community edition) is licensed under Apache-2.0, and enterprise capabilities are developed in a separate private repository. Before submitting a contribution, please read
-[`LICENSING.md`](LICENSING.md).
+[`LICENSING.en.md`](LICENSING.en.md).
 
 ## 1. Contributor License Agreement (CLA)
 
-All external contributions must first sign [`CLA.md`](CLA.md) (individuals; employed contributors require company authorization).
+All external contributions must first sign [`CLA.en.md`](CLA.en.md) (individuals; employed contributors require company authorization).
 Current process: state the following in the PR description
 
 > I have read the CLA Document and I hereby sign the CLA.
@@ -44,7 +44,7 @@ unit/integration tests and the reproducible benchmark adapter.
   stating the motivation and impact scope; performance changes must include measurement data.
 - One PR focuses on one thing; do not reorder unrelated code along the way.
 - Historical bugs must be covered by regression tests; performance gates and correctness gates must not be bypassed.
-- For security vulnerabilities, do **not** open a public issue; see [`SECURITY.md`](SECURITY.md).
+- For security vulnerabilities, do **not** open a public issue; see [`SECURITY.en.md`](SECURITY.en.md).
 
 ## 4. Boundary Discipline (Important)
 
@@ -62,4 +62,4 @@ unit/integration tests and the reproducible benchmark adapter.
 
 ## 6. Code of Conduct
 
-By participating in this project, you agree to [`CODE_OF_CONDUCT.md`](CODE_OF_CONDUCT.md).
+By participating in this project, you agree to [`CODE_OF_CONDUCT.en.md`](CODE_OF_CONDUCT.en.md).

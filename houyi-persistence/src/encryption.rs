@@ -20,9 +20,10 @@
 //! EN: keyring file lines `id=hex`, optional `active=id`; ids are at most 16
 //! printable ASCII chars. Keys are zeroized on drop and redacted in Debug.
 //!
-//! 限制 / Limits: v1 不做在线批量重加密、外部 KMS SDK、国密/FIPS；这些通过
-//! 同一 trait/格式演进（见 docs/ENTERPRISE_READINESS.md）。
+//! 限制 / Limits: v1 不做在线批量重加密、外部 KMS SDK、国密/FIPS。
+//! 部署与密钥备份见 docs/DEPLOYMENT_GUIDE.md。
 //! EN: no online bulk re-encryption, external KMS SDKs, or SM4/FIPS in v1.
+//! See docs/DEPLOYMENT_GUIDE.en.md for deployment and key backups.
 
 use std::collections::HashMap;
 use std::io;

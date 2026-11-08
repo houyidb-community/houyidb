@@ -38,7 +38,7 @@ helm install houyi-follower ./deploy/helm/houyidb -n houyidb \
   --set replication.leaderAddr=houyi-leader-houyidb.houyidb.svc:9876 \
   --set replication.authTokenSecret=houyi-replication
 
-# Trigger a manual promote (see the risk boundaries in docs/runbooks/replication-divergence.md)
+# Trigger a manual promote (see the risk boundaries in docs/runbooks/replication-divergence.en.md)
 kubectl -n houyidb exec houyi-follower-houyidb-0 -- \
   curl -fsS -X POST http://127.0.0.1:7000/v1/admin/promote
 ```

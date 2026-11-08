@@ -14,7 +14,7 @@
 |------|-------|
 | Machine | Apple Silicon (arm64), 8 cores, 16GB RAM, macOS, AC power |
 | Version | v0.2.0-beta.5 candidate builds (tables come from different dates; see labels) |
-| Tool | VectorDBBench; method and parameters in `VDBBENCH_PROTOCOL.md` |
+| Tool | VectorDBBench; method and parameters in `VDBBENCH_PROTOCOL.en.md` |
 | Shared parameters | Non-streaming: k=10, m=24, ef_construction=400, COSINE, load_concurrency=8 |
 | Query concurrency | 1 / 8 / 16, 30s each; ef_search swept per scenario |
 | Build tuning | `PARALLEL_BATCH_BUILD=1`, `MAX_BUILD_BATCH=8192`, `SEED_SERIAL_POINTS=256` |
@@ -134,7 +134,7 @@ for bulk loading (Cohere 1M: 1170s vs 1055s); set
 ## 7. Reproduce
 
 ```bash
-# Method and parameters: VDBBENCH_PROTOCOL.md. This repository publishes no
+# Method and parameters: VDBBENCH_PROTOCOL.en.md. This repository publishes no
 # third-party comparison data.
 export VDB_ROOT=/path/to/VectorDBBench
 python3 benchmarks/vectordb_bench_houyidb/install.py --vdb-root "$VDB_ROOT"

@@ -30,7 +30,7 @@ curl -fsS http://127.0.0.1:17000/metrics | grep houyidb_replication_
 2. Fix the root cause: expand the disk/clean up safely deletable archives, fix read-only mounts/permissions, handle EIO.
 3. After the root cause is eliminated, **restart the node** (the poisoned state is cleared only on reopen). Before restarting, copy the log file for the
    damaged window to the incident directory for reference.
-4. If it is poisoned again immediately after restart: stop trying and switch to [replication-divergence.md](replication-divergence.md)
+4. If it is poisoned again immediately after restart: stop trying and switch to [replication-divergence.en.md](replication-divergence.en.md)
    to evaluate rebuilding from a replica; do not let both nodes run in a degraded state.
 
 ## Recovery Verification

@@ -55,6 +55,6 @@ HouyiDB 目前处于 beta 阶段（`0.2.x`）。安全修复面向 `main` 上的
 
 ## 安全特性与验证（Security features and verification）
 
-- 控制矩阵与当前证据见 [`docs/ENTERPRISE_READINESS.md`](docs/ENTERPRISE_READINESS.md)。
+- 安全配置与部署边界见[部署指南](docs/DEPLOYMENT_GUIDE.md)；故障处理见[告警 Runbooks](docs/runbooks/README.md)。
 - 在本地运行 `./scripts/security_audit.sh` 可执行 cargo audit/deny/SBOM。
 - 审计链验证：`GET /v1/admin/audit/verify`（需要 Admin 令牌）。

@@ -11,6 +11,12 @@
   id 却回读出 blue payload，重启后同样复现。过滤、按条件删除与 payload 回读
   现在统一为 last-wins 口径；压实只回收物理行，不改变查询结果。
 
+### Changed
+- **英文文档导航修正**：英文文档中的互链统一指向 `.en.md` 目标，
+  `SECURITY(.en).md` 的安全验证入口改指部署指南与告警 Runbooks（原
+  `docs/ENTERPRISE_READINESS.md` 不在公共快照内）；修正失效的相对引用。
+  （信用 @Aqiu16717，公共 PR #4）
+
 ## v0.2.0-beta.8 (2026-11-07)
 
 ### Added

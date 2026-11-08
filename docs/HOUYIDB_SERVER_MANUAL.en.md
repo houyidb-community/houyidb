@@ -5,7 +5,7 @@
 > A single-node, memory-first vector database — server manual.  
 > Supports both the pgwire / HTTP protocols and multiple switchable index backends; for
 > production deployment, authentication, TLS, encryption at rest, and primary/standby
-> configuration, see `docs/DEPLOYMENT_GUIDE.md`.
+> configuration, see `docs/DEPLOYMENT_GUIDE.en.md`.
 
 ---
 
