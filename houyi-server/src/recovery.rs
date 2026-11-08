@@ -2808,4 +2808,60 @@ mod tests {
         );
         let _ = std::fs::remove_file(&path);
     }
+
+    /// 回归（公共 issue #6）：重启重放同 id 的多次 upsert 后，过滤只看最后一行——
+    /// 旧 payload 不得命中，最新 payload 正常命中（重启不改变 last-wins 语义）。
+    /// EN: Regression (public issue #6): after replaying multiple upserts of the same
+    /// id, filtering sees only the last row — the old payload must not match and the
+    /// latest payload must (restart preserves the last-wins semantics).
+    #[tokio::test]
+    async fn collections_wal_replay_filter_sees_last_row_per_id() {
+        let path = unique_wal_path("collections-filter-lastwins");
+        let _ = std::fs::remove_file(&path);
+        {
+            let (mut wal, _) = FileWal::open(&path).unwrap();
+            let old = vec![wal_item(
+                1,
+                vec![1.0, 0.0, 0.0, 0.0],
+                None,
+                Some(serde_json::json!({"color": "red"})),
+            )];
+            wal.append(encode_collection_upsert_batch("docs", 4, &old).unwrap());
+            let new = vec![wal_item(
+                1,
+                vec![1.0, 0.0, 0.0, 0.0],
+                None,
+                Some(serde_json::json!({"color": "blue"})),
+            )];
+            wal.append(encode_collection_upsert_batch("docs", 4, &new).unwrap());
+        }
+        let (_wal, entries) = FileWal::open(&path).unwrap();
+        let manager = crate::collection::CollectionManager::new(4, "flat");
+        replay_collections_wal_into_manager(&entries, &manager, &HashMap::new())
+            .await
+            .unwrap();
+        let col = manager.get("docs").unwrap();
+        let scalars = col.scalars.lock().unwrap();
+        let payloads = scalars.payloads_for(&[1]);
+        assert_eq!(
+            payloads.get(&1).expect("payload").get("color"),
+            Some(&houyi_core::ScalarValue::Text("blue".to_string())),
+            "latest row wins on read-back"
+        );
+        let red = scalars.matching_ids(
+            "color",
+            &houyi_core::ScalarPredicate::Eq(houyi_core::ScalarValue::Text("red".to_string())),
+        );
+        assert!(
+            red.is_empty(),
+            "superseded payload must not match after replay: {red:?}"
+        );
+        let blue = scalars.matching_ids(
+            "color",
+            &houyi_core::ScalarPredicate::Eq(houyi_core::ScalarValue::Text("blue".to_string())),
+        );
+        assert_eq!(blue, vec![1], "latest payload must match after replay");
+        drop(scalars);
+        let _ = std::fs::remove_file(&path);
+    }
 }

@@ -2,6 +2,15 @@
 
 > [English](CHANGELOG.en.md)
 
+## Unreleased
+
+### Fixed
+- **payload 过滤只看每个 id 的最后一行**（公共 issue #6）：重复 upsert 同一 id
+  后，旧 payload 不再参与过滤。修复前 append-only 页里的旧行仍会命中——先写
+  `{"color":"red"}` 再改写为 `{"color":"blue"}` 后，过滤 `color=red` 会返回该
+  id 却回读出 blue payload，重启后同样复现。过滤、按条件删除与 payload 回读
+  现在统一为 last-wins 口径；压实只回收物理行，不改变查询结果。
+
 ## v0.2.0-beta.8 (2026-11-07)
 
 ### Added

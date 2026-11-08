@@ -481,10 +481,12 @@ HOUYI_TRIAL_HTTP_ADDR=0.0.0.0:17000 \
   the full resync in `docs/runbooks/collections-retention-resync.md`; it never
   wipes itself. Replication protocol v8 is not rolling-compatible across
   versions, so upgrade all replicas together (see the server manual).
-- Scalar pages are checked every 10 minutes and compacted when at least 50% of
-  rows are stale; after compaction a filter matches only the last row per id
-  (previously stale rows could match too). clustered / flat-clustered / pq-flat
-  do not support snapshot compaction yet.
+- Scalar pages are append-only: re-upserting the same id appends a new row, and
+  both filtering and payload read-back only see the last row per id (stale
+  values stop matching as soon as they are overwritten). A check runs every
+  10 minutes and compacts when at least 50% of rows are stale, reclaiming
+  physical rows without changing query results. clustered / flat-clustered /
+  pq-flat do not support snapshot compaction yet.
 - Array/object values in payload are treated as JSON text columns, so filtering
   semantics are limited.
 - Backend/metric support matrix: hnsw / flat / clustered / flat-clustered

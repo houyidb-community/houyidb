@@ -97,12 +97,15 @@ pub struct ScalarCompactionResult {
 ///
 /// 追加写（append-only）+ 内存压实（P5.0.1）：重复 upsert 同一 id 先追加新行；
 /// 默认每 10 分钟按 stale 比例压实，只保留每个 id 的最后一行并丢弃墓碑行。
-/// 压实时过滤语义从「旧值仍命中」修正为「只看最后一行」；压实不写 WAL，重启后
-/// 由 WAL/快照恢复，随后周期任务再次压实。
+/// 过滤与 payload 回读一律只看最后一行（旧行是已被覆盖的旧值，从写入起即失效）；
+/// 压实只是回收物理行，不改变查询语义。压实不写 WAL，重启后由 WAL/快照恢复，
+/// 随后周期任务再次压实。
 /// EN: Append-only with in-memory compaction (P5.0.1): a re-upsert appends a new
 /// row; the default 10-minute task compacts by stale ratio, keeping only the last
-/// row per id and dropping tombstoned rows. Compaction fixes stale-value filter
-/// matches; it writes no WAL, so restart restores from WAL/snapshots and the
+/// row per id and dropping tombstoned rows. Filtering and payload read-back only
+/// see the last row — stale rows are superseded values and stay invisible from the
+/// write on; compaction merely reclaims physical rows and never changes query
+/// semantics. It writes no WAL, so restart restores from WAL/snapshots and the
 /// periodic task compacts again.
 pub struct CollectionScalars {
     /// 字段私有：页行与 `row_to_id` 的 1:1 对齐是结构性不变量，
@@ -113,6 +116,17 @@ pub struct CollectionScalars {
     /// 第 i 项 = PAX 页第 i 行对应的向量 id；与页内行一一对应。
     /// Entry i = vector id backing page row i; aligned 1:1 with page rows.
     row_to_id: Vec<u64>,
+    /// 每个 id 的最后一行行号（last-wins 过滤索引）：由 [`append_row`](Self::append_row)
+    /// 与 `row_to_id` 同步推进，`from_rows` 重建；被墓碑删除的 id 条目会保留到同 id
+    /// 重写或重建为止，由 `matching_ids` 的墓碑检查屏蔽。过滤只认该行，追加写留下的
+    /// 旧行不参与；命中行经本表判定，无需再按页去重。
+    /// EN: Last row index per id (the last-wins filter index), advanced together with
+    /// `row_to_id` by [`append_row`](Self::append_row) and rebuilt by `from_rows`.
+    /// Entries of tombstoned ids linger until a same-id re-upsert or a rebuild and are
+    /// masked by the tombstone check in `matching_ids`. Filters only accept that row,
+    /// so stale rows from append-only re-upserts never participate; matched rows are
+    /// resolved through this index instead of per-page dedupe.
+    last_row: HashMap<u64, u64>,
     /// 已删除向量 id 的墓碑集：append-only 页无法物理删行，删除以墓碑表达——
     /// 过滤命中映射与 payload 回读都跳过墓碑 id；同 id 重新 upsert 时复活（清除）。
     /// EN: Tombstones of deleted vector ids. The append-only page cannot physically
@@ -136,6 +150,7 @@ impl CollectionScalars {
         Self {
             page: HouyiPage::new(COLLECTION_SCALAR_PAGE_CAPACITY),
             row_to_id: Vec::new(),
+            last_row: HashMap::new(),
             tombstones: HashSet::new(),
             generation: 0,
         }
@@ -158,8 +173,9 @@ impl CollectionScalars {
         // (same contract as the vector-side tombstones; bare-vector upserts don't
         // touch scalar tombstones, consistent with "bare vectors add no row").
         self.tombstones.remove(&id);
-        self.page.insert_row(scalars, None);
+        let row_idx = self.page.insert_row(scalars, None) as u64;
         self.row_to_id.push(id);
+        self.last_row.insert(id, row_idx);
         self.generation = self.generation.wrapping_add(1);
     }
 
@@ -232,10 +248,13 @@ impl CollectionScalars {
     /// semantics).
     ///
     /// 与 [`live_rows_last_wins`](Self::live_rows_last_wins) 的区别：快照必须逐物理行
-    /// 保存（包括 stale 行），否则「快照 + 尾段重放」会隐式压实、改变过滤语义。
+    /// 保存（包括 stale 行），使「快照 + 尾段重放」复原的物理/存活/stale 行数与快照
+    /// 时点一致（压实节奏与诊断指标不变）；查询语义由 last-wins 保证，与物理行数无关。
     /// EN: Unlike `live_rows_last_wins`, snapshots must keep every physical row
-    /// (stale rows included); otherwise snapshot+tail replay would implicitly
-    /// compact and change filter semantics.
+    /// (stale rows included), so snapshot+tail replay reproduces the same
+    /// physical/live/stale row counts as of the snapshot (compaction cadence and
+    /// diagnostics stay unchanged). Query semantics are guaranteed by last-wins and
+    /// do not depend on physical row counts.
     // P5.0.2 快照写入接线后使用；先保留单一实现。
     // EN: Used once P5.0.2 wires snapshot writes; keep the single implementation now.
     #[allow(dead_code)]
@@ -257,34 +276,42 @@ impl CollectionScalars {
     pub(crate) fn from_rows(rows: ScalarRows, tombstones: Vec<u64>) -> Self {
         let mut out = Self::new();
         for (id, scalars) in rows {
-            out.page.insert_row(scalars, None);
+            let row_idx = out.page.insert_row(scalars, None) as u64;
             out.row_to_id.push(id);
+            out.last_row.insert(id, row_idx);
         }
         out.tombstones = tombstones.into_iter().collect();
         out
     }
 
-    /// 返回列上谓词命中的向量 id（行号→id 映射 + 按出现顺序去重）。
-    /// Vector ids matched by `pred` on `column`: row→id mapping, order-preserving dedupe.
+    /// 返回列上谓词命中的向量 id（只看每个 id 的最后一行）。
+    /// Vector ids matched by `pred` on `column` (last row per id only).
     ///
-    /// append-only 重写会让多行指向同一 id，故此处按页行顺序去重；压实后同一 id
-    /// 只剩最后一行，结果集不会改变（旧值本就不再参与过滤）。
-    /// EN: Append-only re-upserts map several rows to one id, so dedupe in page
-    /// order; after compaction only the last row per id remains, which does not
-    /// change the result set (stale values no longer participate).
+    /// append-only 重写会让多行指向同一 id，只有最后一行代表该 id 的当前值；旧行
+    /// 不得再参与过滤（公共 issue #6：重写 payload 后旧值仍命中，与 `payloads_for`
+    /// 的 last-wins 回读口径矛盾）。压实前后结果一致——压实只是回收物理行。
+    /// EN: Append-only re-upserts map several rows to one id; only the last row is
+    /// current, so stale rows must not participate (public issue #6: after
+    /// re-upserting a payload the old value still matched, contradicting the
+    /// last-wins read-back in `payloads_for`). The result is identical before and
+    /// after compaction — compaction only reclaims physical rows.
     pub(crate) fn matching_ids(&self, column: &str, pred: &ScalarPredicate) -> Vec<u64> {
-        let row_ids = self.page.filter_to_bitset(column, pred);
-        let mut ids = Vec::with_capacity(row_ids.len());
-        let mut seen = HashSet::with_capacity(row_ids.len());
-        for row_idx in row_ids {
-            if let Some(&vector_id) = self.row_to_id.get(row_idx as usize) {
-                if self.tombstones.contains(&vector_id) {
-                    continue;
-                }
-                if seen.insert(vector_id) {
-                    ids.push(vector_id);
-                }
+        let matched_rows = self.page.filter_to_bitset(column, pred);
+        let mut ids = Vec::with_capacity(matched_rows.len());
+        for row_idx in matched_rows {
+            let Some(&vector_id) = self.row_to_id.get(row_idx as usize) else {
+                continue;
+            };
+            if self.tombstones.contains(&vector_id) {
+                continue;
             }
+            // 命中行不是该 id 的最后一行 ⇒ 被重写覆盖的旧值，丢弃（去重随之自然成立）。
+            // EN: A match on a non-last row is a superseded value — drop it (dedupe
+            // follows automatically).
+            if self.last_row.get(&vector_id) != Some(&row_idx) {
+                continue;
+            }
+            ids.push(vector_id);
         }
         ids
     }
@@ -292,14 +319,15 @@ impl CollectionScalars {
     /// 按向量 id 回读 payload（label + payload 键值），供检索响应携带文档内容。
     /// Read payloads back by vector id (label + payload keys) for search responses.
     ///
-    /// append-only 语义：同一 id 多行时**最后一行生效**（与检索侧「重写以最新为准」
-    /// 的直觉一致，也修正了 v1 文档里「过滤仍命中旧值」的已知限制中可回读的部分）；
+    /// append-only 语义：同一 id 多行时**最后一行生效**，与过滤侧
+    /// [`matching_ids`](Self::matching_ids) 的 last-wins 口径一致（公共 issue #6）；
     /// 墓碑 id 一律缺席。行扫描为 O(页行数)，仅在 `include_payload=true` 的检索尾部
     /// 调用（k 个 id 的查找合并成一次扫页），不在单点查询热路径。
-    /// EN: Append-only semantics — the LAST row per id wins (matching the "latest
-    /// re-upsert wins" intuition); tombstoned ids are always absent. The row scan is
-    /// O(page rows), invoked only at the tail of `include_payload=true` searches
-    /// (one merged scan for k ids), never on a point-lookup hot path.
+    /// EN: Append-only semantics — the LAST row per id wins, matching the last-wins
+    /// rule of [`matching_ids`](Self::matching_ids) (public issue #6); tombstoned ids
+    /// are always absent. The row scan is O(page rows), invoked only at the tail of
+    /// `include_payload=true` searches (one merged scan for k ids), never on a
+    /// point-lookup hot path.
     pub(crate) fn payloads_for(&self, ids: &[u64]) -> HashMap<u64, HashMap<String, ScalarValue>> {
         let want: HashSet<u64> = ids.iter().copied().collect();
         // 反向扫页：每个目标 id 只取最后一行。
@@ -1116,6 +1144,40 @@ mod tests {
             live[0].1.get("color"),
             Some(&ScalarValue::Text("blue".to_string()))
         );
+    }
+
+    /// 回归（公共 issue #6）：同 id 重写后，旧 payload 不得再命中过滤。
+    /// EN: Regression (public issue #6): after re-upserting an id, its old payload
+    /// must no longer match a filter.
+    #[test]
+    fn matching_ids_only_sees_the_last_row_per_id() {
+        use houyi_core::ScalarPredicate;
+
+        let mut s = CollectionScalars::new();
+        s.append_row(1, row("red"));
+        s.append_row(1, row("blue"));
+        s.append_row(2, row("red"));
+        s.tombstone(2);
+
+        let red = ScalarPredicate::Eq(ScalarValue::Text("red".to_string()));
+        let blue = ScalarPredicate::Eq(ScalarValue::Text("blue".to_string()));
+        assert!(s.matching_ids("color", &red).is_empty());
+        assert_eq!(s.matching_ids("color", &blue), vec![1]);
+
+        // 压实前后必须同结果（修复前只有压实后才不再命中旧值）。
+        // EN: The result must be identical before and after compaction (before the
+        // fix only compaction stopped stale values from matching).
+        let compacted = CollectionScalars::from_rows(s.live_rows_last_wins(), Vec::new());
+        assert!(compacted.matching_ids("color", &red).is_empty());
+        assert_eq!(compacted.matching_ids("color", &blue), vec![1]);
+
+        // 快照恢复保留物理旧行；last_row 索引随 from_rows 重建，过滤语义不变。
+        // EN: Snapshot restore keeps the physical stale rows; from_rows rebuilds the
+        // last-row index, so filter semantics are unchanged.
+        let (rows, tombstones) = s.snapshot_view();
+        let restored = CollectionScalars::from_rows(rows, tombstones);
+        assert!(restored.matching_ids("color", &red).is_empty());
+        assert_eq!(restored.matching_ids("color", &blue), vec![1]);
     }
 
     #[test]

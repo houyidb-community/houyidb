@@ -1123,6 +1123,15 @@ pub async fn execute_query(
     result
 }
 
+/// 原始 PAX 页上的过滤检索（启动自检探针用）：直接按谓词求 bitset，不经过
+/// [`crate::collection::CollectionScalars::matching_ids`] 的 last-wins 过滤。
+/// 仅适用于单行/无重写的页；collection 的真实过滤必须走 `matching_ids`，否则
+/// 同 id 重写后旧值会重新命中（公共 issue #6）。
+/// EN: Filtered search over a raw PAX page (startup self-check probe only): builds
+/// the bitset straight from the predicate, bypassing the last-wins filter in
+/// [`crate::collection::CollectionScalars::matching_ids`]. Only safe for
+/// single-row/non-rewritten pages; real collection filtering must go through
+/// `matching_ids`, or stale values match after same-id re-upserts (public issue #6).
 pub async fn execute_hybrid_with_scalar_bitset(
     index: &IndexBackend,
     page: &HouyiPage,

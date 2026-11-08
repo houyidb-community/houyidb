@@ -227,11 +227,13 @@ async fn handle_list_collections(
 /// 向指定 Collection 写入向量 / Upsert vectors into a named collection
 ///
 /// 向量进入索引后端；携带的 `label`/`payload` 在向量写入成功后追加到该 Collection
-/// 的内存 PAX 标量页（供 `/hybrid/search` 结构化过滤）。标量页 v1 易失：不写 WAL、
-/// 不进快照，进程重启后丢失（详见 [`crate::collection::CollectionScalars`]）。
+/// 的内存 PAX 标量页（供 `/hybrid/search` 结构化过滤）。标量页随 collections WAL
+/// 与快照持久化，重启后由重放/快照恢复（详见
+/// [`crate::collection::CollectionScalars`]）。
 /// EN: Vectors go to the index backend; on success each vector's `label`/`payload`
 /// is appended to the collection's in-memory PAX scalar page for hybrid filtering.
-/// The page is volatile in v1 — no WAL/snapshot, lost on restart.
+/// The page is persisted through the collections WAL and snapshots and restored
+/// on restart (see [`crate::collection::CollectionScalars`]).
 /// 只读副本拦截（P4.4.1）：role=follower 时写端点入口首行 503 `read_only`——
 /// 数据面变更只允许经复制流到达（apply 直调 CollectionManager，天然豁免）。
 /// 检索/metrics/health 不调用本守卫，只读副本可查是卖点。
@@ -621,11 +623,13 @@ pub async fn handle_collection_upsert(
                 // EN: append_row advances the page row and row_to_id atomically — the
                 // 1:1 alignment no longer depends on callers remembering both pushes.
                 //
-                // 旧行暂时保留；周期内存压实（P5.0.1）会按 stale 比例回收，
-                // 之后过滤只看到最后一行。压实前旧值仍可能命中（检索侧仅按 id 去重）。
-                // EN: Stale rows are retained until the periodic in-memory compaction
-                // (P5.0.1) reclaims them; filters then see only the last row per id.
-                // Before compaction, superseded values may still match.
+                // 旧行暂时保留，但过滤只看每个 id 的最后一行（旧值从写入起即失效，
+                // 公共 issue #6）；周期内存压实（P5.0.1）只按 stale 比例回收物理行，
+                // 不改变查询结果。
+                // EN: Stale rows are retained, but filters only see the last row per id
+                // (superseded values stop matching from the write on; public issue #6).
+                // The periodic in-memory compaction (P5.0.1) only reclaims physical rows
+                // by stale ratio and never changes query results.
                 scalars.append_row(v.id, row);
             }
         }
@@ -1101,13 +1105,14 @@ async fn collection_search_inner(
 /// 语义：按 id 删除，幂等——不存在的 id 静默跳过，`deleted` 只计真实存在的删除。
 /// 向量侧经 [`crate::index_backend::IndexBackend::delete`]（hnsw/flat 支持，其余
 /// 后端 400 fail-fast）；标量侧登记墓碑（append-only 页不能物理删行），后续的
-/// 过滤命中与 payload 回读都跳过已删 id。整个删除是 collection 内存态操作
-/// （v1 易失，与标量页同口径：不进 WAL/快照）。
+/// 过滤命中与 payload 回读都跳过已删 id。删除 WAL-first（`collection_delete`
+/// 记录先于内存变更），墓碑随快照持久化，重启后由重放/快照恢复。
 /// EN: Delete by ids, idempotent — unknown ids are skipped and `deleted` counts only
 /// ids that existed. The vector side goes through `IndexBackend::delete` (hnsw/flat
 /// only; other backends get 400); the scalar side records tombstones (the append-only
-/// page cannot drop rows) so filters and payload read-back skip deleted ids. The whole
-/// operation is volatile in-memory (v1, same as the scalar page: no WAL/snapshot).
+/// page cannot drop rows) so filters and payload read-back skip deleted ids. Deletion
+/// is WAL-first (`collection_delete` records precede the in-memory change) and the
+/// tombstones are captured by snapshots, so restart restores them via replay/snapshot.
 pub async fn handle_collection_delete(
     State(state): State<BenchmarkHttpState>,
     axum::extract::Path(name): axum::extract::Path<String>,
@@ -2771,13 +2776,14 @@ pub struct HybridSearchRequest {
 /// 混合检索（Collection 路由 + 维度校验）/ Hybrid search with collection routing + dim validation.
 ///
 /// 过滤条件在该 Collection 的内存 PAX 标量页上求值：先得到匹配的页行号，再经
-/// `row_to_id` 映射成向量 id（append-only 重写会让多行指向同一 id，按出现顺序去重），
-/// 多个过滤条件之间取交集。v1 标量页易失：进程重启后页为空，带过滤条件的检索返回空。
+/// `row_to_id` 映射成向量 id，只看每个 id 的最后一行（append-only 重写产生的旧行
+/// 不参与过滤），多个过滤条件之间取交集。标量页随 collections WAL 与快照持久化，
+/// 重启后由重放/快照恢复。
 /// EN: Filters run against the collection's in-memory PAX scalar page. Matched row
-/// indices are mapped to vector ids via `row_to_id` (deduped in order, since
-/// append-only re-upserts may map several rows to one id), then intersected.
-/// The page is volatile in v1: after a restart it is empty and filtered search
-/// returns nothing.
+/// indices are mapped to vector ids via `row_to_id`, keeping only the last row per
+/// id (stale rows from append-only re-upserts never match), then intersected.
+/// The scalar page is persisted through the collections WAL and snapshots and
+/// restored on restart.
 pub async fn handle_collection_hybrid_search(
     State(state): State<BenchmarkHttpState>,
     axum::extract::Path(name): axum::extract::Path<String>,

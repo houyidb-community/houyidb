@@ -4304,6 +4304,104 @@ async fn collection_reupsert_after_delete_resurrects_with_latest_payload() {
     );
 }
 
+/// 回归（公共 issue #6）：payload 过滤只看每个 id 的最后一行——同 id 重写后旧值
+/// 不再命中，检索结果与 include_payload 回读一致；按旧值条件删除也不再生效。
+/// 修复前 append-only 页里的旧行仍参与过滤，`color=red` 会返回已改成 blue 的 id。
+/// EN: Regression (public issue #6): payload filters see only the last row per id —
+/// after re-upserting the same id the old value no longer matches, search agrees
+/// with include_payload read-back, and delete-by-old-value is a no-op. Before the
+/// fix, stale rows in the append-only page still matched, so `color=red` returned
+/// an id whose payload had already changed to blue.
+#[tokio::test]
+async fn collection_reupsert_payload_filter_uses_last_row_only() {
+    use houyi_server::http_handler::{handle_collection_hybrid_search, HybridSearchRequest};
+    use houyi_server::types::{HybridSearchFilter, UpsertVector};
+
+    let (state, _cleanup) = collection_test_state(4);
+    let doc = |color: &str| {
+        vec![UpsertVector {
+            id: 1,
+            values: vec![1.0, 0.0, 0.0, 0.0],
+            label: None,
+            payload: Some(json_payload(serde_json::json!({ "color": color }))),
+        }]
+    };
+    collection_upsert(&state, "c", doc("red")).await;
+    collection_upsert(&state, "c", doc("blue")).await;
+
+    // 旧值不得命中，且不得回读任何 payload。
+    // EN: The stale value must not match, and no payload must be read back.
+    let red = handle_collection_hybrid_search(
+        State(state.clone()),
+        Path("c".to_string()),
+        None,
+        Json(HybridSearchRequest {
+            vector: vec![1.0, 0.0, 0.0, 0.0],
+            k: 3,
+            filters: vec![HybridSearchFilter {
+                column: "color".to_string(),
+                op: "eq".to_string(),
+                value: serde_json::json!("red"),
+            }],
+            include_payload: true,
+            ef_search: None,
+        }),
+    )
+    .await
+    .expect("hybrid search should succeed")
+    .0;
+    assert!(red.ids.is_empty(), "stale payload must not match: {red:?}");
+    assert!(
+        red.payloads.expect("payloads present").is_empty(),
+        "stale match must not read back"
+    );
+
+    // 最新值命中且回读为最新值。
+    // EN: The current value matches and reads back as current.
+    let blue = handle_collection_hybrid_search(
+        State(state.clone()),
+        Path("c".to_string()),
+        None,
+        Json(HybridSearchRequest {
+            vector: vec![1.0, 0.0, 0.0, 0.0],
+            k: 3,
+            filters: vec![HybridSearchFilter {
+                column: "color".to_string(),
+                op: "eq".to_string(),
+                value: serde_json::json!("blue"),
+            }],
+            include_payload: true,
+            ef_search: None,
+        }),
+    )
+    .await
+    .expect("hybrid search should succeed")
+    .0;
+    assert_eq!(blue.ids, vec![1]);
+    assert_eq!(
+        blue.payloads.expect("payloads present")["1"]["color"],
+        serde_json::json!("blue")
+    );
+
+    // 按旧值条件删除不得命中；按最新值删除命中 1 条。
+    // EN: Delete-by-old-value must be a no-op; delete-by-current-value removes one.
+    let filter = |color: &str| {
+        vec![HybridSearchFilter {
+            column: "color".to_string(),
+            op: "eq".to_string(),
+            value: serde_json::json!(color),
+        }]
+    };
+    let deleted_old = collection_delete_full(&state, "c", Vec::new(), filter("red"))
+        .await
+        .expect("delete should succeed");
+    assert_eq!(deleted_old.deleted, 0, "stale filter must delete nothing");
+    let deleted_new = collection_delete_full(&state, "c", Vec::new(), filter("blue"))
+        .await
+        .expect("delete should succeed");
+    assert_eq!(deleted_new.deleted, 1, "current filter must delete the id");
+}
+
 /// 不支持删除的后端（clustered）fail-fast 400，且标量页不被半删除污染。
 /// EN: backends without delete support (clustered) fail fast with 400 and the
 /// scalar page is not polluted by a half-delete.
@@ -5269,8 +5367,12 @@ async fn collection_hybrid_reupsert_same_id_dedupes_results() {
         "same vector id must appear at most once, got {ids:?}"
     );
 
-    // 压实前：append-only 旧行仍在页内，red 的旧值依旧命中。
-    // EN: Before compaction the append-only stale row still matches red.
+    // 压实前：append-only 旧行仍在页内，但过滤只看每个 id 的最后一行，旧值不得
+    // 命中（公共 issue #6 修复后的语义；此前旧值会命中外层过滤却回读最新 payload）。
+    // EN: Before compaction the stale row is still physically present, but filtering
+    // only sees the last row per id, so the old value must not match (semantics
+    // after the public issue #6 fix; it previously matched while reading back the
+    // latest payload).
     let stale = collection_hybrid(
         &state,
         "c7",
@@ -5279,14 +5381,14 @@ async fn collection_hybrid_reupsert_same_id_dedupes_results() {
         vec![("color", "eq", serde_json::json!("red"))],
     )
     .await;
-    assert_eq!(
-        stale,
-        vec![1],
-        "pre-compaction: superseded value still matches (documented behavior)"
+    assert!(
+        stale.is_empty(),
+        "pre-compaction: superseded value must not match, got {stale:?}"
     );
 
-    // 压实后：只保留最后一行，旧值不再命中。
-    // EN: After compaction only the last row remains; the stale value no longer matches.
+    // 压实后：只保留最后一行，结果与压实前一致（压实不改变查询语义）。
+    // EN: After compaction only the last row remains; results match the
+    // pre-compaction state (compaction never changes query semantics).
     let col = state.collections.get("c7").expect("collection exists");
     col.compact_scalars(true, 0.5)
         .await

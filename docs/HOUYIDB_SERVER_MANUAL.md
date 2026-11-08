@@ -257,7 +257,9 @@ follower 保留旧 manifest（仅暂时多占本地 WAL），直到有新 collec
 `collections_wal_max_segments`（默认 16，0=关闭删除）、
 `collections_wal_follower_grace_secs`（默认 60，leader 断连进度保留）、
 `collections_scalar_compact_interval_secs`（默认 600，0=关闭）、
-`collections_scalar_compact_stale_ratio`（默认 0.5）。
+`collections_scalar_compact_stale_ratio`（默认 0.5）。标量页为 append-only：重复
+upsert 同一 id 追加新行，过滤与 payload 回读只看每个 id 的最后一行；压实只回收
+物理行，不改变查询结果（公共 issue #6 修复后的语义）。
 
 ### 5.7 pgwire 指标
 

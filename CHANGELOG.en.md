@@ -2,6 +2,18 @@
 
 > [中文](CHANGELOG.md)
 
+## Unreleased
+
+### Fixed
+- **Payload filters only see the last row per id** (public issue #6): after
+  re-upserting the same id, the old payload no longer participates in filtering.
+  Before the fix, stale rows in the append-only page still matched — writing
+  `{"color":"red"}` and then `{"color":"blue"}` made a `color=red` filter return
+  the id while reading back the blue payload, and the behavior persisted across
+  restarts. Filtering, delete-by-filter and payload read-back now share the
+  last-wins rule; compaction only reclaims physical rows and never changes
+  query results.
+
 ## v0.2.0-beta.8 (2026-11-07)
 
 ### Added

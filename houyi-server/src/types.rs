@@ -1503,11 +1503,12 @@ pub struct UpsertVector {
     #[serde(default)]
     pub label: Option<String>,
     /// 自由 JSON 标量字段；写入所属 Collection 的内存 PAX 标量页，供混合检索过滤。
-    /// v1 易失：标量页不写 WAL、不进快照，进程重启后丢失；键名 `label` 为保留列，
-    /// 请改用顶层 `label` 字段（占用将返回 400）。
-    /// Free-form JSON scalar fields; stored in the collection's in-memory PAX scalar
-    /// page for hybrid-search filtering. Volatile in v1 (no WAL/snapshot; lost on
-    /// restart). The key `label` is reserved for the top-level field and rejected.
+    /// 标量页随 collections WAL 与快照持久化，重启后由重放/快照恢复；键名 `label`
+    /// 为保留列，请改用顶层 `label` 字段（占用将返回 400）。
+    /// EN: Free-form JSON scalar fields; stored in the collection's in-memory PAX
+    /// scalar page for hybrid-search filtering. The page is persisted through the
+    /// collections WAL and snapshots and restored on restart. The key `label` is
+    /// reserved for the top-level field and rejected.
     /// `null`/array/object values land in a JSON-text column via the
     /// crate-private `json_value_to_scalar` conversion (module `scalar_json`).
     #[serde(default)]
@@ -1542,11 +1543,13 @@ pub struct SearchRequest {
 
 /// Collection 向量删除请求 / Delete-by-ids request for a collection.
 ///
-/// 删除是 collection 内存态操作（v1 易失语义与标量页一致：不进 WAL、不进快照）。
-/// 不存在的 id 静默跳过（幂等）；`deleted` 计真实存在的删除数。
-/// EN: Deletion is a volatile in-memory operation (same v1 semantics as the scalar
-/// page — no WAL/snapshot). Unknown ids are skipped (idempotent); `deleted` counts
-/// ids that actually existed.
+/// 删除 WAL-first（`collection_delete` 记录先于内存变更）；墓碑随标量页一起进
+/// 快照，重启后由重放/快照恢复。不存在的 id 静默跳过（幂等）；`deleted` 计真实
+/// 存在的删除数。
+/// EN: Deletion is WAL-first (`collection_delete` records precede the in-memory
+/// change); tombstones are captured by snapshots together with the scalar page and
+/// restored on restart via replay/snapshot. Unknown ids are skipped (idempotent);
+/// `deleted` counts ids that actually existed.
 #[derive(Debug, Deserialize)]
 pub struct DeleteRequest {
     /// 显式 id 列表；与 `filters` 命中结果取**并集**（两者可单独或同时使用）。

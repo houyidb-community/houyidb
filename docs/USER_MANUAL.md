@@ -449,9 +449,10 @@ HOUYI_TRIAL_HTTP_ADDR=0.0.0.0:17000 \
   之外会收到 `BEHIND_RETAINED`，必须按
   `docs/runbooks/collections-retention-resync.md` 做全量重同步；不会自动清库。
   复制协议 v8 不做跨版本滚动兼容，升级需所有副本一起进行（见服务手册）。
-- 标量页默认每 10 分钟检查、stale 行 ≥50% 时压实；压实后过滤只命中每个 id
-  的最后一行（此前旧行仍会命中）。clustered / flat-clustered / pq-flat 暂不
-  支持快照压缩。
+- 标量页为 append-only：重复 upsert 同一 id 会追加新行，过滤与 payload 回读
+  只看每个 id 的最后一行（旧值从写入起即不再命中）。默认每 10 分钟检查、
+  stale 行 ≥50% 时压实回收物理行，压实不改变查询结果。clustered /
+  flat-clustered / pq-flat 暂不支持快照压缩。
 - payload 的数组/对象值按 JSON 文本列处理，过滤语义有限。
 - 后端与度量支持矩阵：hnsw / flat / clustered / flat-clustered 支持
   l2/cosine/ip/l1；`pq-flat` 仅 `l2`（HTTP score 为 `1 − L2²`，无界）；

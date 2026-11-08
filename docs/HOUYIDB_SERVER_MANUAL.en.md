@@ -269,7 +269,11 @@ diverging on metrics.
 `collections_wal_max_segments` (default 16; 0 = disable deletion),
 `collections_wal_follower_grace_secs` (default 60),
 `collections_scalar_compact_interval_secs` (default 600; 0 = disabled),
-`collections_scalar_compact_stale_ratio` (default 0.5).
+`collections_scalar_compact_stale_ratio` (default 0.5). Scalar pages are
+append-only: re-upserting the same id appends a new row, and filtering plus
+payload read-back only see the last row per id; compaction reclaims physical
+rows without changing query results (the semantics after the public issue #6
+fix).
 
 ### 5.7 pgwire Metrics
 
