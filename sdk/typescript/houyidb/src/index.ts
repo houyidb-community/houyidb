@@ -4,6 +4,7 @@ export type {
   CollectionStatus,
   SearchOptions,
   HybridSearchOptions,
+  FusionSearchOptions,
   DeleteOptions,
   // 建集合的公共类型必须从唯一入口导出，否则使用方只能依赖方法返回值的
   // 推断类型，无法声明变量或实现接口（OCR #29）。
@@ -16,6 +17,7 @@ export type {
 } from "./client.js";
 export {
   SearchResult,
+  FusionResult,
   HouyiError,
   toVectorId,
 } from "./types.js";
@@ -25,5 +27,7 @@ export type {
   Filter,
   FilterOp,
   SearchHit,
+  FusionHit,
+  SparseTerm,
 } from "./types.js";
 export { stableId } from "./stable-id.js";

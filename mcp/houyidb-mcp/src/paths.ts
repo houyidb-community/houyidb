@@ -26,6 +26,7 @@ export type CollectionRoute =
   | "status"
   | "search"
   | "hybrid/search"
+  | "fusion/search"
   | "upsert"
   | "delete";
 

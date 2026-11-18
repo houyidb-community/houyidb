@@ -58,18 +58,93 @@ var created = await client.CreateCollectionAsync("docs", 768, new CreateCollecti
 {
     Metric = "ip",          // l2 / cosine / ip / l1
     IndexType = "hnsw",     // hnsw / flat / clustered / flat-clustered / pq-flat / hii-l0
+    VectorDtype = "f16",    // optional: f32 (default) / f16 (hnsw only, main-store memory halved)
+    Quantization = "int8",  // optional: none (default) / int8 / rabitq (hnsw only, graph-side compression)
+    Sparse = "bm25",        // optional: none (default) / bm25 (hnsw/flat only, immutable after creation)
     Hnsw = new HnswParams(M: 16, EfConstruction: 100, EfSearch: 64),
 });
-// created.Metric == "ip"; the server echoes the effective parameters
+// created.Metric == "ip"; created.VectorDtype/Quantization/Sparse echo f16/int8/bm25;
+// the server echoes the effective parameters
 ```
 
 Metric support matrix: `hnsw` / `flat` / `clustered` / `flat-clustered`
 support all four; `pq-flat` supports `l2` only; `hii-l0` supports `cosine`
 only.
 
+`VectorDtype` allows `f16` for the hnsw backend only and is immutable after
+creation; queries stay f32 and distances are computed against f16-rounded data
+(asymmetric quantization). An older server that omits the field yields `null`;
+never default it to `f32` yourself.
+
+`Quantization` is independent of `VectorDtype`: `int8` (1 B/dim) and
+`rabitq` (1 bit/dim) compress only the HNSW graph-side copy while the main
+store keeps the raw vectors, and search reranks exactly on those after taking
+graph candidates, so final top-k precision is unchanged. `rabitq` supports
+`Metric = l2 | cosine` only (`ip`/`l1` return 400). It is hnsw-only and
+immutable after creation; unset
+options keep the key out of the request body, and an older server that omits
+the field yields `null`.
+
 Search scores are metric-derived (higher means more similar): `cosine` →
 `1 - distance` in [-1, 1]; `l2` / `l1` → `1 - distance` (unclamped); `ip` →
 the raw dot product.
+
+## Sparse Vectors (BM25) and Fusion Search (P4)
+
+The sparse index is an **explicit creation switch**: `Sparse = "bm25"` works
+on `hnsw` / `flat` backends only and is immutable after creation; implicitly
+created collections are always `none`, and writing `Sparse` on a `sparse=none`
+collection (or combining `bm25` with another backend at creation) returns 400.
+When an older server omits the field in the creation response,
+`created.Sparse` is `null` and is tolerated as an optional field.
+
+Terms are client-supplied (no tokenizer): `new SparseTerm(termId, weight)`,
+term ∈ [1, 2^24−1], weight finite and > 0; at most 1024 terms per document
+(the server sums duplicate terms), and at most 64 terms per fusion query.
+
+```csharp
+// Sparse writes ride the dense batch (whole-document replacement): null = unchanged, empty list = clear
+await col.UpsertAsync(new[]
+{
+    new Vector
+    {
+        Id = StableId.Of("doc-2"),
+        Values = embedding,
+        Sparse = new List<SparseTerm> { new(7, 1.0f), new(8, 0.8f) },
+    },
+});
+
+// Fusion search: dense and sparse are both required; the k limit matches Search
+var fusionOptions = new FusionOptions
+{
+    Fusion = "rrf",        // rrf (default) / weighted
+    RrfK = 60,             // 1..=1000, rrf only
+    // Alpha = 0.5f,       // 0..=1, weighted only (default 0.5)
+    IncludePayload = true,
+};
+fusionOptions.Filters.Add(new Filter("category", FilterOp.Eq, "fruit"));
+var fused = await col.FusionSearchAsync(
+    queryEmbedding, new[] { new SparseTerm(7, 1.0f), new SparseTerm(8, 0.8f) }, 10,
+    fusionOptions);
+foreach (var hit in fused.Hits)
+{
+    // hit.Score only expresses fused ranking; hit.DenseScore is metric-converted and hit.SparseScore is raw BM25
+    Console.WriteLine($"{hit.Id} {hit.Score} {hit.DenseScore} {hit.SparseScore}");
+}
+```
+
+Two fusion modes: `rrf` (default, `score = Σ 1/(rrf_k + rank)`) and
+`weighted` (min-max normalize each path, then
+`alpha*dense + (1-alpha)*sparse`). Both paths over-fetch `4*k` and apply
+Filters; documents missing from both paths are excluded. Explicitly supplied
+`RrfK`/`Alpha` values are always strictly validated (400 when out of range,
+even under the inactive mode). `fused.Metric` explains `DenseScore` only;
+`fused.FusionMode` / `RrfK` / `Alpha` echo the effective parameters.
+
+Fusion search is pure read and never creates a collection implicitly; a
+`sparse=none` collection returns 400; an older server without the endpoint
+returns 404, passed through verbatim. Sparse **writes** are HTTP/SDK only
+(pgwire supports fusion queries only).
 
 ## Admin Operation: Dropping a Whole Collection (Irreversible)
 

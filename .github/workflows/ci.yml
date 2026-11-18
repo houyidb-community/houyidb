@@ -33,19 +33,42 @@ jobs:
       # P4.8：移除 hwloc 后无原生系统依赖，无需额外安装。
       - run: cargo test --all --no-fail-fast
       - run: cargo build --release -p houyi-server
+      - name: Quantized recall gates (release)
+        # 量化召回门（int8/rabitq）debug 下约 18 分钟，测试本体标记 ignore，
+        # 统一在 release 模式运行：编译产物与上面的 server release 构建共享，
+        # 运行约 2 分钟，既保留门禁覆盖又不拖垮 debug 全量测试。
+        # EN: Quantized recall gates (int8/rabitq) take ~18 minutes in debug, so
+        # the tests are marked ignored and run in release here. Release
+        # artifacts are shared with the server build above and the gates finish
+        # in ~2 minutes, keeping coverage without inflating the debug suite.
+        run: cargo test --release -p houyi-vector --test recall_gate -- --ignored
 
   # Linux 覆盖：防止 cfg(target_os = "linux") 路径在 macOS-only CI 下烂掉
   # （先例：numa_vec 的 mbind 调用从未被编译，Docker 构建时才暴露）。
+  #
+  # Cargo.lock 变化会让 Swatinem/rust-cache 换 key，冷缓存下需重新编译整个
+  # workspace；15 日的两次 30 分钟超时即冷编译 + debug 量化门（现已移入
+  # release）叠加所致。预算按冷编译留足，首次成功写回缓存后约为数分钟。
+  # EN: A Cargo.lock change rotates the Swatinem/rust-cache key; with a cold
+  # cache the whole workspace must recompile. The two 30-minute timeouts on the
+  # 15th were cold compile plus debug quantized gates (now moved to release).
+  # Budget for the cold compile; once the cache is written, later runs take
+  # minutes.
   test-linux:
     name: Test (Linux x86_64)
     runs-on: ubuntu-24.04
-    timeout-minutes: 30
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
       - run: cargo test --all --no-fail-fast
       - run: cargo build --release -p houyi-server
+      - name: Quantized recall gates (release)
+        # 同 macOS：量化门在 release 运行，Linux 冷编译也留有余量。
+        # EN: Same as macOS: quantized gates run in release, leaving headroom
+        # for the Linux cold compile.
+        run: cargo test --release -p houyi-vector --test recall_gate -- --ignored
 
   clippy:
     name: Clippy
@@ -92,10 +115,23 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+      - name: Compute short git SHA
+        id: short_sha
+        # Docker 上下文无 `.git`，build.rs 读不到提交；显式传入供 build_sha
+        # 嵌入。PR 事件下 `github.sha` 是合成的 refs/pull/<n>/merge 提交
+        # （每次推送重新生成，无法回溯源码），必须优先取 PR 头提交。
+        # EN: The Docker context has no `.git`, so build.rs cannot read the commit;
+        # pass it explicitly for the embedded build_sha. On pull_request events
+        # `github.sha` is the synthetic refs/pull/<n>/merge commit (regenerated on
+        # every push and not traceable to source), so prefer the PR head SHA.
+        env:
+          GIT_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: echo "value=${GIT_SHA::8}" >> "$GITHUB_OUTPUT"
       - uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
         with:
           context: .
           push: false
+          build-args: HOUYIDB_GIT_SHA=${{ steps.short_sha.outputs.value }}
           # load 进本地 daemon，下面的冒烟步才能 docker run（OCR d69068e[3]）。
           # 只构建/加载 linux/amd64（runner 原生架构）：arm64 走 QEMU 会
           # 让构建时间翻倍，CI 冒烟为 amd64 单架构已足够；release.yml 的
@@ -109,3 +145,83 @@ jobs:
         # Dockerfile 无 ENTRYPOINT、CMD 是 houyi-server：`docker run img --help`
         # 会把 --help 整体替换 CMD，必须用 --entrypoint 显式指定二进制。
         run: docker run --rm --entrypoint houyi-server houyidb:ci-check --help >/dev/null
+      - name: Verify build_sha inside the image
+        # 端到端钉住 build-arg → build.rs → `/version` 的整条链路：ARG 名漂移、
+        # .dockerignore 变化或回退逻辑回归都会让镜像重新变成 unknown，而
+        # `--help` 冒烟看不到；必须真正启动容器并比对入口注入的短 SHA。
+        # EN: Pin the whole build-arg → build.rs → `/version` chain end to end:
+        # an ARG rename, a .dockerignore change, or a fallback regression would
+        # silently turn the image back to `unknown`, which the `--help` smoke
+        # cannot see; boot the container and compare against the injected SHA.
+        env:
+          SHORT_SHA: ${{ steps.short_sha.outputs.value }}
+        run: |
+          # 不挂 --rm：容器若提前退出需要 docker logs 取证，由 trap 统一清理。
+          # EN: No --rm: an early-exiting container must stay long enough for
+          # docker logs; the trap cleans it up.
+          cid=$(docker run -d -p 127.0.0.1:17000:7000 houyidb:ci-check)
+          trap 'docker rm -f "$cid" >/dev/null 2>&1 || true' EXIT
+          # 就绪状态按墙钟时限跟踪（每次 curl 最多 2s + sleep 1s，用固定
+          # 迭代数会把 30s 预算悄悄拉长到 ~90s）。只对真正的终态
+          # （exited/dead）立即失败；inspect 瞬时失败或 created/restarting
+          # 等过渡态继续轮询。失败时输出容器日志，别让后续 python 解析报错
+          # 掩盖根因。
+          # EN: Track readiness against a wall-clock deadline (each attempt can
+          # spend 2s in curl plus 1s sleeping, so a fixed iteration count would
+          # silently stretch the 30s budget to ~90s). Fail fast only on genuine
+          # terminal states (exited/dead); keep polling through transient
+          # inspect failures and states like created/restarting. Dump container
+          # logs on failure instead of letting a later Python parse error mask
+          # the root cause.
+          ready=0
+          start=$SECONDS
+          status=unknown
+          exit_info=""
+          while (( SECONDS - start < 30 )); do
+            # 一次 inspect 同时取状态/退出码/OOM 标记；失败时保留 stderr，
+            # 让超时诊断能区分 daemon 不可达与容器已终止，OOM kill（137）
+            # 也能从 exit/OOM 字段直接看出来。
+            # EN: One inspect yields state, exit code, and OOM flag; keep stderr
+            # on failure so timeout diagnostics distinguish an unreachable daemon
+            # from a terminated container, and an OOM kill (137) is visible via
+            # the exit/OOM fields.
+            raw=$(docker inspect -f '{{.State.Status}} exit={{.State.ExitCode}} oom={{.State.OOMKilled}}' "$cid" 2>/tmp/inspect.err) || true
+            if [ -n "$raw" ]; then
+              status=${raw%% *}
+              exit_info=$raw
+            else
+              status=unknown
+              exit_info="inspect failed: $(tr '\n' ' ' < /tmp/inspect.err)"
+            fi
+            case "$status" in
+              exited | dead)
+                echo "::error::container entered terminal state ($exit_info) before answering /v1/version"
+                docker logs "$cid" || true
+                exit 1
+                ;;
+            esac
+            # --max-time 必须设：接受 TCP 却不响应的容器不能拖到 job 超时。
+            # EN: --max-time is mandatory: a container that accepts TCP but
+            # never responds must not hang until the job timeout.
+            if curl -fsS --max-time 2 http://127.0.0.1:17000/v1/version > /tmp/version.json; then
+              ready=1
+              break
+            fi
+            sleep 1
+          done
+          if [ "$ready" != "1" ]; then
+            elapsed=$((SECONDS - start))
+            echo "::error::container did not answer /v1/version within ${elapsed}s (budget 30s, last status: $status; $exit_info)"
+            docker logs "$cid" || true
+            exit 1
+          fi
+          if ! got=$(python3 -c 'import json; print(json.load(open("/tmp/version.json"))["build_sha"])'); then
+            echo "::error::failed to parse /v1/version"
+            cat /tmp/version.json || true
+            docker logs "$cid" || true
+            exit 1
+          fi
+          if [ "$got" != "$SHORT_SHA" ]; then
+            echo "::error::image build_sha=$got, expected $SHORT_SHA"
+            exit 1
+          fi

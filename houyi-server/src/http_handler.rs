@@ -19,6 +19,9 @@ use houyi_persistence::vector_snapshot::{
 };
 use houyi_persistence::vector_wal::{encode_vector_upsert_batch, VectorItem};
 use houyi_persistence::wal_sidecar::{read_applied_lsn, write_applied_lsn_atomic};
+use houyi_vector::sparse::{
+    normalize_min_max, normalize_terms, rrf_fuse, weighted_fuse, SparseMode, MAX_SPARSE_QUERY_TERMS,
+};
 use houyi_vector::{DistanceMetric, HnswBatchPlanMode};
 use serde::Deserialize;
 use std::collections::HashMap;
@@ -190,6 +193,13 @@ async fn handle_list_collections(
                 "name": name,
                 "dims": col.dims,
                 "index_type": col.index_type,
+                // 存储编码创建时定型（f32 | f16），只读回显。
+                // EN: storage encoding fixed at creation (f32 | f16), read-only echo.
+                "vector_dtype": col.vector_dtype().as_str(),
+                // 图侧量化同为创建时定型（none | int8 | rabitq），只读回显。
+                // EN: graph-side quantization is also fixed at creation
+                // (none | int8 | rabitq), read-only echo.
+                "quantization": col.quantization().as_str(),
                 "vectors": indexed,
                 // 度量与 HNSW 参数为创建时定型值（不可变）；非 hnsw 后端不返回。
                 // EN: metric and HNSW parameters are fixed at creation (immutable);
@@ -511,6 +521,23 @@ pub async fn handle_collection_upsert(
             ));
         }
     }
+    // 稀疏词项形状/term/权重/数量预校验先于任何写入（P4）：坏请求不得在 WAL
+    // 留下记录，也不得在 none 集合上被静默丢弃（带 sparse 键即 400）。
+    // EN: Sparse shape/term/weight/count validation runs before any side effect
+    // (P4): a bad request must not leave WAL records, and a sparse key on a
+    // sparse=none collection is a 400 rather than silently dropped.
+    let mut sparse_terms: Vec<Option<Vec<(u32, f32)>>> = Vec::with_capacity(req.vectors.len());
+    for v in &req.vectors {
+        sparse_terms.push(match &v.sparse {
+            Some(value) => Some(parse_sparse_terms_wire(
+                value,
+                houyi_vector::sparse::MAX_SPARSE_TERMS_PER_DOC,
+                &format!("vector id={}", v.id),
+            )?),
+            None => None,
+        });
+    }
+    let batch_has_sparse = sparse_terms.iter().any(Option::is_some);
 
     // Collection 维度以首批首个向量定型；空批次沿用服务默认维度。
     // Collection dims are fixed by the first vector of the first batch; empty batch
@@ -530,10 +557,40 @@ pub async fn handle_collection_upsert(
         .memory_watermark
         .check_admission()
         .map_err(|msg| (axum::http::StatusCode::SERVICE_UNAVAILABLE, msg))?;
-    let col = state
-        .collections
-        .get_or_create(&name, Some(dims))
-        .map_err(|e| (axum::http::StatusCode::BAD_REQUEST, e))?;
+    // 携带稀疏的批次绝不触发隐式创建：目标集合必须已以 sparse=bm25 存在
+    // （upsert 首批写的隐式创建恒为 none，否则稀疏数据将无处可放）。
+    // EN: Sparse batches never trigger implicit creation: the target must
+    // already exist with sparse=bm25 (implicit first-write creation is always
+    // none, which would have nowhere to store the sparse data).
+    let col = if batch_has_sparse {
+        let col = state.collections.get(&name).ok_or_else(|| {
+            (
+                axum::http::StatusCode::BAD_REQUEST,
+                format!("collection '{name}' does not exist; create it with sparse=bm25 first"),
+            )
+        })?;
+        if col.sparse_mode() != SparseMode::Bm25 {
+            return Err((
+                axum::http::StatusCode::BAD_REQUEST,
+                format!(
+                    "collection '{name}' has sparse=none; sparse data requires a collection \
+                     created with sparse=bm25 (sparse is a creation-time switch)"
+                ),
+            ));
+        }
+        if col.dims != dims {
+            return Err((
+                axum::http::StatusCode::BAD_REQUEST,
+                format!("dim mismatch: expect {}, got {dims}", col.dims),
+            ));
+        }
+        col
+    } else {
+        state
+            .collections
+            .get_or_create(&name, Some(dims))
+            .map_err(|e| (axum::http::StatusCode::BAD_REQUEST, e))?
+    };
     // 写互斥：WAL append 与后续内存变更（insert_batch + 标量行）必须同序——
     // 否则并发同 id 的两批 upsert 可能出现 WAL 顺序 A,B 而内存顺序 B,A，
     // 重放收敛到与已确认状态不同的值（last-writer 分叉）。
@@ -559,12 +616,19 @@ pub async fn handle_collection_upsert(
     let wal_items: Vec<houyi_persistence::collection_wal::CollectionWalItem> = req
         .vectors
         .iter()
-        .map(|v| houyi_persistence::collection_wal::CollectionWalItem {
-            id: v.id,
-            values: v.values.clone(),
-            label: v.label.clone(),
-            payload: v.payload.clone(),
-        })
+        .zip(sparse_terms.iter())
+        .map(
+            |(v, sparse)| houyi_persistence::collection_wal::CollectionWalItem {
+                id: v.id,
+                values: v.values.clone(),
+                label: v.label.clone(),
+                payload: v.payload.clone(),
+                // 缺省 = 不修改；`[]` = 清空；WAL 编码器再做一次规范化（幂等）。
+                // EN: absent = no change; `[]` = clear; the WAL encoder
+                // canonicalizes again (idempotent).
+                sparse: sparse.clone(),
+            },
+        )
         .collect();
     let payload =
         houyi_persistence::collection_wal::encode_collection_upsert_batch(&name, dims, &wal_items)
@@ -597,6 +661,48 @@ pub async fn handle_collection_upsert(
         tracing::warn!(error = %e, "[houyi-upsert] collection insert_batch rejected (expected validation-only)");
         (axum::http::StatusCode::BAD_REQUEST, e)
     })?;
+
+    // 稀疏索引与向量写入同步（同写锁内），覆盖尚在 builder 队列的向量，满足
+    // 「先写即可查」。整文档替换语义使本步天然幂等；锁序 write_lock → sparse、
+    // 与标量页不嵌套，且标准库锁不跨 .await。
+    // EN: Sparse indexing is synchronous with the vector write (same write lock),
+    // covering vectors still in the builder queue for read-your-write. Whole-
+    // document replacement makes this idempotent. Lock order is write_lock ->
+    // sparse (never nested with scalars) and no std guard crosses .await.
+    if batch_has_sparse {
+        // `sparse=none` 与非法词项已在 WAL 之前预校验，走到这里仍缺失/拒绝
+        // 只可能是内部不变量被破坏（WAL 已落盘，不能谎报 4xx）——映射 500
+        // 并留 error 日志，便于按日志定位腐坏。
+        // EN: `sparse=none` and invalid terms were pre-validated before the WAL;
+        // reaching this point without an index or with a rejected upsert means a
+        // broken internal invariant (the WAL is already durable, so 4xx would be a
+        // lie) — map to 500 and log at error level for corruption triage.
+        let index = col.sparse_index().ok_or_else(|| {
+            tracing::error!(
+                collection = %name,
+                "[houyi-upsert] bm25 collection lost its sparse index after WAL append (invariant violation)"
+            );
+            (
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                "sparse index missing on a bm25 collection (invariant violation)".to_string(),
+            )
+        })?;
+        let mut guard = index
+            .write()
+            .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        for (v, terms) in req.vectors.iter().zip(sparse_terms.iter()) {
+            if let Some(terms) = terms {
+                guard.upsert_doc(v.id, terms).map_err(|e| {
+                    tracing::error!(error = %e, id = v.id, "[houyi-upsert] sparse upsert rejected after WAL append (invariant violation)");
+                    (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
+                })?;
+            }
+        }
+        // 死 postings 超过活行时重建（写锁内，结果与重建前一致）。
+        // EN: Rebuild once dead postings outnumber live ones (under the write
+        // lock; results are unchanged by the rebuild).
+        guard.compact_if_needed();
+    }
 
     // 仅当至少一个向量携带 label/非空 payload 时才建行；
     // row_to_id 必须与页内行严格一一对应，因此「裸向量」不插入标量页。
@@ -712,11 +818,69 @@ pub async fn handle_create_collection(
             ))
         }
     };
-    CollectionManager::validate_create(&index_type, req.dims, metric, hnsw)
-        .map_err(|e| (axum::http::StatusCode::BAD_REQUEST, e))?;
+    // 存储编码缺省 f32；非 f32 只允许 hnsw 且在 validate_create 中 fail-fast。
+    // EN: Storage encoding defaults to f32; non-f32 values are only allowed for
+    // hnsw and fail fast in validate_create.
+    let vector_dtype = match req.vector_dtype.as_deref() {
+        Some(d) => houyi_vector::VectorDtype::parse_str(d).ok_or_else(|| {
+            (
+                axum::http::StatusCode::BAD_REQUEST,
+                format!("invalid vector_dtype {d:?} (expect f32|f16)"),
+            )
+        })?,
+        None => houyi_vector::VectorDtype::F32,
+    };
+    // 图侧量化缺省 none；非 none 只允许 hnsw 且在 validate_create 中 fail-fast，
+    // rabitq 另要求 metric l2|cosine。
+    // EN: Graph-side quantization defaults to none; non-none values are only
+    // allowed for hnsw and fail fast in validate_create, and rabitq additionally
+    // requires metric l2|cosine.
+    let quantization = match req.quantization.as_deref() {
+        Some(q) => houyi_vector::Quantization::parse_str(q).ok_or_else(|| {
+            (
+                axum::http::StatusCode::BAD_REQUEST,
+                format!("invalid quantization {q:?} (expect none|int8|rabitq)"),
+            )
+        })?,
+        None => houyi_vector::Quantization::None,
+    };
+    // 稀疏模式缺省 none；未知串 400，bm25 仅 hnsw/flat（validate_create 裁决）。
+    // EN: Sparse mode defaults to none; unknown strings are 400, and bm25 is
+    // limited to hnsw/flat (decided by validate_create).
+    let sparse = match req.sparse.as_deref() {
+        Some(s) => SparseMode::parse_str(s).ok_or_else(|| {
+            (
+                axum::http::StatusCode::BAD_REQUEST,
+                format!("invalid sparse {s:?} (expect none|bm25)"),
+            )
+        })?,
+        None => SparseMode::None,
+    };
+    CollectionManager::validate_create(
+        &index_type,
+        req.dims,
+        metric,
+        hnsw,
+        vector_dtype,
+        quantization,
+        sparse,
+    )
+    .map_err(|e| (axum::http::StatusCode::BAD_REQUEST, e))?;
+    // 显式创建：量化（含显式 none）参与严格比对，同名不同量化 → 409。
+    // EN: Explicit creation: quantization (including an explicit none) is
+    // compared strictly; a same-name collection with a different value → 409.
     let (col, created) = state
         .collections
-        .get_or_create_typed_with_metric(&name, req.dims, &index_type, Some(metric), hnsw)
+        .get_or_create_typed_with_metric_and_quantization(
+            &name,
+            req.dims,
+            &index_type,
+            Some(metric),
+            hnsw,
+            Some(vector_dtype),
+            Some(quantization),
+            Some(sparse),
+        )
         .map_err(|e| {
             // validate_create 已证明同一组参数可构造，因此这里只有「同名已存在且
             // 参数不符」一种失败：名字被占用是 409，不是请求格式错误。不再回读
@@ -788,7 +952,10 @@ pub async fn handle_create_collection(
             dims: col.dims,
             metric: col.metric.as_str().to_string(),
             index_type: col.index_type.clone(),
+            vector_dtype: col.vector_dtype().as_str().to_string(),
+            quantization: col.quantization().as_str().to_string(),
             hnsw: hnsw_response,
+            sparse: col.sparse_mode().as_str().to_string(),
         }),
     ))
 }
@@ -816,21 +983,39 @@ pub async fn handle_create_collection(
 /// EN: Pairs with non-finite distance are dropped together. serde_json does not reject
 /// non-finite floats — it serializes them as `null` (valid JSON, but it silently breaks
 /// the numeric `scores` contract and typed-client decoding), and NaN cannot be sorted.
+/// 单点距离 → 相似度换算（与 [`scored_pairs_to_response`] 同一口径，融合检索
+/// 的 dense 路复用本函数，避免第二份度量解释）。非有限距离返回 `None`。
+/// EN: Single distance → similarity conversion (same contract as
+/// [`scored_pairs_to_response`], reused by the dense side of fusion so the
+/// metric interpretation exists once). Non-finite distances return `None`.
+fn metric_similarity(distance: f32, metric: DistanceMetric) -> Option<f32> {
+    if !distance.is_finite() {
+        return None;
+    }
+    Some(match metric {
+        DistanceMetric::Cosine => (1.0 - distance).clamp(-1.0, 1.0),
+        DistanceMetric::L2 | DistanceMetric::L1 => 1.0 - distance,
+        DistanceMetric::InnerProduct => -distance,
+    })
+}
+
+/// 融合检索成功的全局计数（P4）。进程级原子量而非挂在 `BenchmarkHttpState`
+/// 上：指标口径天然跨集合，且避免为单个计数器改动全部测试状态字面量。
+/// EN: Global fusion-search success counter (P4). A process-wide atomic rather
+/// than a `BenchmarkHttpState` field: the metric is inherently cross-collection
+/// and a single counter should not force edits to every test state literal.
+static FUSION_SEARCHES_TOTAL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 fn scored_pairs_to_response(pairs: Vec<(u64, f32)>, metric: DistanceMetric) -> SearchResponse {
     let mut dropped_non_finite = 0usize;
     let (ids, scores) = pairs
         .into_iter()
-        .filter_map(|(id, distance)| {
-            if !distance.is_finite() {
+        .filter_map(|(id, distance)| match metric_similarity(distance, metric) {
+            Some(score) => Some((id, score)),
+            None => {
                 dropped_non_finite += 1;
-                return None;
+                None
             }
-            let score = match metric {
-                DistanceMetric::Cosine => (1.0 - distance).clamp(-1.0, 1.0),
-                DistanceMetric::L2 | DistanceMetric::L1 => 1.0 - distance,
-                DistanceMetric::InnerProduct => -distance,
-            };
-            Some((id, score))
         })
         .unzip();
     // 结果数可能因此少于 k；打一行诊断让「返回数缩水」可归因（通常是 pg_wire binary
@@ -862,11 +1047,24 @@ fn attach_payloads(
     col: &crate::collection::Collection,
     resp: &mut SearchResponse,
 ) -> Result<(), (axum::http::StatusCode, String)> {
+    resp.payloads = Some(payloads_for_ids(col, &resp.ids)?);
+    Ok(())
+}
+
+/// 按 id 集合取 payload 映射（键为 id 字符串）；融合检索的响应结构与
+/// `SearchResponse` 不同，但负载语义一致，故共用本实现。
+/// EN: Payload map for a set of ids (keys stringified); fusion responses have a
+/// different shape but identical payload semantics, so both share this.
+fn payloads_for_ids(
+    col: &crate::collection::Collection,
+    ids: &[u64],
+) -> Result<std::collections::HashMap<String, serde_json::Value>, (axum::http::StatusCode, String)>
+{
     let scalars = col
         .scalars
         .lock()
         .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    let found = scalars.payloads_for(&resp.ids);
+    let found = scalars.payloads_for(ids);
     let mut payloads = std::collections::HashMap::with_capacity(found.len());
     for (id, row) in found {
         let obj: serde_json::Map<String, serde_json::Value> = row
@@ -875,8 +1073,7 @@ fn attach_payloads(
             .collect();
         payloads.insert(id.to_string(), serde_json::Value::Object(obj));
     }
-    resp.payloads = Some(payloads);
-    Ok(())
+    Ok(payloads)
 }
 
 /// 从「按 4k 过取回来的候选对」中剔除非有限距离，再截断到 k。
@@ -961,7 +1158,7 @@ fn validate_upsert_vectors(
 /// EN: Single read-boundary validator (dim + finiteness). A non-finite query yields NaN
 /// distances and undefined ranking (HiiL0 defends itself by returning empty); reject 400
 /// before touching the index.
-fn validate_query_vector(
+pub(crate) fn validate_query_vector(
     vector: &[f32],
     expected_dim: usize,
     context: &str,
@@ -982,6 +1179,83 @@ fn validate_query_vector(
         ));
     }
     Ok(())
+}
+
+/// 解析请求中的稀疏词项数组 `[[term_id, weight], …]`（P4）。
+///
+/// 为什么在处理器里解析原始 JSON 而不是让 serde 直接反序列化成
+/// `Vec<(u32, f32)>`：元组形状错误会让 axum 的 Json 提取器拒绝并返回 422，
+/// 而接口契约要求 400；这里逐项校验还能把错误定位到 `context`/下标。
+/// 解析复用内核 [`houyi_vector::sparse::normalize_terms`]（term 范围、有限正
+/// 权重、数量上限、重复 term 求和、升序），保证 HTTP、WAL、内核三方校验
+/// 完全一致。返回规范化后的词项（重复项已求和）。
+///
+/// EN: Parse sparse term pairs `[[term_id, weight], …]` (P4). Raw JSON is used
+/// because tuple shape errors would surface as axum's 422 instead of the
+/// required 400, and per-entry checks can name the offending index. Parsing
+/// reuses the kernel's `normalize_terms` (term range, finite positive weights,
+/// count limit, duplicate summing, ascending order) so the HTTP, WAL and kernel
+/// validations are identical. Returns normalized terms (duplicates summed).
+fn parse_sparse_terms_wire(
+    value: &serde_json::Value,
+    max_terms: usize,
+    context: &str,
+) -> Result<Vec<(u32, f32)>, (axum::http::StatusCode, String)> {
+    let pairs = value.as_array().ok_or_else(|| {
+        (
+            axum::http::StatusCode::BAD_REQUEST,
+            format!("{context} sparse must be an array of [term_id, weight] pairs"),
+        )
+    })?;
+    if pairs.len() > max_terms {
+        return Err((
+            axum::http::StatusCode::BAD_REQUEST,
+            format!(
+                "{context} sparse has {} pairs, exceeding the limit of {max_terms}",
+                pairs.len()
+            ),
+        ));
+    }
+    let mut raw: Vec<(u32, f32)> = Vec::with_capacity(pairs.len());
+    for (idx, pair) in pairs.iter().enumerate() {
+        let pair = pair.as_array().filter(|p| p.len() == 2).ok_or_else(|| {
+            (
+                axum::http::StatusCode::BAD_REQUEST,
+                format!("{context} sparse[{idx}] must be a 2-element [term_id, weight] array"),
+            )
+        })?;
+        let term = pair[0].as_u64().ok_or_else(|| {
+            (
+                axum::http::StatusCode::BAD_REQUEST,
+                format!(
+                    "{context} sparse[{idx}][0] term_id must be an integer within 1..={}",
+                    houyi_vector::sparse::MAX_SPARSE_TERM_ID
+                ),
+            )
+        })?;
+        if term == 0 || term > houyi_vector::sparse::MAX_SPARSE_TERM_ID as u64 {
+            return Err((
+                axum::http::StatusCode::BAD_REQUEST,
+                format!(
+                    "{context} sparse[{idx}][0] term_id {term} out of range (1..={})",
+                    houyi_vector::sparse::MAX_SPARSE_TERM_ID
+                ),
+            ));
+        }
+        let weight = pair[1].as_f64().ok_or_else(|| {
+            (
+                axum::http::StatusCode::BAD_REQUEST,
+                format!("{context} sparse[{idx}][1] weight must be a number"),
+            )
+        })?;
+        raw.push((term as u32, weight as f32));
+    }
+    normalize_terms(&raw, max_terms).map_err(|e| {
+        (
+            axum::http::StatusCode::BAD_REQUEST,
+            format!("{context} sparse: {e}"),
+        )
+    })
 }
 
 /// 在指定 Collection 中检索
@@ -1221,6 +1495,20 @@ pub async fn handle_collection_delete(
                 .collections_wal
                 .append(payload)
                 .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+            // 稀疏移除先于标量墓碑（顺序固定，WAL 重放同序）；remove_doc 对
+            // 不存在的 id 幂等，因此重放/复制 apply 可安全重复执行。
+            // EN: Sparse removal precedes scalar tombstones (fixed order, same as
+            // WAL replay); remove_doc is idempotent for unknown ids, so replay and
+            // replication apply can safely repeat.
+            if let Some(index) = col.sparse_index() {
+                let mut guard = index
+                    .write()
+                    .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+                for id in &ids {
+                    guard.remove_doc(*id);
+                }
+                guard.compact_if_needed();
+            }
             let mut scalars = col
                 .scalars
                 .lock()
@@ -1283,12 +1571,14 @@ pub async fn handle_collection_delete(
             .append(payload)
             .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
     };
-    // 仅显式 ids 路径：先删向量再记标量墓碑——不支持 delete 的后端在首个调用即
-    // 报错返回，标量页不被污染（不会出现「向量还在、payload 却消失」的半删除）。
-    // EN: Explicit-ids-only path — vectors first, scalar tombstones second: a
-    // backend that rejects deletes errors on the very first call, before any
-    // tombstone is registered, so the scalar page stays untouched (no half-deleted
-    // state where the vector survives but its payload vanished).
+    // 仅显式 ids 路径：先删向量，成功后再做稀疏移除与标量墓碑——不支持
+    // delete 的后端在首个调用即报错返回，避免「向量还在、稀疏数据却已消失」
+    // 的模态分叉（WAL 已落盘，重放会再次删除，结果仍收敛）。
+    // EN: Explicit-ids-only path — vectors first, sparse removal and scalar
+    // tombstones only after the deletes succeed: a backend that rejects deletes
+    // errors on the first call without destroying sparse data while the vector
+    // survives (the WAL record is already durable, so replay redrives the same
+    // delete and still converges).
     let mut deleted = 0usize;
     let mut removed_ids = Vec::new();
     for id in &ids {
@@ -1300,6 +1590,19 @@ pub async fn handle_collection_delete(
             Ok(false) => {}
             Err(e) => return Err((axum::http::StatusCode::BAD_REQUEST, e)),
         }
+    }
+    // 稀疏移除覆盖全部请求 id（含后端不存在的 id）与重放语义一致；remove_doc
+    // 幂等。
+    // EN: Sparse removal covers every requested id (including ids absent from the
+    // backend), matching replay semantics; remove_doc is idempotent.
+    if let Some(index) = col.sparse_index() {
+        let mut guard = index
+            .write()
+            .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        for id in &ids {
+            guard.remove_doc(*id);
+        }
+        guard.compact_if_needed();
     }
     if !removed_ids.is_empty() {
         let mut scalars = col
@@ -2285,10 +2588,16 @@ pub async fn handle_version() -> Json<serde_json::Value> {
     Json(serde_json::json!({
         "name": "houyidb",
         "version": env!("CARGO_PKG_VERSION"),
+        // 构建时由 build.rs 注入；源码包无 .git 时为 "unknown"。
+        // EN: Injected by build.rs at build time; "unknown" for source packages
+        // without .git.
+        "build_sha": option_env!("HOUYIDB_GIT_SHA").unwrap_or("unknown"),
         "api": "v1",
         "capabilities": ["lease", "demote", "quorum", "replication_status", "query_log",
                          "demote_follower_of", "collection_export", "collection_delete",
-                         "collection_create", "collection_metric"],
+                         "collection_create", "collection_metric", "vector_dtype_f16",
+                         "quantization_int8", "quantization_rabitq",
+                         "sparse_bm25", "fusion_search"],
     }))
 }
 
@@ -2399,6 +2708,14 @@ pub async fn handle_collection_status(
             format!("collection '{name}' not found"),
         )
     })?;
+    // 先取 `built` 再取 `pending`：若反序，可能读到「构图开始前的 pending」
+    // 搭配「构图完成后的 built=true」，把已被构建消费的缓冲误报为
+    // `rebuild_required`。正序下 built=true 之后的 pending 一定已是构建后新写入。
+    // EN: Read `built` before `pending`: the reverse order can pair a
+    // pre-build pending count with a post-build `built=true`, falsely reporting
+    // already-consumed rows as `rebuild_required`. In this order, pending read
+    // after `built=true` only contains post-build writes.
+    let lazy_built = col.backend.lazy_build_status();
     let pending = col.backend.pending_build_count().await;
     let indexed = col.backend.indexed_count().await;
     // hot 缓冲里的点已进入内存但尚未进构图队列；只报 indexed+pending 的
@@ -2430,6 +2747,13 @@ pub async fn handle_collection_status(
         "dims": col.dims,
         "metric": col.metric.as_str(),
         "index_type": col.index_type,
+        // 存储编码创建时定型（f32 | f16），只读回显。
+        // EN: storage encoding fixed at creation (f32 | f16), read-only echo.
+        "vector_dtype": col.vector_dtype().as_str(),
+        // 图侧量化同为创建时定型（none | int8 | rabitq），只读回显。
+        // EN: graph-side quantization is also fixed at creation
+        // (none | int8 | rabitq), read-only echo.
+        "quantization": col.quantization().as_str(),
         "ha_level": col.ha_level().as_str(),
         "applied_lsn": col.applied_lsn(),
         "scalar_row_count": scalar_stats.physical_rows,
@@ -2458,6 +2782,52 @@ pub async fn handle_collection_status(
             );
         }
     }
+    // 惰性构图后端（clustered / flat-clustered / pq-flat）的一次性构图状态：
+    // `built=true` 后写入只进缓冲、不会入图，`rebuild_required` 显式提示必须
+    // 重建集合才能检索到这些行（幂等口径）。即时后端省略该字段。`buffered`
+    // 复用上方同一次 `pending` 快照（懒后端的 pending 即缓冲行数），且构建中
+    // `built` 返回 false，状态端点不会阻塞等待构图锁。
+    // EN: One-shot build state for lazy backends (clustered / flat-clustered /
+    // pq-flat): after `built=true` writes only fill the buffer and never enter the
+    // graph; `rebuild_required` states explicitly that a collection rebuild is
+    // needed to search them. Omitted for eager backends. `buffered` reuses the
+    // `pending` snapshot above (pending is the buffer length for lazy backends);
+    // `built` was sampled before that read so the pair cannot contradict, and
+    // status never blocks on the build lock.
+    if let Some(built) = lazy_built {
+        if let Some(obj) = body.as_object_mut() {
+            obj.insert(
+                "lazy_build".to_string(),
+                serde_json::json!({
+                    "built": built,
+                    "buffered": pending,
+                    "rebuild_required": built && pending > 0,
+                }),
+            );
+        }
+    }
+    // 稀疏索引状态（P4）：none 模式只回显 mode——给 0 统计会被误读成
+    // 「已启用但为空」，与创建时的事实相反。
+    // EN: Sparse index status (P4): none-mode echoes mode only — zeroed stats
+    // would read as "enabled but empty", contradicting the creation-time fact.
+    let sparse_stats = col
+        .sparse_stats()
+        .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    if let Some(obj) = body.as_object_mut() {
+        obj.insert(
+            "sparse".to_string(),
+            match sparse_stats {
+                Some(stats) => serde_json::json!({
+                    "mode": col.sparse_mode().as_str(),
+                    "doc_count": stats.doc_count,
+                    "term_count": stats.term_count,
+                    "posting_count": stats.posting_count,
+                    "dead_postings": stats.dead_postings,
+                }),
+                None => serde_json::json!({"mode": "none"}),
+            },
+        );
+    }
     Ok(Json(body))
 }
 
@@ -2466,7 +2836,10 @@ pub async fn handle_collection_status(
 ///
 /// 行格式 / line format:
 /// - header：`{"format":"houyidb-export","version":1,"collection":..,"dims":..,"metric":..,"index_type":..,"count":N}`
-/// - 记录：`{"id":..,"vector":[..],"payload":{..}|null}`（按 id 升序）
+/// - 记录：`{"id":..,"vector":[..],"payload":{..}|null,"sparse":[[t,w]..]?}`（按 id 升序；
+///   `sparse` 仅在 bm25 集合且该文档有词项时出现——加法字段，普通消费方忽略即可）
+///   EN: records carry an optional additive `"sparse"` array only for bm25
+///   collections and only for docs with terms; ordinary consumers may ignore it.
 /// - footer：`{"end":true,"count":N}`
 ///
 /// 一致性 / consistency: 捕获阶段短暂持有集合写锁，向量表与 payload 页来自同一
@@ -2494,9 +2867,9 @@ pub async fn handle_collection_export(
             format!("collection '{name}' not found"),
         )
     })?;
-    let (vectors, payloads) = {
-        // 锁序与写路径一致：write_lock 先于 scalars。
-        // EN: lock order matches writes: write_lock before scalars.
+    let (vectors, payloads, sparse_rows) = {
+        // 锁序与写路径一致：write_lock 先于 scalars / sparse。
+        // EN: lock order matches writes: write_lock before scalars / sparse.
         let _write = col
             .begin_write()
             .await
@@ -2526,7 +2899,41 @@ pub async fn handle_collection_export(
         };
         let payloads: HashMap<u64, HashMap<String, houyi_core::ScalarValue>> =
             rows.into_iter().collect();
-        (vectors, payloads)
+        // 稀疏词项视图：同一次捕获时刻导出，避免「向量与词项来自不同时点」；
+        // 只含存活 posting，term 升序 → 每文档的词项天然升序。
+        // EN: Sparse term view captured at the same instant as the vectors (no
+        // cross-instant mixing); live postings only, terms ascending — so each
+        // doc's term list comes out ascending too.
+        let sparse_rows: Option<HashMap<u64, Vec<(u32, f32)>>> = match col.sparse_mode() {
+            SparseMode::None => None,
+            SparseMode::Bm25 => {
+                let lock = col.sparse_index().ok_or_else(|| {
+                    (
+                        axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                        "sparse index missing on a bm25 collection (invariant violation)"
+                            .to_string(),
+                    )
+                })?;
+                let view = lock
+                    .read()
+                    .map_err(|e| {
+                        (
+                            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                            format!("export sparse: {e}"),
+                        )
+                    })?
+                    .snapshot_view();
+                let mut map: HashMap<u64, Vec<(u32, f32)>> =
+                    HashMap::with_capacity(view.doc_count as usize);
+                for (term, postings) in view.terms {
+                    for (doc, weight) in postings {
+                        map.entry(doc).or_default().push((term, weight));
+                    }
+                }
+                Some(map)
+            }
+        };
+        (vectors, payloads, sparse_rows)
     };
     let count = vectors.len();
     let header = serde_json::json!({
@@ -2554,8 +2961,8 @@ pub async fn handle_collection_export(
             async move { Ok::<Bytes, std::io::Error>(Bytes::from(header_line)) },
         );
     let records = futures_util::stream::unfold(
-        (vectors, payloads, 0usize, count),
-        |(vectors, payloads, idx, count)| async move {
+        (vectors, payloads, sparse_rows, 0usize, count),
+        |(vectors, payloads, sparse_rows, idx, count)| async move {
             if idx >= count {
                 return None;
             }
@@ -2569,8 +2976,21 @@ pub async fn handle_collection_export(
                         .collect(),
                 )
             });
-            let record =
-                serde_json::json!({"id": id, "vector": vector.as_ref(), "payload": payload});
+            // 导出线格式始终是 f32 JSON：f16 行在此提升（f16 值可精确表示为 f32）。
+            // 用 `to_f32_cow` 让 f32 行零拷贝序列化（只有 f16 行才分配提升缓冲）。
+            // EN: The export wire format is f32 JSON; f16 rows are lifted here
+            // (every f16 value is exactly representable in f32). `to_f32_cow`
+            // lets f32 rows serialize zero-copy (only f16 rows allocate a lifted buffer).
+            let mut record =
+                serde_json::json!({"id": id, "vector": vector.to_f32_cow(), "payload": payload});
+            // 稀疏词项按需追加（加法字段）：无词项的文档不出现该键。
+            // EN: Append sparse terms on demand (additive field); docs without
+            // terms omit the key entirely.
+            if let Some(terms) = sparse_rows.as_ref().and_then(|map| map.get(id)) {
+                if let Some(obj) = record.as_object_mut() {
+                    obj.insert("sparse".to_string(), serde_json::json!(terms));
+                }
+            }
             let item = match serde_json::to_vec(&record) {
                 Ok(mut line) => {
                     line.push(b'\n');
@@ -2581,7 +3001,7 @@ pub async fn handle_collection_export(
                     format!("export record {id}: {e}"),
                 )),
             };
-            Some((item, (vectors, payloads, idx + 1, count)))
+            Some((item, (vectors, payloads, sparse_rows, idx + 1, count)))
         },
     );
     let footer_stream =
@@ -2962,6 +3382,324 @@ fn intersect_opt(prev: Option<Vec<u64>>, new: &[u64]) -> Option<Vec<u64>> {
     }
 }
 
+/// 融合检索的融合后结果（按模态对齐的三个数组）。
+/// EN: Post-fusion outcome with per-modality arrays aligned to `ids`.
+pub(crate) struct FusionOutcome {
+    pub ids: Vec<u64>,
+    pub scores: Vec<f32>,
+    pub dense_scores: Vec<Option<f32>>,
+    pub sparse_scores: Vec<Option<f32>>,
+}
+
+/// dense+sparse 融合的共享执行核心（HTTP 与 pgwire 共用；pgwire 只消费 `ids`）。
+///
+/// 两路候选各按 `4*k` 过取：dense 走 `search_scored_with_ef_override`（带过滤
+/// mask 与 ef 覆盖），距离经 [`metric_similarity`] 统一换算成「越大越好」的相似度；
+/// sparse 走 `Bm25Index::search`（BM25 分天然越大越好）；有过滤时改用
+/// `Bm25Index::search_filtered`，让 mask 在**截断前**生效，避免 4*k 先截断
+/// 再过滤导致稀疏模态整体丢失。
+/// 融合本身复用内核纯函数（RRF / min-max 加权），本函数不复制任何打分算法。
+/// 不检查 `sparse_mode`：调用边缘各自负责把「集合未启用稀疏」映射成自己的
+/// 错误信封（HTTP 400 / pgwire 0A000）。
+/// EN: Shared dense+sparse fusion core reused by HTTP and pgwire (pgwire consumes
+/// `ids` only). Both sides over-fetch 4*k: dense via `search_scored_with_ef_override`
+/// (filter mask + ef override) with distances normalized by [`metric_similarity`]
+/// into higher-is-better similarities; sparse via `Bm25Index::search` (BM25 is
+/// higher-is-better), switching to `Bm25Index::search_filtered` when filters are
+/// present so the mask applies **before truncation** — truncate-then-filter would
+/// silently drop the whole sparse modality at 4*k. Fusion reuses the kernel pure
+/// functions (RRF / min-max weighted) — no scoring algorithm is duplicated here.
+/// `sparse_mode` is not checked: each edge maps "sparse disabled" to its own error
+/// envelope (HTTP 400 / pgwire 0A000).
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn execute_fusion(
+    col: &crate::collection::Collection,
+    vector: &[f32],
+    sparse_query: &[(u32, f32)],
+    k: usize,
+    ef_search: Option<usize>,
+    filter_ids: Option<&[u64]>,
+    mode: FusionMode,
+    rrf_k: u32,
+    alpha: f32,
+) -> Result<FusionOutcome, (axum::http::StatusCode, String)> {
+    let fetch_k = k.saturating_mul(4).max(k);
+    let dense_pairs: Vec<(u64, f32)> = col
+        .backend
+        .search_scored_with_ef_override(vector, fetch_k, filter_ids, ef_search)
+        .await
+        .into_iter()
+        .filter_map(|(id, distance)| metric_similarity(distance, col.metric).map(|s| (id, s)))
+        .collect();
+    // 稀疏路：读锁内同步算分；std guard 在 .await 之前释放（锁纪律）。
+    // EN: Sparse side scores under a read lock; the std guard is released before
+    // any later .await (lock discipline).
+    let sparse_pairs: Vec<(u64, f32)> = {
+        let index = col.sparse_index().ok_or_else(|| {
+            (
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                "sparse index missing on a bm25 collection (invariant violation)".to_string(),
+            )
+        })?;
+        let guard = index
+            .read()
+            .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        let pairs = match filter_ids {
+            // mask 在截断前应用：过滤后的候选仍能填满 fetch_k。
+            // EN: Mask before truncation so filtered candidates still fill fetch_k.
+            Some(ids) => {
+                let allowed: std::collections::HashSet<u64> = ids.iter().copied().collect();
+                guard.search_filtered(sparse_query, fetch_k, &allowed)
+            }
+            None => guard.search(sparse_query, fetch_k),
+        };
+        drop(guard);
+        pairs
+    };
+    let fused = match mode {
+        FusionMode::Rrf => rrf_fuse(&dense_pairs, &sparse_pairs, k, rrf_k),
+        FusionMode::Weighted => {
+            // 归一化只在过滤后的候选集上做；单元素列表归一为 1.0。
+            // EN: Min-max over the filtered candidate lists; single-element lists normalize to 1.0.
+            let dense_normed = normalize_min_max(&dense_pairs);
+            let sparse_normed = normalize_min_max(&sparse_pairs);
+            weighted_fuse(&dense_normed, &sparse_normed, alpha, k)
+        }
+    };
+    let dense_map: std::collections::HashMap<u64, f32> = dense_pairs.into_iter().collect();
+    let sparse_map: std::collections::HashMap<u64, f32> = sparse_pairs.into_iter().collect();
+    let mut outcome = FusionOutcome {
+        ids: Vec::with_capacity(fused.len()),
+        scores: Vec::with_capacity(fused.len()),
+        dense_scores: Vec::with_capacity(fused.len()),
+        sparse_scores: Vec::with_capacity(fused.len()),
+    };
+    for (id, score) in fused {
+        outcome.ids.push(id);
+        outcome.scores.push(score);
+        // 缺席模态显式 null，避免把 0 误解成「命中且得零分」。
+        // EN: Absent modality is an explicit null so 0 is never mistaken for a hit.
+        outcome.dense_scores.push(dense_map.get(&id).copied());
+        outcome.sparse_scores.push(sparse_map.get(&id).copied());
+    }
+    FUSION_SEARCHES_TOTAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    Ok(outcome)
+}
+
+/// 融合检索端点（`POST /v1/collections/{name}/fusion/search`）。
+/// EN: Fusion-search endpoint (`POST /v1/collections/{name}/fusion/search`).
+pub async fn handle_collection_fusion_search(
+    State(state): State<BenchmarkHttpState>,
+    axum::extract::Path(name): axum::extract::Path<String>,
+    principal: Option<axum::extract::Extension<crate::rbac::AuthenticatedPrincipal>>,
+    Json(req): Json<FusionSearchRequest>,
+) -> Result<Json<FusionSearchResponse>, (axum::http::StatusCode, String)> {
+    let started = std::time::Instant::now();
+    let k = req.k;
+    let filtered = !req.filters.is_empty();
+    let result = collection_fusion_search_inner(
+        State(state.clone()),
+        axum::extract::Path(name.clone()),
+        principal.clone(),
+        Json(req),
+    )
+    .await;
+    if let Err((status, _)) = &result {
+        record_query_log(
+            &state,
+            principal.as_ref().map(|ext| &ext.0),
+            "fusion_search",
+            Some(&name),
+            k,
+            status.as_u16(),
+            started,
+            0,
+            filtered,
+        );
+    }
+    result
+}
+
+async fn collection_fusion_search_inner(
+    State(state): State<BenchmarkHttpState>,
+    axum::extract::Path(name): axum::extract::Path<String>,
+    principal: Option<axum::extract::Extension<crate::rbac::AuthenticatedPrincipal>>,
+    Json(req): Json<FusionSearchRequest>,
+) -> Result<Json<FusionSearchResponse>, (axum::http::StatusCode, String)> {
+    let col = state.collections.get(&name).ok_or_else(|| {
+        (
+            axum::http::StatusCode::NOT_FOUND,
+            format!("collection '{name}' not found"),
+        )
+    })?;
+
+    // k 边界与稠密查询校验先于加锁/检索（与另三条检索路径同口径）。
+    // EN: k boundary and dense-query validation before locking/searching (same
+    // contract as the other search paths).
+    if req.k == 0 {
+        return Err((
+            axum::http::StatusCode::BAD_REQUEST,
+            "k must be >= 1 (use a positive top-k)".to_string(),
+        ));
+    }
+    reject_search_limits(req.k, req.ef_search)?;
+    validate_query_vector(&req.vector, col.dims, "query")?;
+
+    // 稀疏未启用的集合上融合检索无意义：显式拒绝而非返回半路结果。
+    // EN: Fusion search is meaningless when sparse is disabled; refuse rather
+    // than return a half-modal result.
+    if col.sparse_mode() != SparseMode::Bm25 {
+        return Err((
+            axum::http::StatusCode::BAD_REQUEST,
+            format!(
+                "fusion search requires a collection created with sparse=\"bm25\" \
+                 (collection '{name}' has sparse=\"none\")"
+            ),
+        ));
+    }
+    let sparse_raw = req.sparse.as_ref().ok_or_else(|| {
+        (
+            axum::http::StatusCode::BAD_REQUEST,
+            "sparse query terms are required for fusion search (e.g. [[1, 0.9]])".to_string(),
+        )
+    })?;
+    let sparse_query = parse_sparse_terms_wire(sparse_raw, MAX_SPARSE_QUERY_TERMS, "sparse query")?;
+    if sparse_query.is_empty() {
+        return Err((
+            axum::http::StatusCode::BAD_REQUEST,
+            "sparse query terms must not be empty".to_string(),
+        ));
+    }
+
+    // 融合参数：缺省值在服务端补齐；显式提供的值即使当前模式不参与计算也
+    // 严格校验（可预测的 400 优于静默忽略），响应只回显当前模式实际使用的参数。
+    // EN: Fusion params: defaults are filled server-side; explicitly supplied
+    // values are validated even when the active mode ignores them (a predictable
+    // 400 beats silent ignore). The response echoes only the params that scored.
+    let mode = match req.fusion.as_deref() {
+        Some(value) => FusionMode::parse_str(value).ok_or_else(|| {
+            (
+                axum::http::StatusCode::BAD_REQUEST,
+                format!("invalid fusion {value:?} (expect rrf|weighted)"),
+            )
+        })?,
+        None => FusionMode::Rrf,
+    };
+    let rrf_k = match req.rrf_k {
+        Some(value) if !(1..=MAX_RRF_K).contains(&value) => {
+            return Err((
+                axum::http::StatusCode::BAD_REQUEST,
+                format!("rrf_k={value} out of range 1..={MAX_RRF_K}"),
+            ));
+        }
+        Some(value) => value,
+        None => DEFAULT_RRF_K,
+    };
+    let alpha = match req.alpha {
+        Some(value) if !value.is_finite() || !(0.0..=1.0).contains(&value) => {
+            return Err((
+                axum::http::StatusCode::BAD_REQUEST,
+                format!("alpha={value} out of range 0..=1 (must be finite)"),
+            ));
+        }
+        Some(value) => value,
+        None => DEFAULT_FUSION_ALPHA,
+    };
+
+    // 过滤谓词构造沿用唯一解释入口；bm25 仅允许 hnsw/flat，过滤天然可用，
+    // 但仍显式校验后端以防御建集合路径以外的状态。
+    // EN: Predicates come from the single interpreter; bm25 only exists on
+    // hnsw/flat, but the backend is still checked defensively.
+    let predicates: Vec<ScalarPredicate> = if req.filters.is_empty() {
+        Vec::new()
+    } else {
+        req.filters
+            .iter()
+            .map(|filter| filter_predicate(&filter.column, &filter.op, &filter.value))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| (axum::http::StatusCode::BAD_REQUEST, e))?
+    };
+    let mut filter_ids: Option<Vec<u64>> = None;
+    if !req.filters.is_empty() {
+        if col.index_type != "hnsw" && col.index_type != "flat" {
+            return Err((
+                axum::http::StatusCode::BAD_REQUEST,
+                format!(
+                    "filtered fusion search is unsupported for index_type '{}' (supported: hnsw, flat)",
+                    col.index_type
+                ),
+            ));
+        }
+        // 标量页锁只覆盖求交集，不跨 .await。
+        // EN: The scalar lock covers only the intersection and never spans .await.
+        let scalars = col
+            .scalars
+            .lock()
+            .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        for (filter, predicate) in req.filters.iter().zip(predicates.iter()) {
+            let ids = scalars.matching_ids(&filter.column, predicate);
+            filter_ids = intersect_opt(filter_ids, &ids);
+        }
+    }
+
+    let t0 = std::time::Instant::now();
+    let outcome = execute_fusion(
+        &col,
+        &req.vector,
+        &sparse_query,
+        req.k,
+        req.ef_search,
+        filter_ids.as_deref(),
+        mode,
+        rrf_k,
+        alpha,
+    )
+    .await?;
+    let elapsed_ms = t0.elapsed().as_millis() as u64;
+    let threshold = state
+        .pgwire_metrics
+        .slow_query_ms
+        .load(std::sync::atomic::Ordering::Relaxed);
+    if crate::types::slow_query_exceeded(elapsed_ms, threshold) {
+        tracing::warn!(
+            elapsed_ms,
+            threshold_ms = threshold,
+            collection = %name,
+            k = req.k,
+            fusion = mode.as_str(),
+            "slow http fusion search"
+        );
+    }
+    let mut resp = FusionSearchResponse {
+        ids: outcome.ids,
+        scores: outcome.scores,
+        dense_scores: outcome.dense_scores,
+        sparse_scores: outcome.sparse_scores,
+        metric: col.metric.as_str().to_string(),
+        fusion: FusionParamsResponse {
+            mode: mode.as_str().to_string(),
+            rrf_k: (mode == FusionMode::Rrf).then_some(rrf_k),
+            alpha: (mode == FusionMode::Weighted).then_some(alpha),
+        },
+        payloads: None,
+    };
+    if req.include_payload {
+        resp.payloads = Some(payloads_for_ids(&col, &resp.ids)?);
+    }
+    record_query_log(
+        &state,
+        principal.as_ref().map(|ext| &ext.0),
+        "fusion_search",
+        Some(&name),
+        req.k,
+        200,
+        t0,
+        resp.ids.len(),
+        filter_ids.is_some(),
+    );
+    Ok(Json(resp))
+}
+
 async fn benchmark_health() -> Json<HealthResponse> {
     Json(HealthResponse {
         status: "ok".to_string(),
@@ -3017,15 +3755,29 @@ pub async fn benchmark_readyz(
 /// this constant so it can't drift.
 const METRICS_WAL_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 
-/// `/metrics` Prometheus 文本暴露端点（P4.0.4）：8 个核心指标，全部取自现有
-/// 原子计数/快照，抓取路径零额外采集开销；不引 prometheus client 依赖——
-/// 指标数量少且格式简单，手写 text exposition 比拖一个 client crate 更透明。
-/// Prometheus text exposition endpoint: 8 core metrics sourced from existing
-/// atomics/snapshots, so scrapes add no collection cost. No client crate —
-/// the metric set is small enough that hand-written exposition is clearer.
+/// Prometheus label 值转义：反斜杠、双引号、换行（collection 名来自用户输入，
+/// 直接拼接会破坏 exposition 格式甚至注入额外样本）。
+/// EN: Escape backslash, double quote, and newline in a Prometheus label value.
+/// Collection names are user input; naive interpolation would corrupt the
+/// exposition or inject extra samples.
+fn prometheus_label_escape(value: &str) -> String {
+    value
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('\n', "\\n")
+}
+
+/// `/metrics` Prometheus 文本暴露端点（P4.0.4）：核心指标取自现有原子计数/
+/// 快照；另暴露 per-collection 向量 gauge（`indexed_count` 为廉价读锁计数）。
+/// 不引 prometheus client 依赖——指标数量少且格式简单，手写 text exposition
+/// 比拖一个 client crate 更透明。
+/// EN: Prometheus text exposition endpoint: core metrics come from existing
+/// atomics/snapshots, plus a per-collection vector gauge (`indexed_count` is a
+/// cheap read-lock count). No client crate — the metric set is small enough
+/// that hand-written exposition is clearer.
 ///
 /// 命名遵循 Prometheus 约定（`_total` 后缀 = counter；单位后缀 `_bytes`）。
-/// Naming follows Prometheus conventions (`_total` = counter, `_bytes` = bytes unit).
+/// EN: Naming follows Prometheus conventions (`_total` = counter, `_bytes` = bytes unit).
 // pub：bin target 的集成测试（tests.rs）跨 crate 装配路由做行为守卫。
 pub async fn benchmark_metrics(
     State(state): State<BenchmarkHttpState>,
@@ -3034,6 +3786,26 @@ pub async fn benchmark_metrics(
     let indexed = state.index.indexed_count().await;
     let pending = state.index.pending_build_count().await;
     let bm = state.index.builder_metrics();
+    // per-collection 向量 gauge：名称排序保证墙面稳定；每个集合只读一次
+    // `indexed_count`（廉价计数，不做 status 的标量 O(rows) 扫描）。
+    // EN: Per-collection vector gauge: sorted names keep the exposition stable,
+    // and each collection only reads `indexed_count` (cheap; no status-style
+    // O(rows) scalar scan).
+    let mut collection_names = state.collections.list();
+    collection_names.sort();
+    let mut collection_vectors_section = String::from(
+        "# HELP houyidb_collection_vectors Vectors indexed per collection.\n\
+         # TYPE houyidb_collection_vectors gauge\n",
+    );
+    for name in collection_names {
+        if let Some(col) = state.collections.get(&name) {
+            let vectors = col.backend.indexed_count().await;
+            collection_vectors_section.push_str(&format!(
+                "houyidb_collection_vectors{{collection=\"{}\"}} {vectors}\n",
+                prometheus_label_escape(&name)
+            ));
+        }
+    }
     // active_file_len 在 Async 模式要穿有界通道等写线程应答（阻塞 recv），
     // 移出 runtime worker；读取失败（如写线程死亡 BrokenPipe）降级为省略
     // 该族指标 + warn，而非整篇 500——WAL 出问题时恰恰不能连索引/pgwire
@@ -3358,6 +4130,55 @@ pub async fn benchmark_metrics(
          # TYPE houyidb_collections_scalar_compaction_dropped_rows_total counter\n\
          houyidb_collections_scalar_compaction_dropped_rows_total {scalar_dropped}\n"
     );
+    // 稀疏索引聚合指标（P4）：跨集合求和，避免 per-collection 标签的基数爆炸；
+    // bm25 集合之外的集合对四项 gauge 贡献 0。融合检索计数是进程级计数器。
+    // EN: Aggregate sparse metrics (P4): summed across collections to avoid
+    // per-collection label cardinality blowup; non-bm25 collections contribute 0.
+    // Fusion searches are counted process-wide.
+    let (sparse_docs, sparse_terms, sparse_postings, sparse_dead) = {
+        let mut docs = 0u64;
+        let mut terms = 0u64;
+        let mut postings = 0u64;
+        let mut dead = 0u64;
+        for name in state.collections.list() {
+            let Some(col) = state.collections.get(&name) else {
+                continue;
+            };
+            match col.sparse_stats() {
+                Ok(Some(stats)) => {
+                    docs += stats.doc_count;
+                    terms += stats.term_count;
+                    postings += stats.posting_count;
+                    dead += stats.dead_postings;
+                }
+                Ok(None) => {}
+                // 中毒锁不等于“无稀疏”：保留可见性，用 0 会误导容量规划。
+                // EN: A poisoned lock is not "no sparse"; zeroes would mislead capacity planning.
+                Err(e) => {
+                    tracing::warn!(collection = %name, error = %e, "sparse stats unavailable");
+                }
+            }
+        }
+        (docs, terms, postings, dead)
+    };
+    let sparse_section = format!(
+        "# HELP houyidb_sparse_docs Documents present in BM25 sparse indexes across collections.\n\
+         # TYPE houyidb_sparse_docs gauge\n\
+         houyidb_sparse_docs {sparse_docs}\n\
+         # HELP houyidb_sparse_terms Distinct terms across BM25 sparse indexes.\n\
+         # TYPE houyidb_sparse_terms gauge\n\
+         houyidb_sparse_terms {sparse_terms}\n\
+         # HELP houyidb_sparse_postings Live (doc, term) postings across BM25 sparse indexes.\n\
+         # TYPE houyidb_sparse_postings gauge\n\
+         houyidb_sparse_postings {sparse_postings}\n\
+         # HELP houyidb_sparse_dead_postings Dead postings awaiting compaction (amplification gauge).\n\
+         # TYPE houyidb_sparse_dead_postings gauge\n\
+         houyidb_sparse_dead_postings {sparse_dead}\n\
+         # HELP houyidb_fusion_searches_total Successful dense+sparse fusion searches since startup.\n\
+         # TYPE houyidb_fusion_searches_total counter\n\
+         houyidb_fusion_searches_total {fusion_searches}\n",
+        fusion_searches = FUSION_SEARCHES_TOTAL.load(std::sync::atomic::Ordering::Relaxed),
+    );
     // Collections WAL 段/保留指标（P5.0.3）。
     // EN: Collections WAL segment/retention metrics (P5.0.3).
     let collections_wal_path =
@@ -3461,6 +4282,7 @@ pub async fn benchmark_metrics(
          # HELP houyidb_index_pending_build Vectors queued for async graph build (readiness watermark {watermark}).\n\
          # TYPE houyidb_index_pending_build gauge\n\
          houyidb_index_pending_build {pending}\n\
+         {collection_vectors_section}\
          # HELP houyidb_index_flush_total Async-builder flush rounds since startup.\n\
          # TYPE houyidb_index_flush_total counter\n\
          houyidb_index_flush_total {flush_count}\n\
@@ -3502,6 +4324,7 @@ pub async fn benchmark_metrics(
          # TYPE houyidb_memory_watermark_rejected_total counter\n\
          houyidb_memory_watermark_rejected_total {mem_rejected}\n\
          {scalar_section}\
+         {sparse_section}\
          # HELP houyidb_graph_snapshot_writes_total Graph snapshot files written since startup (P4.4.0; main index + collections).\n\
          # TYPE houyidb_graph_snapshot_writes_total counter\n\
          houyidb_graph_snapshot_writes_total {gs_writes}\n\
@@ -3547,6 +4370,7 @@ pub async fn benchmark_metrics(
             .graph_snapshot_metrics
             .bytes_written_total
             .load(std::sync::atomic::Ordering::Relaxed),
+        sparse_section = sparse_section,
         collections_section = collections_section,
         replication_section = replication_section,
     );
@@ -3587,6 +4411,19 @@ pub async fn benchmark_upsert(
     // build hints and appended the WAL before the 400: a poisoned record then survived in
     // the log (this path is WAL-first) and poisoned label mappings.
     validate_upsert_vectors(&req.vectors, state.vector_dim)?;
+
+    // 基准主索引没有稀疏旁路索引：带 sparse 的条目必须显式拒绝，绝不静默丢弃
+    // （静默忽略会让客户端以为写入成功，而数据只在 collection 路径存在）。
+    // EN: The benchmark main index has no sparse side index: reject sparse-bearing
+    // items explicitly instead of silently dropping them (a silent drop would let
+    // callers believe the write landed).
+    if req.vectors.iter().any(|v| v.sparse.is_some()) {
+        return Err((
+            axum::http::StatusCode::BAD_REQUEST,
+            "sparse is only supported on collection upserts; the benchmark index has no sparse index"
+                .to_string(),
+        ));
+    }
 
     // 内存水位线（P4.2.4）：校验后、副作用前裁决，超限 503。
     // EN: Memory watermark admission after validation, before side effects.
@@ -4296,6 +5133,12 @@ where
             "/v1/collections/{name}/hybrid/search",
             post(handle_collection_hybrid_search),
         )
+        // dense+sparse 融合检索（P4）：与 hybrid（dense+标量过滤）区分命名。
+        // EN: dense+sparse fusion search (P4); distinct from hybrid (dense+scalar filters).
+        .route(
+            "/v1/collections/{name}/fusion/search",
+            post(handle_collection_fusion_search),
+        )
         .route(
             "/v1/collections/{name}/upsert",
             post(handle_collection_upsert),
@@ -4663,6 +5506,7 @@ mod collection_status_tests {
                 } else {
                     None
                 },
+                sparse: None,
             })
             .collect();
         let _ = handle_collection_upsert(
@@ -4719,6 +5563,399 @@ mod collection_status_tests {
         assert_eq!(status["ha_level"], "semi_sync");
         // WAL/sidecar 由 TempFileCleanup 在 drop 时删除（panic 路径同样执行）。
         // The guard removes the WAL/sidecar on drop, including the panic path.
+    }
+
+    /// 惰性构图后端（clustered / flat-clustered / pq-flat）的 status 必须显式
+    /// 暴露一次性构图语义：未建 → built=false；已建后再写 → buffered>0 且
+    /// rebuild_required=true，这些行不会进图（旧实现只靠 pending_count 不降，
+    /// 运维易误读为构图进行中）。即时后端必须省略该字段。
+    /// EN: The status endpoint must expose one-shot semantics for every lazy
+    /// backend (clustered / flat-clustered / pq-flat): unbuilt -> built=false;
+    /// writes after a build -> buffered>0 with rebuild_required=true, and those
+    /// rows never enter the graph (the old implementation only showed a
+    /// non-decreasing pending count, which reads as an in-flight build). Eager
+    /// backends must omit the field entirely.
+    #[tokio::test]
+    async fn status_reports_one_shot_lazy_build_state() {
+        for index_type in ["clustered", "flat-clustered", "pq-flat"] {
+            let (state, _cleanup) = temp_state(index_type);
+            upsert_rows(&state, &[(1, false)]).await;
+            let status = handle_collection_status(State(state.clone()), Path("st".to_string()))
+                .await
+                .unwrap()
+                .0;
+            assert_eq!(
+                status["lazy_build"]["built"], false,
+                "{index_type}: unbuilt backend must report built=false"
+            );
+            assert_eq!(status["lazy_build"]["buffered"], 1, "{index_type}");
+            assert_eq!(
+                status["lazy_build"]["rebuild_required"], false,
+                "{index_type}"
+            );
+
+            let col = state.collections.get("st").expect("collection");
+            assert_eq!(
+                col.backend.optimize_build().await,
+                1,
+                "{index_type}: one buffered row should build"
+            );
+            let status = handle_collection_status(State(state.clone()), Path("st".to_string()))
+                .await
+                .unwrap()
+                .0;
+            assert_eq!(status["lazy_build"]["built"], true, "{index_type}");
+            assert_eq!(status["lazy_build"]["buffered"], 0, "{index_type}");
+            assert_eq!(
+                status["lazy_build"]["rebuild_required"], false,
+                "{index_type}"
+            );
+
+            // 构图完成后的写入只进缓冲：可检索集合仍是 1 条，且提示需重建。
+            // EN: Post-build writes only fill the buffer: the searchable
+            // collection stays at 1 row and the status flags a rebuild.
+            upsert_rows(&state, &[(2, false)]).await;
+            let status = handle_collection_status(State(state.clone()), Path("st".to_string()))
+                .await
+                .unwrap()
+                .0;
+            assert_eq!(status["indexed_count"], 1, "{index_type}");
+            assert_eq!(status["pending_count"], 1, "{index_type}");
+            assert_eq!(status["lazy_build"]["built"], true, "{index_type}");
+            assert_eq!(status["lazy_build"]["buffered"], 1, "{index_type}");
+            assert_eq!(
+                status["lazy_build"]["rebuild_required"], true,
+                "{index_type}"
+            );
+        }
+
+        // 即时后端不得回显 lazy_build（文档/OpenAPI 契约）。
+        // EN: Eager backends must not echo lazy_build (documented/OpenAPI contract).
+        let (state, _cleanup) = temp_state("hnsw");
+        upsert_rows(&state, &[(1, false)]).await;
+        let status = handle_collection_status(State(state), Path("st".to_string()))
+            .await
+            .unwrap()
+            .0;
+        assert!(
+            status.get("lazy_build").is_none(),
+            "eager hnsw backend must omit lazy_build, got {status}"
+        );
+    }
+
+    /// P1.6：建集合 API 透传 `vector_dtype`——f16 成功回显并落到后端；
+    /// 非法值 / 非 hnsw 组合 400；同名已 f32 再请求 f16 为 409（不可变）。
+    /// EN: P1.6 — the create API forwards `vector_dtype`: f16 echoes and lands
+    /// on the backend; illegal values / non-hnsw combos are 400; requesting f16
+    /// for an existing f32 name is 409 (immutable).
+    #[tokio::test]
+    async fn create_collection_forwards_vector_dtype_and_fails_closed() {
+        let (state, _cleanup) = temp_state("hnsw");
+        let request = |dtype: Option<&str>, index_type: &str| CreateCollectionRequest {
+            dims: 4,
+            metric: None,
+            index_type: Some(index_type.to_string()),
+            hnsw_m: None,
+            hnsw_ef_construction: None,
+            hnsw_ef_search: None,
+            vector_dtype: dtype.map(str::to_string),
+            quantization: None,
+            sparse: None,
+        };
+
+        let (status, body) = handle_create_collection(
+            State(state.clone()),
+            Path("st".to_string()),
+            Json(request(Some("f16"), "hnsw")),
+        )
+        .await
+        .expect("f16 hnsw create must succeed");
+        assert_eq!(status, axum::http::StatusCode::CREATED);
+        assert_eq!(body.vector_dtype, "f16");
+        assert_eq!(
+            state.collections.get("st").unwrap().vector_dtype(),
+            houyi_vector::VectorDtype::F16
+        );
+        assert_eq!(state.collections.get("st").unwrap().index_type, "hnsw");
+
+        // 非法编码与非 hnsw 组合在 validate_create 前/内 fail-fast。
+        // EN: illegal encodings and non-hnsw combos fail fast.
+        let (status, message) = handle_create_collection(
+            State(state.clone()),
+            Path("other".to_string()),
+            Json(request(Some("bf16"), "hnsw")),
+        )
+        .await
+        .expect_err("bf16 must be rejected");
+        assert_eq!(status, axum::http::StatusCode::BAD_REQUEST);
+        assert!(message.contains("invalid vector_dtype"), "{message}");
+
+        let (status, message) = handle_create_collection(
+            State(state.clone()),
+            Path("flat".to_string()),
+            Json(request(Some("f16"), "flat")),
+        )
+        .await
+        .expect_err("flat+f16 must be rejected");
+        assert_eq!(status, axum::http::StatusCode::BAD_REQUEST);
+        assert!(
+            message.contains("only supported for index_type 'hnsw'"),
+            "{message}"
+        );
+
+        // dtype 创建后不可变：同名 f32 已存在再请求 f16 是 409。
+        // EN: dtype is immutable: an existing f32 name refuses f16 with 409.
+        let (status, _) = handle_create_collection(
+            State(state.clone()),
+            Path("drift".to_string()),
+            Json(request(None, "hnsw")),
+        )
+        .await
+        .expect("f32 create must succeed");
+        assert_eq!(status, axum::http::StatusCode::CREATED);
+        let (status, message) = handle_create_collection(
+            State(state.clone()),
+            Path("drift".to_string()),
+            Json(request(Some("f16"), "hnsw")),
+        )
+        .await
+        .expect_err("existing f32 name must refuse f16");
+        assert_eq!(status, axum::http::StatusCode::CONFLICT);
+        assert!(message.contains("vector_dtype"), "{message}");
+    }
+
+    /// P2：建集合 API 透传 `quantization`——int8 成功回显并落到后端；
+    /// 非法值 / 非 hnsw 组合 400；同名已 none 再请求 int8 为 409（不可变）。
+    /// EN: P2 — the create API forwards `quantization`: int8 echoes and lands on
+    /// the backend; illegal values / non-hnsw combos are 400; requesting int8 for
+    /// an existing none name is 409 (immutable).
+    #[tokio::test]
+    async fn create_collection_forwards_quantization_and_fails_closed() {
+        let (state, _cleanup) = temp_state("hnsw");
+        let request = |quantization: Option<&str>, index_type: &str| CreateCollectionRequest {
+            dims: 4,
+            metric: None,
+            index_type: Some(index_type.to_string()),
+            hnsw_m: None,
+            hnsw_ef_construction: None,
+            hnsw_ef_search: None,
+            vector_dtype: None,
+            quantization: quantization.map(str::to_string),
+            sparse: None,
+        };
+
+        let (status, body) = handle_create_collection(
+            State(state.clone()),
+            Path("qi".to_string()),
+            Json(request(Some("int8"), "hnsw")),
+        )
+        .await
+        .expect("int8 hnsw create must succeed");
+        assert_eq!(status, axum::http::StatusCode::CREATED);
+        assert_eq!(body.quantization, "int8");
+        let col = state.collections.get("qi").expect("collection");
+        assert_eq!(col.quantization(), houyi_vector::Quantization::Int8);
+        // 量化必须真正落到图侧后端，而不是只回显字段。
+        // EN: The quantization must land on the graph backend, not just echo.
+        match &col.backend {
+            crate::index_backend::IndexBackend::Hnsw(idx) => {
+                assert_eq!(idx.vector_quantization(), houyi_vector::Quantization::Int8);
+            }
+            _ => panic!("int8 requires hnsw backend"),
+        }
+
+        // 非法取值在 handler 解析层 fail-fast。
+        // EN: illegal values fail fast at the handler's parse layer.
+        let (status, message) = handle_create_collection(
+            State(state.clone()),
+            Path("bad".to_string()),
+            Json(request(Some("int4"), "hnsw")),
+        )
+        .await
+        .expect_err("int4 must be rejected");
+        assert_eq!(status, axum::http::StatusCode::BAD_REQUEST);
+        assert!(message.contains("invalid quantization"), "{message}");
+
+        // 非 hnsw 组合在 validate_create 内 fail-fast。
+        // EN: non-hnsw combos fail fast inside validate_create.
+        let (status, message) = handle_create_collection(
+            State(state.clone()),
+            Path("flat".to_string()),
+            Json(request(Some("int8"), "flat")),
+        )
+        .await
+        .expect_err("flat+int8 must be rejected");
+        assert_eq!(status, axum::http::StatusCode::BAD_REQUEST);
+        assert!(
+            message.contains("only supported for index_type 'hnsw'"),
+            "{message}"
+        );
+
+        // 显式 none 与缺省等价：回显 none。
+        // EN: explicit none equals the default and echoes none.
+        let (status, body) = handle_create_collection(
+            State(state.clone()),
+            Path("qn".to_string()),
+            Json(request(Some("none"), "hnsw")),
+        )
+        .await
+        .expect("explicit none create must succeed");
+        assert_eq!(status, axum::http::StatusCode::CREATED);
+        assert_eq!(body.quantization, "none");
+
+        // 量化创建后不可变：同名已 none 再请求 int8 是 409。
+        // EN: quantization is immutable: an existing none name refuses int8 with 409.
+        let (status, _) = handle_create_collection(
+            State(state.clone()),
+            Path("drift".to_string()),
+            Json(request(None, "hnsw")),
+        )
+        .await
+        .expect("default create must succeed");
+        assert_eq!(status, axum::http::StatusCode::CREATED);
+        let (status, message) = handle_create_collection(
+            State(state.clone()),
+            Path("drift".to_string()),
+            Json(request(Some("int8"), "hnsw")),
+        )
+        .await
+        .expect_err("existing none name must refuse int8");
+        assert_eq!(status, axum::http::StatusCode::CONFLICT);
+        assert!(message.contains("quantization"), "{message}");
+    }
+
+    /// P3：建集合 API 透传 `rabitq`——l2/cosine 成功回显并落到图后端；
+    /// ip/l1 与非 hnsw 组合 400；同名已有量化再请求 rabitq 为 409（不可变）。
+    /// EN: P3 — the create API forwards `rabitq`: l2/cosine echo and land on the
+    /// graph backend; ip/l1 and non-hnsw combos are 400; requesting rabitq for
+    /// an existing quantized name is 409 (immutable).
+    #[tokio::test]
+    async fn create_collection_forwards_rabitq_quantization_and_fails_closed() {
+        let (state, _cleanup) = temp_state("hnsw");
+        let request = |quantization: Option<&str>, index_type: &str, metric: Option<&str>| {
+            CreateCollectionRequest {
+                dims: 4,
+                metric: metric.map(str::to_string),
+                index_type: Some(index_type.to_string()),
+                hnsw_m: None,
+                hnsw_ef_construction: None,
+                hnsw_ef_search: None,
+                vector_dtype: None,
+                quantization: quantization.map(str::to_string),
+                sparse: None,
+            }
+        };
+
+        // l2 与 cosine 均允许：rabitq 落到图侧后端而不是只回显字段。
+        // EN: l2 and cosine are allowed; rabitq lands on the graph backend,
+        // not just the echo field.
+        for (name, metric) in [("qr", "l2"), ("qc", "cosine")] {
+            let (status, body) = handle_create_collection(
+                State(state.clone()),
+                Path(name.to_string()),
+                Json(request(Some("rabitq"), "hnsw", Some(metric))),
+            )
+            .await
+            .expect("rabitq hnsw create must succeed");
+            assert_eq!(status, axum::http::StatusCode::CREATED);
+            assert_eq!(body.quantization, "rabitq");
+            let col = state.collections.get(name).expect("collection");
+            assert_eq!(col.quantization(), houyi_vector::Quantization::RaBitQ);
+            match &col.backend {
+                crate::index_backend::IndexBackend::Hnsw(idx) => {
+                    assert_eq!(
+                        idx.vector_quantization(),
+                        houyi_vector::Quantization::RaBitQ
+                    );
+                }
+                _ => panic!("rabitq requires hnsw backend"),
+            }
+        }
+
+        // ip/l1 没有角度几何语义：create 层 400 fail-fast。
+        // EN: ip/l1 have no angle-based geometry: 400 at creation.
+        for metric in ["ip", "l1"] {
+            let (status, message) = handle_create_collection(
+                State(state.clone()),
+                Path(format!("bad-{metric}")),
+                Json(request(Some("rabitq"), "hnsw", Some(metric))),
+            )
+            .await
+            .expect_err("rabitq+ip/l1 must be rejected");
+            assert_eq!(status, axum::http::StatusCode::BAD_REQUEST);
+            assert!(message.contains("requires metric l2|cosine"), "{message}");
+        }
+
+        // 非 hnsw 组合仍按 hnsw-only 规则拒绝。
+        // EN: non-hnsw combos are still rejected by the hnsw-only rule.
+        let (status, message) = handle_create_collection(
+            State(state.clone()),
+            Path("flat".to_string()),
+            Json(request(Some("rabitq"), "flat", Some("l2"))),
+        )
+        .await
+        .expect_err("flat+rabitq must be rejected");
+        assert_eq!(status, axum::http::StatusCode::BAD_REQUEST);
+        assert!(
+            message.contains("only supported for index_type 'hnsw'"),
+            "{message}"
+        );
+
+        // 量化创建后不可变：同名已 rabitq 再请求 int8 是 409。
+        // EN: quantization is immutable: an existing rabitq name refuses int8.
+        let (status, message) = handle_create_collection(
+            State(state.clone()),
+            Path("qr".to_string()),
+            Json(request(Some("int8"), "hnsw", Some("l2"))),
+        )
+        .await
+        .expect_err("existing rabitq name must refuse int8");
+        assert_eq!(status, axum::http::StatusCode::CONFLICT);
+        assert!(message.contains("quantization"), "{message}");
+
+        // 状态视图回显 rabitq。
+        // EN: the status view echoes rabitq.
+        let status = handle_collection_status(State(state), Path("qr".to_string()))
+            .await
+            .expect("status")
+            .0;
+        assert_eq!(status["quantization"], "rabitq");
+    }
+
+    /// P2：列表与状态视图回显 create 时定型的 quantization。
+    /// EN: P2 — the list and status views echo the creation-time quantization.
+    #[tokio::test]
+    async fn list_and_status_echo_quantization() {
+        let (state, _cleanup) = temp_state("hnsw");
+        let (status, body) = handle_create_collection(
+            State(state.clone()),
+            Path("q".to_string()),
+            Json(CreateCollectionRequest {
+                dims: 4,
+                metric: None,
+                index_type: Some("hnsw".to_string()),
+                hnsw_m: None,
+                hnsw_ef_construction: None,
+                hnsw_ef_search: None,
+                vector_dtype: None,
+                quantization: Some("int8".to_string()),
+                sparse: None,
+            }),
+        )
+        .await
+        .expect("int8 create must succeed");
+        assert_eq!(status, axum::http::StatusCode::CREATED);
+        assert_eq!(body.quantization, "int8");
+
+        let Json(infos) = handle_list_collections(State(state.clone()), None).await;
+        assert_eq!(infos.len(), 1);
+        assert_eq!(infos[0]["quantization"], "int8");
+
+        let status = handle_collection_status(State(state), Path("q".to_string()))
+            .await
+            .expect("status")
+            .0;
+        assert_eq!(status["quantization"], "int8");
     }
 
     /// 生产装配级认证守卫（OCR 359d85d[1]）：tests.rs 的迷你路由只验证
@@ -5066,6 +6303,7 @@ mod collection_status_tests {
                     values: vec![0.0, 1.0, 0.0, 0.0],
                     label: None,
                     payload: None,
+                    sparse: None,
                 }],
                 index: None,
             }),
@@ -5136,6 +6374,7 @@ mod collection_status_tests {
                         values: vec![0.0, 1.0, 0.0, 0.0],
                         label: None,
                         payload: None,
+                        sparse: None,
                     }],
                     index: None,
                 }),
@@ -5527,6 +6766,7 @@ mod read_only_tests {
                 values: vec![0.0; 4],
                 label: None,
                 payload: None,
+                sparse: None,
             }],
             index: None,
         }
@@ -6327,6 +7567,7 @@ mod collection_ha_level_tests {
                     values: vec![1.0, 0.0, 0.0, 0.0],
                     label: None,
                     payload: None,
+                    sparse: None,
                 }],
                 index: None,
             }),
@@ -6599,6 +7840,7 @@ mod promote_tests {
                     values: vec![1.0, 0.0, 0.0, 0.0],
                     label: None,
                     payload: None,
+                    sparse: None,
                 }],
                 index: None,
             }),
@@ -6641,6 +7883,7 @@ mod promote_tests {
                     values: vec![1.0, 0.0, 0.0, 0.0],
                     label: None,
                     payload: None,
+                    sparse: None,
                 }],
                 index: None,
             }),
@@ -6728,6 +7971,7 @@ mod promote_tests {
                     values: vec![1.0, 0.0, 0.0, 0.0],
                     label: None,
                     payload: None,
+                    sparse: None,
                 }],
                 index: None,
             }),

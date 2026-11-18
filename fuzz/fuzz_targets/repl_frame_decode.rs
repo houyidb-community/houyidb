@@ -1,7 +1,7 @@
 #![no_main]
-//! 目标 3：复制协议 v3 帧解码（HANDSHAKE / WELCOME / DATA / HEARTBEAT / ACK /
+//! 目标 3：复制协议 v10 帧解码（HANDSHAKE / WELCOME / DATA / HEARTBEAT / ACK /
 //! ERROR）。
-//! EN: Target 3: replication protocol v3 frame decoding (HANDSHAKE / WELCOME / DATA /
+//! EN: Target 3: replication protocol v10 frame decoding (HANDSHAKE / WELCOME / DATA /
 //! EN: HEARTBEAT / ACK / ERROR).
 //!
 //! 断言的不变量 / Invariants:
@@ -275,19 +275,41 @@ fuzz_target!(|data: &[u8]| {
             leader_next_lsn: spec.lsn,
         }
     );
-    let hs = proto::encode_handshake(spec.lsn, spec.payload_len, 0xABCD_EF01, "tok")
-        .expect("handshake encode");
+    // HANDSHAKE 前缀在 v4/v6/v10 依次扩展（内容指纹、保留起点 + 快照
+    // checkpoint、follower 身份）；编码→解码必须逐字段回读一致。
+    // EN: The HANDSHAKE prefix grew across v4/v6/v10 (content fingerprint,
+    // EN: retention start + snapshot checkpoint, follower id); encode→decode
+    // EN: must round-trip every field.
+    let follower_id = [0x5A_u8; 16];
+    let log_start_lsn = spec.lsn.wrapping_add(1);
+    let snapshot_checkpoint = spec.lsn.wrapping_add(2);
+    let hs = proto::encode_handshake(
+        spec.lsn,
+        spec.payload_len,
+        0xABCD_EF01,
+        log_start_lsn,
+        snapshot_checkpoint,
+        follower_id,
+        "tok",
+    )
+    .expect("handshake encode");
     let prefix = proto::decode_handshake_prefix(&hs).expect("handshake prefix must decode");
     assert_eq!(prefix.resume_lsn, spec.lsn);
     assert_eq!(prefix.stream_mask, spec.payload_len);
     assert_eq!(prefix.log_hash, 0xABCD_EF01);
+    assert_eq!(prefix.log_start_lsn, log_start_lsn);
+    assert_eq!(prefix.snapshot_checkpoint, snapshot_checkpoint);
+    assert_eq!(prefix.follower_id, follower_id);
     assert_eq!(
         proto::decode_handshake_token(&hs[proto::HANDSHAKE_PREFIX_LEN..]).expect("token"),
         "tok"
     );
-    let wl = proto::encode_welcome(spec.lsn);
+    let wl = proto::encode_welcome(spec.lsn, log_start_lsn);
     assert_eq!(
         proto::decode_welcome(&wl).expect("welcome must decode"),
-        spec.lsn
+        proto::Welcome {
+            leader_next_lsn: spec.lsn,
+            leader_first_available_lsn: log_start_lsn,
+        }
     );
 });

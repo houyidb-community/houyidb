@@ -1,12 +1,14 @@
 /**
- * HouyiDB HTTP 客户端（Node 18+ 全局 fetch）。
+ * HouyiDB HTTP 客户端（Node 20+ 全局 fetch；20 是生产依赖
+ * `@hono/node-server` 的最低要求）。
  *
  * 设计要点：
  * - 错误正文先脱敏再截断，token 不进入日志或 MCP 工具结果；
  * - 非 2xx 与 JSON 解析失败使用不同的错误类型，便于工具层给出可读提示；
  * - fetch 可注入，单元测试无需真实网络。
  *
- * EN: HouyiDB HTTP client built on Node 18+ global fetch.
+ * EN: HouyiDB HTTP client built on Node 20+ global fetch; 20 is the floor
+ * required by the production dependency `@hono/node-server`.
  * EN: Design notes:
  * - Error bodies are redacted before truncation, keeping the token out of logs
  *   and MCP tool results;
@@ -89,8 +91,8 @@ function resolveFetch(fetchImpl?: FetchLike): FetchLike {
   const globalFetch = (globalThis as { fetch?: FetchLike }).fetch;
   if (!globalFetch) {
     throw new HouyiTransportError(
-      "Global fetch is unavailable; Node.js 18 or newer is required. " +
-        "全局 fetch 不可用，需要 Node.js 18 或更高版本。",
+      "Global fetch is unavailable; Node.js 20 or newer is required. " +
+        "全局 fetch 不可用，需要 Node.js 20 或更高版本。",
     );
   }
   return globalFetch.bind(globalThis);

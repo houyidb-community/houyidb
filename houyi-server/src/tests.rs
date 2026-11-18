@@ -3109,6 +3109,9 @@ async fn pgwire_upsert_batch_persists_to_wals() {
                 hnsw_m: Some(params.m),
                 hnsw_ef_construction: Some(params.ef_construction),
                 hnsw_ef_search: Some(params.ef_search),
+                vector_dtype: Some(col.vector_dtype().as_str().to_string()),
+                quantization: Some(col.quantization().as_str().to_string()),
+                sparse: Some(col.sparse_mode().as_str().to_string()),
             },
         })
     );
@@ -3976,6 +3979,7 @@ fn three_docs() -> Vec<houyi_server::types::UpsertVector> {
             payload: Some(json_payload(
                 serde_json::json!({"name": "apple", "price": 3}),
             )),
+            sparse: None,
         },
         UpsertVector {
             id: 2,
@@ -3984,6 +3988,7 @@ fn three_docs() -> Vec<houyi_server::types::UpsertVector> {
             payload: Some(json_payload(
                 serde_json::json!({"name": "phone", "price": 4999}),
             )),
+            sparse: None,
         },
         UpsertVector {
             id: 3,
@@ -3992,6 +3997,7 @@ fn three_docs() -> Vec<houyi_server::types::UpsertVector> {
             payload: Some(json_payload(
                 serde_json::json!({"name": "novel", "price": 45}),
             )),
+            sparse: None,
         },
     ]
 }
@@ -4286,6 +4292,7 @@ async fn collection_reupsert_after_delete_resurrects_with_latest_payload() {
             payload: Some(json_payload(
                 serde_json::json!({"name": "apple-pro", "price": 9}),
             )),
+            sparse: None,
         }],
     )
     .await;
@@ -4324,6 +4331,7 @@ async fn collection_reupsert_payload_filter_uses_last_row_only() {
             values: vec![1.0, 0.0, 0.0, 0.0],
             label: None,
             payload: Some(json_payload(serde_json::json!({ "color": color }))),
+            sparse: None,
         }]
     };
     collection_upsert(&state, "c", doc("red")).await;
@@ -4515,6 +4523,7 @@ async fn concurrent_upsert_delete_replay_converges_to_memory_state() {
                     values: vec![1.0, 0.0, 0.0, 0.0],
                     label: Some("fruit".to_string()),
                     payload: Some(payload),
+                    sparse: None,
                 }],
                 index: None,
             };
@@ -5057,6 +5066,7 @@ async fn collection_hybrid_eq_text_payload_matches_without_quote_bug() {
             payload: Some(json_payload(
                 serde_json::json!({"color": "red", "price": 10}),
             )),
+            sparse: None,
         }],
     )
     .await;
@@ -5102,6 +5112,7 @@ async fn collection_hybrid_numeric_int_and_float_filters() {
                 values: vec![1.0, 0.0, 0.0, 0.0],
                 label: None,
                 payload: Some(json_payload(serde_json::json!({"price": 10, "score": 1.5}))),
+                sparse: None,
             },
             UpsertVector {
                 id: 2,
@@ -5112,6 +5123,7 @@ async fn collection_hybrid_numeric_int_and_float_filters() {
                 // EN: score also yields a float: a missing column is filled as JsonText("null"),
                 // EN: and houyi-core cross-type compare returns Equal, polluting gte/lte semantics.
                 payload: Some(json_payload(serde_json::json!({"price": 1, "score": 0.5}))),
+                sparse: None,
             },
         ],
     )
@@ -5186,6 +5198,7 @@ async fn collection_hybrid_label_column_filter() {
             values: vec![1.0, 0.0, 0.0, 0.0],
             label: Some("fruit".to_string()),
             payload: None,
+            sparse: None,
         }],
     )
     .await;
@@ -5226,6 +5239,7 @@ async fn collection_hybrid_multiple_filters_intersect() {
                 payload: Some(json_payload(
                     serde_json::json!({"color": "red", "price": 10}),
                 )),
+                sparse: None,
             },
             UpsertVector {
                 id: 2,
@@ -5234,6 +5248,7 @@ async fn collection_hybrid_multiple_filters_intersect() {
                 payload: Some(json_payload(
                     serde_json::json!({"color": "blue", "price": 100}),
                 )),
+                sparse: None,
             },
         ],
     )
@@ -5277,6 +5292,7 @@ async fn collection_hybrid_filter_nonexistent_column_returns_empty() {
             values: vec![1.0, 0.0, 0.0, 0.0],
             label: Some("fruit".to_string()),
             payload: None,
+            sparse: None,
         }],
     )
     .await;
@@ -5305,12 +5321,14 @@ async fn collection_hybrid_no_filters_falls_back_to_plain_search() {
                 values: vec![1.0, 0.0, 0.0, 0.0],
                 label: None,
                 payload: None,
+                sparse: None,
             },
             UpsertVector {
                 id: 2,
                 values: vec![0.0, 1.0, 0.0, 0.0],
                 label: None,
                 payload: None,
+                sparse: None,
             },
         ],
     )
@@ -5338,6 +5356,7 @@ async fn collection_hybrid_reupsert_same_id_dedupes_results() {
             values: vec![1.0, 0.0, 0.0, 0.0],
             label: None,
             payload: Some(json_payload(serde_json::json!({"color": "red"}))),
+            sparse: None,
         }],
     )
     .await;
@@ -5349,6 +5368,7 @@ async fn collection_hybrid_reupsert_same_id_dedupes_results() {
             values: vec![1.0, 0.0, 0.0, 0.0],
             label: None,
             payload: Some(json_payload(serde_json::json!({"color": "blue"}))),
+            sparse: None,
         }],
     )
     .await;
@@ -5435,6 +5455,7 @@ async fn collection_scalar_compaction_endpoint_and_status() {
                 values: vec![1.0, 0.0, 0.0, 0.0],
                 label: None,
                 payload: Some(json_payload(serde_json::json!({"color": color}))),
+                sparse: None,
             }],
         )
         .await;
@@ -5491,6 +5512,7 @@ async fn collection_upsert_rejects_reserved_label_payload_key() {
                 "label": "sneaky",
                 "color": "red"
             }))),
+            sparse: None,
         }],
         index: None,
     };
@@ -5526,12 +5548,14 @@ async fn flat_backend_hybrid_filter_honors_mask() {
                 values: vec![1.0, 0.0, 0.0, 0.0],
                 label: None,
                 payload: Some(json_payload(serde_json::json!({"color": "red"}))),
+                sparse: None,
             },
             UpsertVector {
                 id: 2,
                 values: vec![0.9, 0.1, 0.0, 0.0],
                 label: None,
                 payload: Some(json_payload(serde_json::json!({"color": "blue"}))),
+                sparse: None,
             },
         ],
     )
@@ -5577,6 +5601,7 @@ async fn clustered_backend_filtered_hybrid_search_rejected_with_400() {
             values: vec![1.0, 0.0, 0.0, 0.0],
             label: None,
             payload: Some(json_payload(serde_json::json!({"color": "red"}))),
+            sparse: None,
         }],
     )
     .await;
@@ -5618,18 +5643,21 @@ async fn hybrid_filter_in_op_actually_filters() {
                 values: vec![1.0, 0.0, 0.0, 0.0],
                 label: None,
                 payload: Some(json_payload(serde_json::json!({"color": "red"}))),
+                sparse: None,
             },
             UpsertVector {
                 id: 2,
                 values: vec![0.0, 1.0, 0.0, 0.0],
                 label: None,
                 payload: Some(json_payload(serde_json::json!({"color": "blue"}))),
+                sparse: None,
             },
             UpsertVector {
                 id: 3,
                 values: vec![0.0, 0.0, 1.0, 0.0],
                 label: None,
                 payload: Some(json_payload(serde_json::json!({"color": "green"}))),
+                sparse: None,
             },
         ],
     )
@@ -5667,24 +5695,28 @@ async fn hybrid_mixed_batch_bare_and_payload_vectors_stay_aligned() {
                 values: vec![1.0, 0.0, 0.0, 0.0],
                 label: None,
                 payload: None,
+                sparse: None,
             },
             UpsertVector {
                 id: 2,
                 values: vec![0.0, 1.0, 0.0, 0.0],
                 label: None,
                 payload: Some(json_payload(serde_json::json!({"color": "red"}))),
+                sparse: None,
             },
             UpsertVector {
                 id: 3,
                 values: vec![0.0, 0.0, 1.0, 0.0],
                 label: None,
                 payload: None,
+                sparse: None,
             },
             UpsertVector {
                 id: 4,
                 values: vec![0.0, 0.0, 0.0, 1.0],
                 label: None,
                 payload: Some(json_payload(serde_json::json!({"color": "blue"}))),
+                sparse: None,
             },
         ],
     )
@@ -5737,6 +5769,7 @@ async fn hybrid_filters_isolated_per_collection() {
             values: vec![1.0, 0.0, 0.0, 0.0],
             label: None,
             payload: Some(json_payload(serde_json::json!({"color": "red"}))),
+            sparse: None,
         }],
     )
     .await;
@@ -5749,12 +5782,14 @@ async fn hybrid_filters_isolated_per_collection() {
                 values: vec![0.0, 1.0, 0.0, 0.0],
                 label: None,
                 payload: Some(json_payload(serde_json::json!({"color": "blue"}))),
+                sparse: None,
             },
             UpsertVector {
                 id: 3,
                 values: vec![0.0, 0.0, 1.0, 0.0],
                 label: None,
                 payload: Some(json_payload(serde_json::json!({"color": "red"}))),
+                sparse: None,
             },
         ],
     )
@@ -5804,6 +5839,7 @@ async fn hybrid_filter_in_with_non_array_value_rejected_400() {
             values: vec![1.0, 0.0, 0.0, 0.0],
             label: None,
             payload: Some(json_payload(serde_json::json!({"color": "red"}))),
+            sparse: None,
         }],
     )
     .await;
@@ -5840,6 +5876,7 @@ async fn hybrid_filter_in_with_nested_array_element_rejected_400() {
             values: vec![1.0, 0.0, 0.0, 0.0],
             label: None,
             payload: Some(json_payload(serde_json::json!({"color": "red"}))),
+            sparse: None,
         }],
     )
     .await;
@@ -5874,6 +5911,7 @@ async fn hybrid_filter_gt_with_array_value_rejected_400() {
             values: vec![1.0, 0.0, 0.0, 0.0],
             label: None,
             payload: Some(json_payload(serde_json::json!({"price": 10}))),
+            sparse: None,
         }],
     )
     .await;
@@ -5914,6 +5952,7 @@ async fn hybrid_unknown_op_rejected_400() {
             values: vec![1.0, 0.0, 0.0, 0.0],
             label: None,
             payload: Some(json_payload(serde_json::json!({"color": "red"}))),
+            sparse: None,
         }],
     )
     .await;
@@ -6035,12 +6074,14 @@ async fn collection_search_scores_aligned_and_exact_match_one() {
             values: v.to_vec(),
             label: None,
             payload: None,
+            sparse: None,
         })
         .chain(std::iter::once(houyi_server::types::UpsertVector {
             id: 42,
             values: vec![2.0, 0.0, 3.0, 0.0],
             label: None,
             payload: None,
+            sparse: None,
         }))
         .collect();
     collection_upsert(&state, "c1", vectors).await;
@@ -6097,12 +6138,14 @@ async fn flat_collection_search_scores_use_cosine_ranking() {
                 values: vec![10.0, 0.0, 0.0, 0.0],
                 label: None,
                 payload: None,
+                sparse: None,
             },
             houyi_server::types::UpsertVector {
                 id: 2,
                 values: vec![0.0, 1.0, 0.0, 0.0],
                 label: None,
                 payload: None,
+                sparse: None,
             },
         ],
     )
@@ -6132,24 +6175,28 @@ async fn hybrid_filtered_search_scores_align_with_filtered_ids() {
                 values: vec![1.0, 0.0, 0.0, 0.0],
                 label: None,
                 payload: Some(json_payload(serde_json::json!({"color": "red"}))),
+                sparse: None,
             },
             houyi_server::types::UpsertVector {
                 id: 2,
                 values: vec![0.9, 0.1, 0.0, 0.0],
                 label: None,
                 payload: Some(json_payload(serde_json::json!({"color": "red"}))),
+                sparse: None,
             },
             houyi_server::types::UpsertVector {
                 id: 3,
                 values: vec![0.0, 1.0, 0.0, 0.0],
                 label: None,
                 payload: Some(json_payload(serde_json::json!({"color": "blue"}))),
+                sparse: None,
             },
             houyi_server::types::UpsertVector {
                 id: 4,
                 values: vec![0.0, 0.0, 1.0, 0.0],
                 label: None,
                 payload: Some(json_payload(serde_json::json!({"color": "blue"}))),
+                sparse: None,
             },
         ],
     )
@@ -6260,30 +6307,35 @@ async fn benchmark_search_filtered_scores_remain_aligned() {
                     values: vec![1.0, 0.0, 0.0, 0.0],
                     label: Some("red".to_string()),
                     payload: None,
+                    sparse: None,
                 },
                 houyi_server::types::UpsertVector {
                     id: 2,
                     values: vec![1.0, 1.0, 0.0, 0.0],
                     label: Some("red".to_string()),
                     payload: None,
+                    sparse: None,
                 },
                 houyi_server::types::UpsertVector {
                     id: 3,
                     values: vec![0.9, 0.0, 0.1, 0.0],
                     label: Some("red".to_string()),
                     payload: None,
+                    sparse: None,
                 },
                 houyi_server::types::UpsertVector {
                     id: 4,
                     values: vec![0.0, 1.0, 0.0, 0.0],
                     label: Some("blue".to_string()),
                     payload: None,
+                    sparse: None,
                 },
                 houyi_server::types::UpsertVector {
                     id: 5,
                     values: vec![0.8, 0.0, 0.2, 0.0],
                     label: Some("red".to_string()),
                     payload: None,
+                    sparse: None,
                 },
             ],
             index: None,
@@ -6340,6 +6392,7 @@ async fn benchmark_upsert_rejects_non_finite_before_wal() {
                 values: vec![1.0, bad, 0.0, 0.0],
                 label: Some("poison".to_string()),
                 payload: None,
+                sparse: None,
             }],
             index: None,
         };
@@ -6362,12 +6415,14 @@ async fn benchmark_upsert_rejects_non_finite_before_wal() {
                 values: vec![1.0, 0.0, 0.0, 0.0],
                 label: Some("good".to_string()),
                 payload: None,
+                sparse: None,
             },
             UpsertVector {
                 id: 2,
                 values: vec![0.0, f32::NAN, 0.0, 0.0],
                 label: Some("good".to_string()),
                 payload: None,
+                sparse: None,
             },
         ],
         index: None,
@@ -6388,6 +6443,7 @@ async fn benchmark_upsert_rejects_non_finite_before_wal() {
             values: vec![1.0, 0.0, 0.0],
             label: Some("wrong-dim".to_string()),
             payload: None,
+            sparse: None,
         }],
         index: None,
     };
@@ -6440,6 +6496,7 @@ async fn collection_upsert_rejects_non_finite() {
             values: vec![1.0, f32::NAN, 0.0, 0.0],
             label: None,
             payload: None,
+            sparse: None,
         }],
         index: None,
     };
@@ -6471,6 +6528,7 @@ async fn benchmark_search_rejects_non_finite_query() {
                 values: vec![1.0, 0.0, 0.0, 0.0],
                 label: None,
                 payload: None,
+                sparse: None,
             }],
             index: None,
         }),
@@ -6661,6 +6719,7 @@ async fn collection_search_rejects_non_finite_query() {
             values: vec![1.0, 0.0, 0.0, 0.0],
             label: None,
             payload: None,
+            sparse: None,
         }],
     )
     .await;
@@ -6701,6 +6760,7 @@ async fn collection_hybrid_search_rejects_non_finite_query() {
             values: vec![1.0, 0.0, 0.0, 0.0],
             label: Some("red".to_string()),
             payload: None,
+            sparse: None,
         }],
     )
     .await;
@@ -6778,6 +6838,7 @@ async fn collection_search_drops_poisoned_hit() {
             values: vec![1.0, 0.0, 0.0, 0.0],
             label: None,
             payload: None,
+            sparse: None,
         }],
     )
     .await;
@@ -6821,6 +6882,7 @@ async fn collection_hybrid_search_drops_poisoned_hit() {
             values: vec![1.0, 0.0, 0.0, 0.0],
             label: None,
             payload: None,
+            sparse: None,
         }],
     )
     .await;
@@ -6911,6 +6973,7 @@ async fn collection_hnsw_upsert_becomes_searchable_via_builder_worker() {
             values: vec![1.0, 0.0, 0.0, 0.0],
             label: None,
             payload: None,
+            sparse: None,
         }],
         index: None,
     };
@@ -7043,7 +7106,12 @@ async fn readyz_reports_not_ready_above_watermark() {
 /// EN: line.
 #[tokio::test]
 async fn metrics_exposes_prometheus_text_format() {
-    use axum::{body::Body, http::Request, routing::get, Router};
+    use axum::{
+        body::Body,
+        http::Request,
+        routing::{get, put},
+        Router,
+    };
     use tower::ServiceExt;
 
     let (state, _cleanup) = collection_test_state(4);
@@ -7087,7 +7155,40 @@ async fn metrics_exposes_prometheus_text_format() {
             "/metrics",
             get(houyi_server::http_handler::benchmark_metrics),
         )
+        .route(
+            "/v1/collections/{name}",
+            put(houyi_server::http_handler::handle_create_collection),
+        )
         .with_state(state);
+
+    // 通过公开创建端点建空集合，供 per-collection 向量 gauge 的标签/样本断言
+    // 使用。除良名外还建两个集合：一个名称含引号/反斜杠/换行（验证标签转义，
+    // 集合名无字符集限制），一个排序不同的名称（验证名称排序带来的墙面稳定）；
+    // 后者故意在良名之后创建，否则插入顺序也能通过。
+    // EN: Create empty collections through the public create endpoint for the
+    // per-collection gauge label/sample assertions. Besides a benign name,
+    // create one with a quote/backslash/newline (label escaping; collection
+    // names are unrestricted) and another sorted differently (stable exposition
+    // ordering); the latter is created after the benign one so insertion order
+    // alone cannot pass.
+    for uri in [
+        "/v1/collections/metrics-demo",
+        "/v1/collections/metrics-a%22b%5Cc%0A",
+        "/v1/collections/metrics-aaa",
+    ] {
+        let create = Request::builder()
+            .method("PUT")
+            .uri(uri)
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"dims":4}"#))
+            .unwrap();
+        let create_res = app.clone().oneshot(create).await.unwrap();
+        assert_eq!(
+            create_res.status(),
+            axum::http::StatusCode::CREATED,
+            "create {uri} failed"
+        );
+    }
 
     let req = Request::builder()
         .method("GET")
@@ -7114,6 +7215,47 @@ async fn metrics_exposes_prometheus_text_format() {
         .await
         .unwrap();
     let text = String::from_utf8(body.to_vec()).unwrap();
+    // per-collection gauge：HELP/TYPE + 带 collection 标签的样本（空集合=0）。
+    // EN: per-collection gauge: HELP/TYPE plus a labelled sample (empty = 0).
+    assert!(
+        text.contains("# HELP houyidb_collection_vectors "),
+        "missing HELP for houyidb_collection_vectors"
+    );
+    assert!(
+        text.contains("# TYPE houyidb_collection_vectors gauge"),
+        "missing TYPE for houyidb_collection_vectors"
+    );
+    // 三个样本必须各成一行：良名原样；敌意名按 Prometheus 规则转义
+    // （`"`→`\"`、`\`→`\\`、换行→`\n`），不得把 exposition 拆行或注入样本。
+    // EN: The three samples must be separate lines: the benign name verbatim;
+    // the hostile name escaped per Prometheus (`"`→`\"`, `\`→`\\`, newline→`\n`)
+    // without splitting the exposition or injecting extra samples.
+    let demo_line = "houyidb_collection_vectors{collection=\"metrics-demo\"} 0";
+    let hostile_line = "houyidb_collection_vectors{collection=\"metrics-a\\\"b\\\\c\\n\"} 0";
+    let ascending_line = "houyidb_collection_vectors{collection=\"metrics-aaa\"} 0";
+    for line in [demo_line, hostile_line, ascending_line] {
+        assert!(
+            text.lines().any(|l| l == line),
+            "missing per-collection vector sample {line:?}; got: {}",
+            text.lines()
+                .filter(|l| l.starts_with("houyidb_collection_vectors{"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+    }
+    // 名称排序固定顺序（敌意名 `metrics-a"…` < `metrics-aaa` < `metrics-demo`），
+    // 与插入顺序无关，保证跨抓取的墙面稳定。
+    // EN: Sorted names fix the order (`metrics-a"…` < `metrics-aaa` <
+    // `metrics-demo`) independent of insertion order, keeping scrapes stable.
+    let pos = |needle: &str| {
+        text.lines()
+            .position(|l| l == needle)
+            .unwrap_or_else(|| panic!("missing sample {needle:?}"))
+    };
+    assert!(
+        pos(hostile_line) < pos(ascending_line) && pos(ascending_line) < pos(demo_line),
+        "per-collection samples must be emitted in sorted name order"
+    );
     for name in [
         "houyidb_index_hot_buffer",
         "houyidb_index_indexed_vectors",
@@ -7191,6 +7333,7 @@ fn openapi_spec_is_valid_json_and_covers_core_routes() {
         "/v1/collections/{name}/upsert",
         "/v1/collections/{name}/search",
         "/v1/collections/{name}/hybrid/search",
+        "/v1/collections/{name}/fusion/search",
         "/v1/collections/{name}/delete",
         "/v1/collections/{name}/status",
         "/v1/index/status",
@@ -8163,6 +8306,7 @@ async fn slow_query_log_quiet_when_disabled_and_fires_over_threshold() {
             values: (0..96).map(|d| ((i + d as u64) % 7) as f32).collect(),
             label: None,
             payload: None,
+            sparse: None,
         })
         .collect();
     collection_upsert(&state, "c1", vectors).await;
@@ -8516,6 +8660,7 @@ async fn tlp_setup(rows: &[TlpRow], suffix: u64) -> (BenchmarkHttpState, TempFil
                 values: r.vector.clone(),
                 label: None,
                 payload: Some(payload),
+                sparse: None,
             }
         })
         .collect();
@@ -8851,6 +8996,7 @@ async fn collections_compact_endpoint_commits_manifest_and_sets_lease() {
             values: vec![1.0, 0.0, 0.0, 0.0],
             label: Some("a".to_string()),
             payload: None,
+            sparse: None,
         }],
     )
     .await;
@@ -8906,4 +9052,891 @@ async fn collections_compact_endpoint_rejects_followers() {
             .unwrap_err();
     assert_eq!(err.0, StatusCode::SERVICE_UNAVAILABLE);
     assert!(err.1.contains("read_only"));
+}
+
+// ── P4：稀疏向量 + BM25 + 融合检索（HTTP 边界）────────────────────────────
+// EN: P4 — sparse vectors + BM25 + fusion search (HTTP edge).
+
+/// 构造显式建集合请求（维度固定 4，其余参数走缺省）。
+/// EN: Explicit-create request (dims fixed at 4, everything else defaulted).
+fn sparse_create_request(
+    index_type: &str,
+    sparse: Option<&str>,
+) -> houyi_server::types::CreateCollectionRequest {
+    houyi_server::types::CreateCollectionRequest {
+        dims: 4,
+        metric: None,
+        index_type: Some(index_type.to_string()),
+        hnsw_m: None,
+        hnsw_ef_construction: None,
+        hnsw_ef_search: None,
+        vector_dtype: None,
+        quantization: None,
+        sparse: sparse.map(str::to_string),
+    }
+}
+
+/// 直调建集合 handler（保留 Result 以断言 400/409）。
+/// EN: Call the create-collection handler directly (Result kept for 400/409).
+async fn create_collection_expect(
+    state: &BenchmarkHttpState,
+    name: &str,
+    index_type: &str,
+    sparse: Option<&str>,
+) -> Result<(StatusCode, houyi_server::types::CreateCollectionResponse), (StatusCode, String)> {
+    use houyi_server::http_handler::handle_create_collection;
+    handle_create_collection(
+        State(state.clone()),
+        Path(name.to_string()),
+        Json(sparse_create_request(index_type, sparse)),
+    )
+    .await
+    .map(|(status, Json(resp))| (status, resp))
+}
+
+/// 直调 collection upsert handler（保留 Result 以断言 400）。
+/// EN: Call the collection upsert handler directly (Result kept for 400).
+async fn collection_upsert_result(
+    state: &BenchmarkHttpState,
+    name: &str,
+    vectors: Vec<houyi_server::types::UpsertVector>,
+) -> Result<houyi_server::types::UpsertResponse, (StatusCode, String)> {
+    use houyi_server::http_handler::handle_collection_upsert;
+    let req = houyi_server::types::UpsertRequest {
+        vectors,
+        index: None,
+    };
+    handle_collection_upsert(State(state.clone()), Path(name.to_string()), Json(req))
+        .await
+        .map(|Json(resp)| resp)
+}
+
+/// 构造融合检索请求（过滤/载荷/融合参数全部缺省）。
+/// EN: Fusion-search request with all optional knobs defaulted.
+fn fusion_req(
+    vector: Vec<f32>,
+    sparse: Option<serde_json::Value>,
+    k: usize,
+) -> houyi_server::types::FusionSearchRequest {
+    houyi_server::types::FusionSearchRequest {
+        vector,
+        sparse,
+        k,
+        filters: Vec::new(),
+        include_payload: false,
+        ef_search: None,
+        fusion: None,
+        rrf_k: None,
+        alpha: None,
+    }
+}
+
+/// 直调融合检索 handler（保留 Result 以断言 400/404）。
+/// EN: Call the fusion-search handler directly (Result kept for 400/404).
+async fn fusion_call(
+    state: &BenchmarkHttpState,
+    name: &str,
+    req: houyi_server::types::FusionSearchRequest,
+) -> Result<houyi_server::types::FusionSearchResponse, (StatusCode, String)> {
+    use houyi_server::http_handler::handle_collection_fusion_search;
+    handle_collection_fusion_search(
+        State(state.clone()),
+        Path(name.to_string()),
+        None,
+        Json(req),
+    )
+    .await
+    .map(|Json(resp)| resp)
+}
+
+/// 断言 400 错误信封（状态码 + 文案片段）。
+/// EN: Assert a 400 error envelope (status plus a message fragment).
+fn assert_bad_request(err: (StatusCode, String), needle: &str) {
+    assert_eq!(
+        err.0,
+        StatusCode::BAD_REQUEST,
+        "unexpected status: {}",
+        err.1
+    );
+    assert!(
+        err.1.contains(needle),
+        "expected message to contain {needle:?}, got {:?}",
+        err.1
+    );
+}
+
+/// 固定的 bm25 测试集合：两条带词项的文档 + 一条仅 dense 的文档。
+/// EN: Fixed bm25 fixture: two sparse-bearing docs plus one dense-only doc.
+async fn sparse_docs_fixture() -> (BenchmarkHttpState, TempFileCleanup) {
+    use houyi_server::types::UpsertVector;
+
+    let (state, cleanup) = collection_test_state(4);
+    let (status, created) = create_collection_expect(&state, "docs", "hnsw", Some("bm25"))
+        .await
+        .expect("bm25 collection creation should succeed");
+    assert_eq!(status, StatusCode::CREATED);
+    assert_eq!(created.metric, "cosine");
+    assert_eq!(created.sparse, "bm25");
+    collection_upsert(
+        &state,
+        "docs",
+        vec![
+            UpsertVector {
+                id: 1,
+                values: vec![1.0, 0.0, 0.0, 0.0],
+                label: None,
+                payload: Some(json_payload(serde_json::json!({"color": "red"}))),
+                sparse: Some(serde_json::json!([[1, 1.0], [2, 0.5]])),
+            },
+            UpsertVector {
+                id: 2,
+                values: vec![0.9, 0.1, 0.0, 0.0],
+                label: None,
+                payload: Some(json_payload(serde_json::json!({"color": "blue"}))),
+                // 故意乱序输入：服务端按 term 升序规范化。
+                // EN: Deliberately out of order; the server normalizes ascending.
+                sparse: Some(serde_json::json!([[3, 2.0], [1, 0.2]])),
+            },
+            UpsertVector {
+                id: 3,
+                values: vec![0.0, 1.0, 0.0, 0.0],
+                label: None,
+                payload: None,
+                sparse: None,
+            },
+        ],
+    )
+    .await;
+    (state, cleanup)
+}
+
+/// 建集合的 sparse 开关：回显、后端限制、未知值、缺省 none、重建冲突。
+/// EN: Create-time sparse switch: echo, backend limits, unknown values,
+/// none default, and recreate conflicts.
+#[tokio::test]
+async fn collection_sparse_create_echoes_mode_and_fails_closed() {
+    use houyi_server::http_handler::handle_collection_status;
+
+    let (state, _cleanup) = collection_test_state(4);
+
+    // bm25 + hnsw：201 回显 bm25，运行期模式与回显一致。
+    // EN: bm25 on hnsw: 201 echoing bm25; the live mode matches the echo.
+    let (status, body) = create_collection_expect(&state, "bm", "hnsw", Some("bm25"))
+        .await
+        .expect("hnsw bm25 creation should succeed");
+    assert_eq!(status, StatusCode::CREATED);
+    assert_eq!(body.sparse, "bm25");
+    let col = state
+        .collections
+        .get("bm")
+        .expect("collection should exist");
+    assert_eq!(col.sparse_mode(), houyi_vector::sparse::SparseMode::Bm25);
+
+    // flat 后端同样允许 bm25（与带过滤检索的支持面一致）。
+    // EN: flat also allows bm25 (same support surface as filtered search).
+    let (status, body) = create_collection_expect(&state, "flat-bm", "flat", Some("bm25"))
+        .await
+        .expect("flat bm25 creation should succeed");
+    assert_eq!(status, StatusCode::CREATED);
+    assert_eq!(body.index_type, "flat");
+    assert_eq!(body.sparse, "bm25");
+
+    // 其他后端建 bm25 → 400（「建了却查不了」的静默陷阱在创建期拒绝）。
+    // EN: bm25 on other backends → 400 (a silent "built but unqueryable" trap).
+    let err = create_collection_expect(&state, "pq-bm", "pq-flat", Some("bm25"))
+        .await
+        .expect_err("pq-flat bm25 must be rejected");
+    assert_eq!(err.0, StatusCode::BAD_REQUEST);
+    assert!(
+        err.1
+            .contains("only supported for index_type 'hnsw'|'flat'"),
+        "got {:?}",
+        err.1
+    );
+
+    // 大小写不敏感解析 + 规范串回显：请求可写 `BM25`，响应/WAL/清单统一
+    // 落小写 `bm25`（服务端只从枚举 `as_str` 取值，前端大小写不进持久层）。
+    // EN: Case-insensitive parse with canonical echo: the request may say `BM25`,
+    // while the response (and WAL/manifest, which only read the enum's `as_str`)
+    // always carry lowercase `bm25`.
+    let (status, body) = create_collection_expect(&state, "case-bm", "hnsw", Some("BM25"))
+        .await
+        .expect("mixed-case bm25 must parse");
+    assert_eq!(status, StatusCode::CREATED);
+    assert_eq!(body.sparse, "bm25");
+
+    // 未知模式串 → 400。
+    // EN: Unknown mode string → 400.
+    let err = create_collection_expect(&state, "bad-mode", "hnsw", Some("bm42"))
+        .await
+        .expect_err("unknown sparse mode must be rejected");
+    assert_eq!(err.0, StatusCode::BAD_REQUEST);
+    assert!(err.1.contains("invalid sparse"), "got {:?}", err.1);
+
+    // 缺省 none：响应回显 none；status 只给 mode（不伪造 0 统计）。
+    // EN: Defaults to none: the response echoes none and status reports mode
+    // only (never fabricated zeroed stats).
+    let (status, body) = create_collection_expect(&state, "plain", "hnsw", None)
+        .await
+        .expect("default creation should succeed");
+    assert_eq!(status, StatusCode::CREATED);
+    assert_eq!(body.sparse, "none");
+    let status_body = handle_collection_status(State(state.clone()), Path("plain".to_string()))
+        .await
+        .expect("status should succeed")
+        .0;
+    assert_eq!(status_body["sparse"]["mode"], serde_json::json!("none"));
+    assert!(
+        status_body["sparse"].get("doc_count").is_none(),
+        "none mode must not report zeroed stats: {status_body}"
+    );
+
+    // 同名不同 sparse（含显式 none）→ 409：创建期开关不可变。
+    // EN: Same name with a different sparse value (including explicit none) →
+    // 409: the switch is immutable after creation.
+    let err = create_collection_expect(&state, "bm", "hnsw", Some("none"))
+        .await
+        .expect_err("recreating bm as none must conflict");
+    assert_eq!(err.0, StatusCode::CONFLICT);
+    assert!(err.1.contains("sparse"), "got {:?}", err.1);
+    let err = create_collection_expect(&state, "plain", "hnsw", Some("bm25"))
+        .await
+        .expect_err("recreating plain as bm25 must conflict");
+    assert_eq!(err.0, StatusCode::CONFLICT);
+    assert!(err.1.contains("sparse=none"), "got {:?}", err.1);
+}
+
+/// 写入 → BM25 状态 → RRF/加权融合 → 过滤融合 → 载荷回显的闭环。
+/// EN: Write → BM25 status → RRF/weighted fusion → filtered fusion → payload echo.
+#[tokio::test]
+async fn collection_sparse_fusion_search_roundtrip_and_modes() {
+    use houyi_server::http_handler::handle_collection_status;
+    use houyi_server::types::HybridSearchFilter;
+
+    let (state, _cleanup) = sparse_docs_fixture().await;
+
+    // 词项统计：term1 覆盖两文档、term2/term3 各一文档 → 3 term / 4 posting。
+    // EN: Term stats: term1 hits both docs, term2/term3 one each → 3 terms / 4 postings.
+    let status_body = handle_collection_status(State(state.clone()), Path("docs".to_string()))
+        .await
+        .expect("status should succeed")
+        .0;
+    assert_eq!(status_body["sparse"]["mode"], serde_json::json!("bm25"));
+    assert_eq!(status_body["sparse"]["doc_count"].as_u64(), Some(2));
+    assert_eq!(status_body["sparse"]["term_count"].as_u64(), Some(3));
+    assert_eq!(status_body["sparse"]["posting_count"].as_u64(), Some(4));
+    assert_eq!(status_body["sparse"]["dead_postings"].as_u64(), Some(0));
+
+    // 缺省 RRF：id1/id2 在两路的名次互反，RRF 分并列 → id 升序破平。
+    // EN: Default RRF: id1/id2 swap ranks between the two lists, tie the RRF
+    // score, and tie-break by ascending id.
+    let resp = fusion_call(
+        &state,
+        "docs",
+        fusion_req(
+            vec![1.0, 0.0, 0.0, 0.0],
+            Some(serde_json::json!([[1, 1.0], [3, 1.0]])),
+            3,
+        ),
+    )
+    .await
+    .expect("fusion search should succeed");
+    assert_eq!(resp.ids, vec![1, 2, 3]);
+    let tie = (1.0f64 / 61.0 + 1.0f64 / 62.0) as f32;
+    assert!(
+        (resp.scores[0] - tie).abs() < 1e-6,
+        "scores[0]={}",
+        resp.scores[0]
+    );
+    assert!(
+        (resp.scores[1] - tie).abs() < 1e-6,
+        "scores[1]={}",
+        resp.scores[1]
+    );
+    let only_dense = (1.0f64 / 63.0) as f32;
+    assert!(
+        (resp.scores[2] - only_dense).abs() < 1e-6,
+        "scores[2]={}",
+        resp.scores[2]
+    );
+    // dense 一路覆盖全部三篇；sparse 一路缺 id3 → 显式 null。
+    // EN: The dense list covers all three; sparse misses id3 → explicit null.
+    assert!(
+        resp.dense_scores.iter().all(Option::is_some),
+        "dense scores must align for every hit: {:?}",
+        resp.dense_scores
+    );
+    assert_eq!(resp.sparse_scores[2], None);
+    let id1_sparse = resp.sparse_scores[0].expect("id1 must carry a BM25 score");
+    let id2_sparse = resp.sparse_scores[1].expect("id2 must carry a BM25 score");
+    assert!(
+        id2_sparse > id1_sparse && id1_sparse > 0.0,
+        "id2={id2_sparse} must outrank id1={id1_sparse} by raw BM25"
+    );
+    assert_eq!(resp.metric, "cosine");
+    assert_eq!(resp.fusion.mode, "rrf");
+    assert_eq!(resp.fusion.rrf_k, Some(60));
+    assert_eq!(resp.fusion.alpha, None);
+
+    // 加权融合：两路各自 min-max 归一后 alpha*dense+(1-alpha)*sparse。
+    // EN: Weighted fusion: per-list min-max, then alpha*dense+(1-alpha)*sparse.
+    let resp = fusion_call(
+        &state,
+        "docs",
+        houyi_server::types::FusionSearchRequest {
+            fusion: Some("weighted".to_string()),
+            alpha: Some(0.5),
+            ..fusion_req(
+                vec![1.0, 0.0, 0.0, 0.0],
+                Some(serde_json::json!([[1, 1.0], [3, 1.0]])),
+                3,
+            )
+        },
+    )
+    .await
+    .expect("weighted fusion should succeed");
+    assert_eq!(resp.ids, vec![2, 1, 3]);
+    // 加权分数手算：id2 ≈ 0.5*0.994 + 0.5*1.0；id1 = 0.5*1.0 + 0.5*0.0；id3 = 0。
+    // EN: Hand-computed weighted scores: id2 ≈ 0.5*0.994 + 0.5*1.0;
+    // EN: id1 = 0.5*1.0 + 0.5*0.0; id3 = 0.
+    assert!(
+        (resp.scores[0] - 0.997).abs() < 1e-3,
+        "id2={}",
+        resp.scores[0]
+    );
+    assert!(
+        (resp.scores[1] - 0.5).abs() < 1e-3,
+        "id1={}",
+        resp.scores[1]
+    );
+    assert!(resp.scores[2].abs() < 1e-6, "id3={}", resp.scores[2]);
+    assert_eq!(resp.fusion.mode, "weighted");
+    assert_eq!(resp.fusion.rrf_k, None);
+    assert_eq!(resp.fusion.alpha, Some(0.5));
+
+    // 过滤融合：两路候选都按标量命中集后过滤，只留 id1。
+    // EN: Filtered fusion: both sides are post-filtered to the scalar hit set,
+    // leaving only id1.
+    let resp = fusion_call(
+        &state,
+        "docs",
+        houyi_server::types::FusionSearchRequest {
+            filters: vec![HybridSearchFilter {
+                column: "color".to_string(),
+                op: "eq".to_string(),
+                value: serde_json::json!("red"),
+            }],
+            include_payload: true,
+            ..fusion_req(
+                vec![1.0, 0.0, 0.0, 0.0],
+                Some(serde_json::json!([[1, 1.0], [3, 1.0]])),
+                3,
+            )
+        },
+    )
+    .await
+    .expect("filtered fusion should succeed");
+    assert_eq!(resp.ids, vec![1]);
+    let payloads = resp.payloads.expect("include_payload must return payloads");
+    assert_eq!(
+        payloads.get("1").expect("id 1 payload")["color"],
+        serde_json::json!("red")
+    );
+}
+
+/// 过滤融合必须「先掩码再截断」：允许的文档排名低于 4*k 时稀疏模态不得丢失。
+/// EN: Filtered fusion must mask before truncation: an allowed document ranked
+/// below 4*k must not lose its sparse modality.
+#[tokio::test]
+async fn collection_sparse_fusion_filter_masks_before_truncation() {
+    use houyi_server::types::{HybridSearchFilter, UpsertVector};
+
+    let (state, _cleanup) = collection_test_state(4);
+    let (status, _) = create_collection_expect(&state, "selective", "hnsw", Some("bm25"))
+        .await
+        .expect("bm25 creation should succeed");
+    assert_eq!(status, StatusCode::CREATED);
+    // 6 条文档共享 term1，权重递减 → 原始 BM25 排名 10 > 11 > ... > 15；
+    // 允许集只含排名第 6 的 15。k=1 时 fetch_k=4，若先截断再掩码，稀疏路
+    // 会整体为空；正确实现必须在掩码后取第 1 名。
+    // EN: Six docs share term1 with decreasing weights → raw BM25 ranks
+    // 10 > 11 > ... > 15; the allow-list holds only rank-6 doc 15. With k=1,
+    // fetch_k=4: truncate-then-mask empties the sparse side entirely, while
+    // mask-before-truncation keeps rank 1 after filtering.
+    let mut vectors = Vec::new();
+    for (offset, weight) in [6.0, 5.0, 4.0, 3.0, 2.0, 1.0].into_iter().enumerate() {
+        let id = 10 + offset as u64;
+        let color = if id == 15 { "red" } else { "blue" };
+        let mut values = vec![0.0f32; 4];
+        if id == 15 {
+            values[0] = 1.0;
+        } else {
+            values[(offset % 3) + 1] = 1.0;
+        }
+        vectors.push(UpsertVector {
+            id,
+            values,
+            label: None,
+            payload: Some(json_payload(serde_json::json!({"color": color}))),
+            sparse: Some(serde_json::json!([[1, weight]])),
+        });
+    }
+    collection_upsert(&state, "selective", vectors).await;
+
+    let query = vec![1.0, 0.0, 0.0, 0.0];
+    let sparse = Some(serde_json::json!([[1, 1.0]]));
+    // 未过滤基线：找到 15 的原始 BM25 分（全局 df/idf 口径）。
+    // EN: Unfiltered baseline: doc 15's raw BM25 score (global df/idf).
+    let baseline = fusion_call(
+        &state,
+        "selective",
+        fusion_req(query.clone(), sparse.clone(), 6),
+    )
+    .await
+    .expect("unfiltered fusion should succeed");
+    let baseline_pos = baseline
+        .ids
+        .iter()
+        .position(|id| *id == 15)
+        .expect("doc 15 must be present unfiltered");
+    let baseline_sparse = baseline.sparse_scores[baseline_pos].expect("doc 15 has BM25");
+
+    let filtered = fusion_call(
+        &state,
+        "selective",
+        houyi_server::types::FusionSearchRequest {
+            filters: vec![HybridSearchFilter {
+                column: "color".to_string(),
+                op: "eq".to_string(),
+                value: serde_json::json!("red"),
+            }],
+            ..fusion_req(query, sparse, 1)
+        },
+    )
+    .await
+    .expect("filtered fusion should succeed");
+    assert_eq!(filtered.ids, vec![15]);
+    assert!(
+        filtered.dense_scores[0].is_some(),
+        "dense side must keep the allowed doc"
+    );
+    assert_eq!(
+        filtered.sparse_scores[0],
+        Some(baseline_sparse),
+        "sparse side must survive the mask at fetch_k=4 and keep global scoring"
+    );
+}
+
+/// 导出、删除、指标与能力回显：稀疏数据全程跟随生命周期。
+/// EN: Export, delete, metrics, and capabilities: sparse data follows the
+/// full lifecycle.
+#[tokio::test]
+async fn collection_sparse_export_delete_metrics_and_capabilities() {
+    use houyi_server::http_handler::handle_collection_status;
+
+    let (state, _cleanup) = sparse_docs_fixture().await;
+
+    // 导出线格式：稀疏是加法字段，有词项的文档带 "sparse"，其余不带。
+    // EN: Export wire format: sparse is additive — docs with terms carry the key,
+    // others omit it.
+    let res = houyi_server::http_handler::handle_collection_export(
+        State(state.clone()),
+        Path("docs".to_string()),
+        None,
+    )
+    .await
+    .expect("export should succeed");
+    let body = axum::body::to_bytes(res.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let text = String::from_utf8(body.to_vec()).unwrap();
+    let lines: Vec<&str> = text.lines().filter(|line| !line.is_empty()).collect();
+    assert_eq!(lines.len(), 5, "header + 3 records + footer");
+    let header: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
+    assert_eq!(header["format"], serde_json::json!("houyidb-export"));
+    assert_eq!(header["count"].as_u64(), Some(3));
+    let records: Vec<serde_json::Value> = lines[1..4]
+        .iter()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    // 记录按 id 升序；id2 的输入词项乱序，导出视图按 term 升序。
+    // EN: Records ascend by id; id2 was written out of order and exports
+    // term-ascending.
+    assert_eq!(records[0]["id"].as_u64(), Some(1));
+    assert_eq!(records[1]["id"].as_u64(), Some(2));
+    assert_eq!(records[2]["id"].as_u64(), Some(3));
+    let sparse1 = records[0]["sparse"].as_array().expect("id1 sparse terms");
+    assert_eq!(sparse1.len(), 2);
+    assert_eq!(sparse1[0][0].as_u64(), Some(1));
+    assert!((sparse1[0][1].as_f64().unwrap() - 1.0).abs() < 1e-6);
+    assert_eq!(sparse1[1][0].as_u64(), Some(2));
+    assert!((sparse1[1][1].as_f64().unwrap() - 0.5).abs() < 1e-6);
+    let sparse2 = records[1]["sparse"].as_array().expect("id2 sparse terms");
+    assert_eq!(sparse2[0][0].as_u64(), Some(1));
+    assert!((sparse2[0][1].as_f64().unwrap() - 0.2).abs() < 1e-5);
+    assert_eq!(sparse2[1][0].as_u64(), Some(3));
+    assert!((sparse2[1][1].as_f64().unwrap() - 2.0).abs() < 1e-6);
+    assert!(
+        records[2].get("sparse").is_none(),
+        "a doc without terms must omit the sparse key"
+    );
+    let footer: serde_json::Value = serde_json::from_str(lines[4]).unwrap();
+    assert_eq!(footer["end"], serde_json::json!(true));
+    assert_eq!(footer["count"].as_u64(), Some(3));
+
+    // 删除 id2：稀疏移除先于标量墓碑；死 posting 超过活行即压缩（term3 剪除）。
+    // EN: Delete id2: sparse removal precedes the tombstone; dead postings exceed
+    // live ones and compaction prunes term3.
+    let deleted = collection_delete_call(&state, "docs", vec![2])
+        .await
+        .expect("delete should succeed");
+    assert_eq!(deleted.deleted, 1);
+    let status_body = handle_collection_status(State(state.clone()), Path("docs".to_string()))
+        .await
+        .expect("status should succeed")
+        .0;
+    assert_eq!(status_body["sparse"]["doc_count"].as_u64(), Some(1));
+    assert_eq!(status_body["sparse"]["term_count"].as_u64(), Some(2));
+    assert_eq!(status_body["sparse"]["posting_count"].as_u64(), Some(2));
+    assert_eq!(status_body["sparse"]["dead_postings"].as_u64(), Some(0));
+
+    // 删除后融合：id1 两路命中，id3 仅 dense 命中（BM25 分为 null）。
+    // EN: Post-delete fusion: id1 hits both sides, id3 is dense-only (BM25 is null).
+    let resp = fusion_call(
+        &state,
+        "docs",
+        fusion_req(
+            vec![1.0, 0.0, 0.0, 0.0],
+            Some(serde_json::json!([[1, 1.0], [3, 1.0]])),
+            2,
+        ),
+    )
+    .await
+    .expect("post-delete fusion should succeed");
+    assert_eq!(resp.ids, vec![1, 3]);
+    assert_eq!(resp.sparse_scores[1], None);
+
+    // 指标：四项 gauge 跨集合聚合；融合计数是进程级，断言存在且数值 ≥ 1。
+    // EN: Metrics: the four gauges aggregate across collections; the fusion
+    // counter is process-wide, so assert presence and value ≥ 1.
+    let (_headers, metrics_text) =
+        houyi_server::http_handler::benchmark_metrics(State(state.clone())).await;
+    for line in [
+        "houyidb_sparse_docs 1",
+        "houyidb_sparse_terms 2",
+        "houyidb_sparse_postings 2",
+        "houyidb_sparse_dead_postings 0",
+    ] {
+        assert!(
+            metrics_text.lines().any(|candidate| candidate == line),
+            "missing sample line {line:?}"
+        );
+    }
+    let fusion_sample = metrics_text
+        .lines()
+        .find(|line| line.starts_with("houyidb_fusion_searches_total "))
+        .expect("fusion searches counter sample");
+    let fusion_total: u64 = fusion_sample
+        .rsplit(' ')
+        .next()
+        .unwrap()
+        .parse()
+        .expect("fusion counter must be numeric");
+    assert!(fusion_total >= 1);
+
+    // 能力探测回显两个新能力串。
+    // EN: Capability probe echoes both new capability strings.
+    let version = houyi_server::http_handler::handle_version().await.0;
+    // build_sha 契约：要么是短十六进制 SHA（git checkout 或外部显式传入），
+    // 要么是源码包/无 `.git` 构建的回退字面量 `unknown`；不允许空串或其他形态。
+    // EN: build_sha contract: either a short hex SHA (git checkout or explicit
+    // external value) or the literal `unknown` fallback for source packages /
+    // builds without `.git`; empty strings and other shapes are invalid.
+    let build_sha = version["build_sha"].as_str().expect("build_sha string");
+    assert!(
+        build_sha == "unknown"
+            || (build_sha.len() >= 7
+                && build_sha.len() <= 40
+                && build_sha.chars().all(|c| c.is_ascii_hexdigit())),
+        "build_sha must be a short hex SHA or \"unknown\", got {build_sha:?}"
+    );
+    for capability in ["sparse_bm25", "fusion_search"] {
+        assert!(
+            version["capabilities"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|value| value == capability),
+            "missing capability {capability}"
+        );
+    }
+}
+
+/// 错误矩阵：404、none 集合、缺/空/坏 sparse、参数越界、写入边界。
+/// EN: Error matrix: 404, none collection, missing/empty/bad sparse,
+/// out-of-range parameters, and write-boundary rejections.
+#[tokio::test]
+async fn collection_sparse_fusion_error_matrix() {
+    use houyi_server::types::UpsertVector;
+
+    let (state, _cleanup) = sparse_docs_fixture().await;
+    let (status, body) = create_collection_expect(&state, "plain", "hnsw", None)
+        .await
+        .expect("plain creation should succeed");
+    assert_eq!(status, StatusCode::CREATED);
+    assert_eq!(body.sparse, "none");
+
+    // 融合查询是纯读：缺集合 404，不隐式建集合。
+    // EN: Fusion search is read-only: a missing collection is 404, never
+    // implicitly created.
+    let err = fusion_call(
+        &state,
+        "ghost",
+        fusion_req(
+            vec![1.0, 0.0, 0.0, 0.0],
+            Some(serde_json::json!([[1, 1.0]])),
+            2,
+        ),
+    )
+    .await
+    .expect_err("fusion on a missing collection must 404");
+    assert_eq!(err.0, StatusCode::NOT_FOUND);
+    assert!(err.1.contains("not found"), "got {:?}", err.1);
+    assert!(state.collections.get("ghost").is_none());
+
+    // sparse=none 集合 → 400（融合检索需要 bm25）。
+    // EN: sparse=none collection → 400 (fusion requires bm25).
+    let err = fusion_call(
+        &state,
+        "plain",
+        fusion_req(
+            vec![1.0, 0.0, 0.0, 0.0],
+            Some(serde_json::json!([[1, 1.0]])),
+            2,
+        ),
+    )
+    .await
+    .expect_err("fusion on a none collection must 400");
+    assert_eq!(err.0, StatusCode::BAD_REQUEST);
+    assert!(err.1.contains("sparse=\"none\""), "got {:?}", err.1);
+
+    // 缺 sparse / 空 sparse。
+    // EN: Missing sparse / empty sparse.
+    let err = fusion_call(
+        &state,
+        "docs",
+        fusion_req(vec![1.0, 0.0, 0.0, 0.0], None, 2),
+    )
+    .await
+    .expect_err("fusion without sparse terms must 400");
+    assert_bad_request(err, "required");
+    let err = fusion_call(
+        &state,
+        "docs",
+        fusion_req(vec![1.0, 0.0, 0.0, 0.0], Some(serde_json::json!([])), 2),
+    )
+    .await
+    .expect_err("fusion with an empty sparse array must 400");
+    assert_bad_request(err, "must not be empty");
+
+    // 形状 / term / 权重越界。
+    // EN: Shape / term / weight violations.
+    let max_term_plus_one = houyi_vector::sparse::MAX_SPARSE_TERM_ID as u64 + 1;
+    for (sparse, needle) in [
+        (serde_json::json!([[1]]), "2-element"),
+        (serde_json::json!([[0, 1.0]]), "out of range"),
+        (
+            serde_json::json!([[max_term_plus_one, 1.0]]),
+            "out of range",
+        ),
+        (serde_json::json!([[1, -0.5]]), "must be > 0"),
+        (serde_json::json!([[1, 0.0]]), "must be > 0"),
+        (serde_json::json!("not-an-array"), "must be an array"),
+        (serde_json::json!([["x", 1.0]]), "must be an integer"),
+        (serde_json::json!([[1, "x"]]), "weight must be a number"),
+    ] {
+        let err = fusion_call(
+            &state,
+            "docs",
+            fusion_req(vec![1.0, 0.0, 0.0, 0.0], Some(sparse), 2),
+        )
+        .await
+        .expect_err("malformed sparse must 400");
+        assert_bad_request(err, needle);
+    }
+
+    // 查询 term 数上限 64。
+    // EN: Query term limit of 64.
+    let mut too_many = Vec::with_capacity(65);
+    for term in 1..=65u32 {
+        too_many.push(serde_json::json!([term, 1.0]));
+    }
+    let err = fusion_call(
+        &state,
+        "docs",
+        fusion_req(
+            vec![1.0, 0.0, 0.0, 0.0],
+            Some(serde_json::Value::Array(too_many)),
+            2,
+        ),
+    )
+    .await
+    .expect_err("65-term sparse query must 400");
+    assert_bad_request(err, "exceeding the limit of 64");
+
+    // k 与融合参数越界（显式坏值即使当前模式不用也拒绝）。
+    // EN: k and fusion-parameter bounds (bad explicit values are rejected even
+    // when the active mode ignores them).
+    let valid_sparse = || Some(serde_json::json!([[1, 1.0]]));
+    let err = fusion_call(
+        &state,
+        "docs",
+        fusion_req(vec![1.0, 0.0, 0.0, 0.0], valid_sparse(), 0),
+    )
+    .await
+    .expect_err("k=0 must 400");
+    assert_bad_request(err, "k must be >= 1");
+    for (request, needle) in [
+        (
+            houyi_server::types::FusionSearchRequest {
+                fusion: Some("bogus".to_string()),
+                ..fusion_req(vec![1.0, 0.0, 0.0, 0.0], valid_sparse(), 2)
+            },
+            "invalid fusion",
+        ),
+        (
+            houyi_server::types::FusionSearchRequest {
+                rrf_k: Some(0),
+                ..fusion_req(vec![1.0, 0.0, 0.0, 0.0], valid_sparse(), 2)
+            },
+            "out of range 1..=1000",
+        ),
+        (
+            houyi_server::types::FusionSearchRequest {
+                rrf_k: Some(1001),
+                ..fusion_req(vec![1.0, 0.0, 0.0, 0.0], valid_sparse(), 2)
+            },
+            "out of range 1..=1000",
+        ),
+        (
+            houyi_server::types::FusionSearchRequest {
+                alpha: Some(1.5),
+                ..fusion_req(vec![1.0, 0.0, 0.0, 0.0], valid_sparse(), 2)
+            },
+            "out of range 0..=1",
+        ),
+    ] {
+        let err = fusion_call(&state, "docs", request)
+            .await
+            .expect_err("out-of-range fusion parameter must 400");
+        assert_bad_request(err, needle);
+    }
+
+    // dense 查询维度/有限性。
+    // EN: Dense query dimension / finiteness.
+    let err = fusion_call(
+        &state,
+        "docs",
+        fusion_req(vec![1.0, 0.0, 0.0], valid_sparse(), 2),
+    )
+    .await
+    .expect_err("wrong query dim must 400");
+    assert_bad_request(err, "query dim 3 != expected dim 4");
+    let err = fusion_call(
+        &state,
+        "docs",
+        fusion_req(vec![1.0, f32::NAN, 0.0, 0.0], valid_sparse(), 2),
+    )
+    .await
+    .expect_err("non-finite query must 400");
+    assert_bad_request(err, "non-finite");
+
+    // 写入边界：稀疏批次绝不隐式建集合；none 集合带 sparse（含 `[]`）→ 400。
+    // EN: Write boundary: sparse batches never implicitly create; a sparse key
+    // (even `[]`) on a none collection → 400.
+    let err = collection_upsert_result(
+        &state,
+        "ghost",
+        vec![UpsertVector {
+            id: 9,
+            values: vec![1.0, 0.0, 0.0, 0.0],
+            label: None,
+            payload: None,
+            sparse: Some(serde_json::json!([[1, 1.0]])),
+        }],
+    )
+    .await
+    .expect_err("sparse upsert to a missing collection must 400");
+    assert_eq!(err.0, StatusCode::BAD_REQUEST);
+    assert!(
+        err.1.contains("create it with sparse=bm25"),
+        "got {:?}",
+        err.1
+    );
+    assert!(
+        state.collections.get("ghost").is_none(),
+        "a sparse upsert must never implicitly create a collection"
+    );
+    let err = collection_upsert_result(
+        &state,
+        "plain",
+        vec![UpsertVector {
+            id: 10,
+            values: vec![1.0, 0.0, 0.0, 0.0],
+            label: None,
+            payload: None,
+            sparse: Some(serde_json::json!([])),
+        }],
+    )
+    .await
+    .expect_err("a sparse key on a none collection must 400");
+    assert_eq!(err.0, StatusCode::BAD_REQUEST);
+    assert!(err.1.contains("sparse=none"), "got {:?}", err.1);
+
+    // 维度不符（bm25 集合）→ 400。
+    // EN: Dimension mismatch on a bm25 collection → 400.
+    let err = collection_upsert_result(
+        &state,
+        "docs",
+        vec![UpsertVector {
+            id: 11,
+            values: vec![1.0, 0.0, 0.0],
+            label: None,
+            payload: None,
+            sparse: Some(serde_json::json!([[1, 1.0]])),
+        }],
+    )
+    .await
+    .expect_err("dim mismatch must 400");
+    assert_eq!(err.0, StatusCode::BAD_REQUEST);
+    assert!(
+        err.1.contains("dim mismatch: expect 4, got 3"),
+        "got {:?}",
+        err.1
+    );
+
+    // benchmark 主索引没有稀疏旁路索引：显式拒绝而非静默丢弃。
+    // EN: The benchmark main index has no sparse side index: reject explicitly
+    // instead of silently dropping.
+    let err = houyi_server::http_handler::benchmark_upsert(
+        State(state.clone()),
+        Json(houyi_server::types::UpsertRequest {
+            vectors: vec![UpsertVector {
+                id: 12,
+                values: vec![1.0, 0.0, 0.0, 0.0],
+                label: None,
+                payload: None,
+                sparse: Some(serde_json::json!([[1, 1.0]])),
+            }],
+            index: None,
+        }),
+    )
+    .await
+    .expect_err("benchmark upsert with sparse must 400");
+    assert_eq!(err.0, StatusCode::BAD_REQUEST);
+    assert!(
+        err.1.contains("benchmark index has no sparse index"),
+        "got {:?}",
+        err.1
+    );
 }

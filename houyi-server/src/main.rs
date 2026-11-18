@@ -1840,6 +1840,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         upsert_batches_skipped_snapshot = collections_stats.upsert_batches_skipped_snapshot,
         upsert_rows = collections_stats.upsert_rows,
         scalar_rows = collections_stats.scalar_rows,
+        sparse_upserts = collections_stats.sparse_upserts,
+        sparse_removals = collections_stats.sparse_removals,
         delete_batches = collections_stats.delete_batches,
         delete_batches_skipped_snapshot = collections_stats.delete_batches_skipped_snapshot,
         tombstones = collections_stats.tombstones,

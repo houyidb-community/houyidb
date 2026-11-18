@@ -92,4 +92,34 @@ fuzz_target!(|data: &[u8]| {
     // EN: makes every run after the second InvalidStructure.
     let index = houyi_vector::HotBufferIndex::new(DIMS);
     let _ = runtime().block_on(index.restore_graph_snapshot(&payload));
+
+    // 同一 payload 再恢复进一个**期望 int8** 的图：解码器先按 flags 比对
+    // quantization、再解析向量段，未量化目标永远在比对处提前拒绝，v3（codes +
+    // source）布局与 int8 距离/双射校验分支因此只有 int8 目标才可达。两个目标
+    // 分别覆盖 v1/v2 与 v3 的解析面。
+    // EN: Restore the same payload into an **int8-expecting** graph as well: the
+    // decoder compares flags-derived quantization before parsing vector records,
+    // so an unquantized target always rejects early and the v3 (codes + source)
+    // layout plus its int8 bijection checks are reachable only on an int8 target.
+    // The two targets cover the v1/v2 and v3 parse surfaces respectively.
+    let int8_index = houyi_vector::HotBufferIndex::new_with_metric_and_dtype_and_quantization(
+        DIMS,
+        houyi_vector::DistanceMetric::L2,
+        houyi_vector::VectorDtype::F32,
+        houyi_vector::Quantization::Int8,
+    );
+    let _ = runtime().block_on(int8_index.restore_graph_snapshot(&payload));
+
+    // rabitq 期望目标（v4：norm/alpha/packed codes/source）：flags 比对必须
+    // 先行，v4 记录布局、位打包与 alpha/norm 校验只有 rabitq 目标可达。
+    // EN: rabitq-expecting target (v4: norm/alpha/packed codes/source): the
+    // flags comparison runs first, and the v4 record layout, bit packing and
+    // alpha/norm validation are reachable only on a rabitq target.
+    let rabitq_index = houyi_vector::HotBufferIndex::new_with_metric_and_dtype_and_quantization(
+        DIMS,
+        houyi_vector::DistanceMetric::L2,
+        houyi_vector::VectorDtype::F32,
+        houyi_vector::Quantization::RaBitQ,
+    );
+    let _ = runtime().block_on(rabitq_index.restore_graph_snapshot(&payload));
 });

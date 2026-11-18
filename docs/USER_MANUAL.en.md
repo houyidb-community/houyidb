@@ -170,8 +170,87 @@ curl -sS --noproxy '*' -X PUT http://127.0.0.1:17000/v1/collections/goods \
   `cosine` only.
 - The three HNSW parameters must be supplied together (`m` 1..1024,
   `ef_construction` / `ef_search` 1..65536) and only matter for the hnsw backend.
+- `vector_dtype`: `f32` (default) / `f16`. `f16` halves resident vector memory,
+  is hnsw-only, and is **immutable after creation**. Query vectors are always
+  computed in f32 (asymmetric distance: f16 data is first rounded onto the f16
+  grid). A non-f32 dtype with a non-hnsw backend yields 400. The response and
+  `GET .../status` echo the effective `vector_dtype`.
+- `quantization`: `none` (default) / `int8` / `rabitq`. It compresses **only
+  the HNSW graph-side vector copy**: the main store / hot buffer / builder
+  queue always keep the raw (f32 or f16) vectors; search takes candidates from
+  the quantized graph (candidate width ×2 for int8, ×16 for rabitq) and then
+  reranks exactly on the raw vectors, so the final top-k scores never pass
+  through quantization. hnsw-only, **immutable after creation**; a non-hnsw
+  backend explicitly carrying `int8` / `rabitq` yields 400; a same-name
+  collection with different parameters yields 409. `int8` is 1 B/dim;
+  `rabitq` is 1 bit/dim (RaBitQ binary quantization plus a deterministic random
+  rotation) and **supports `metric = l2 | cosine` only** (`ip` / `l1` yield
+  400); query vectors stay f32 (asymmetric estimation). The response and
+  `GET .../status` echo the effective `quantization`.
+- Quantization memory ledger (honest; never plan capacity on "halved"): main
+  store memory is unchanged (the graph-side `source` shares the main-store
+  `Arc`). Graph-side codes = `ceil(D/64)·8` B + 8 B factors, where D is dims
+  rounded up to a power of two; at dims=768 (D=1024) each vector costs f32
+  3072 B / int8 768 B + 8 B / rabitq 128 B + 8 B. rabitq adds only ~136 B per
+  vector over the f32 graph (≈1/24) and drops to ~1/6 of int8; it also needs
+  shared rotation signs of 4·D bytes per collection plus one D×f32 scratch
+  buffer per query. For cosine the raw and normalized copies coincide, so
+  total memory shrinks versus unquantized (int8 ≈ −3 B/dim, rabitq ≈
+  −3.8 B/dim); outside cosine it grows slightly (int8 ≈ +1 B/dim, rabitq ≈
+  +0.18 B/dim). The win is the in-graph distance working set and bandwidth.
+- `sparse`: `none` (default) / `bm25`. `bm25` builds a side inverted index for
+  the collection and enables sparse writes plus fusion search; **hnsw / flat
+  backends only**, **immutable after creation**, and implicit creation is
+  always `none`. The response and `GET .../status` echo the effective `sparse`;
+  changing sparse on the same name yields 409, and `bm25` with any other backend
+  yields 400. The sparse index never changes dense search results; the main
+  store / hot buffer / builder queue still hold only dense vectors.
 - An existing name yields 409 (even with identical parameters); invalid
   parameters 400; follower/read-only 503.
+
+f16 example (memory-sensitive workloads that tolerate ~10⁻³ rounding):
+
+```bash
+curl -sS --noproxy '*' -X PUT http://127.0.0.1:17000/v1/collections/imgf16 \
+  -H 'Content-Type: application/json' -d '{
+  "dims": 512, "metric": "cosine", "index_type": "hnsw", "vector_dtype": "f16"
+}'
+# 201 {"created":true,"collection":"imgf16",...,"vector_dtype":"f16"}
+```
+
+int8 graph-side quantization example (raw f32 main store, still reranked exactly):
+
+```bash
+curl -sS --noproxy '*' -X PUT http://127.0.0.1:17000/v1/collections/imgq \
+  -H 'Content-Type: application/json' -d '{
+  "dims": 512, "metric": "cosine", "index_type": "hnsw",
+  "vector_dtype": "f32", "quantization": "int8"
+}'
+# 201 {"created":true,"collection":"imgq",..."quantization":"int8"}
+```
+
+rabitq graph-side quantization example (1 bit/dim, l2/cosine only; still reranked exactly):
+
+```bash
+curl -sS --noproxy '*' -X PUT http://127.0.0.1:17000/v1/collections/imgq1bit \
+  -H 'Content-Type: application/json' -d '{
+  "dims": 512, "metric": "cosine", "index_type": "hnsw",
+  "quantization": "rabitq"
+}'
+# 201 {"created":true,"collection":"imgq1bit",..."quantization":"rabitq"}
+# metric=ip/l1 with rabitq → 400; rabitq on a non-hnsw backend → 400
+```
+
+bm25 sparse-index example (side inverted index enabling sparse writes and fusion search):
+
+```bash
+curl -sS --noproxy '*' -X PUT http://127.0.0.1:17000/v1/collections/docs \
+  -H 'Content-Type: application/json' -d '{
+  "dims": 512, "metric": "cosine", "index_type": "flat", "sparse": "bm25"
+}'
+# 201 {"created":true,"collection":"docs",...,"sparse":"bm25"}
+# bm25 on a non-hnsw/flat backend → 400; implicit creation is always sparse=none
+```
 
 ### 2.2 Vector Search
 
@@ -209,6 +288,93 @@ Filter operators: `eq` / `gt` / `lt` / `gte` / `lte` / `in` (`value` for `in`
 must be a JSON array). Multiple `filters` are combined with AND. `label` can be
 used directly as a column name. **Filtered search is supported only by the
 hnsw / flat backends** (other backends return 400).
+
+### 2.3.1 Sparse Vectors (BM25) and Fusion Search
+
+Sparse terms are supplied by the caller (**the core does not tokenize**): each
+item is `(term_id, weight)`, where `term_id` is an integer in `1..=2^24-1` and
+`weight` is a finite positive number. Writes and queries accept the JSON array
+`[[term_id, weight], …]`; duplicate terms are summed by the server and order
+does not affect the result. At most 1024 pairs per document and 64 pairs per
+query; anything beyond that yields 400.
+
+Write (the collection must already be `sparse=bm25`; a `sparse` key on a
+`sparse=none` collection always yields 400 and is never silently dropped):
+
+```bash
+curl -sS --noproxy '*' -X POST http://127.0.0.1:17000/v1/collections/docs/upsert \
+  -H 'Content-Type: application/json' -d '{
+  "vectors": [
+    {"id": 1, "values": [0.9,0.1,0.0,0.0], "label": "fruit",
+     "payload": {"text": "apple is a fruit"},
+     "sparse": [[7, 1.0], [8, 0.8], [11, 0.5]]},
+    {"id": 2, "values": [0.1,0.9,0.0,0.0], "label": "device",
+     "payload": {"text": "laptop is a device"},
+     "sparse": [[7, 0.6], [9, 1.0]]}
+  ]
+}'
+# {"inserted":2}
+```
+
+- An absent / `null` `sparse` key means **unchanged**; **`[]`** clears the
+  document's sparse terms.
+- Updates are **whole-document replacement**: re-upserting the same id
+  overwrites the old terms with the new ones (not an incremental merge), which
+  makes replay idempotent.
+- Deletes by id / filters remove the sparse terms too, so deleted documents
+  become unreachable immediately.
+
+Fusion search (both dense and sparse are required; the collection must be
+`sparse=bm25`):
+
+```bash
+curl -sS --noproxy '*' -X POST http://127.0.0.1:17000/v1/collections/docs/fusion/search \
+  -H 'Content-Type: application/json' -d '{
+  "vector": [0.9,0.1,0.0,0.0],
+  "sparse": [[7, 1.0], [9, 0.5]],
+  "k": 2,
+  "fusion": "rrf",
+  "include_payload": true
+}'
+# {"ids":[1,2],"scores":[...],"dense_scores":[0.99,null],
+#  "sparse_scores":[2.1,1.7],"metric":"cosine",
+#  "fusion":{"mode":"rrf","rrf_k":60,"alpha":null},"payloads":{...}}
+```
+
+- `fusion`: `rrf` (default) or `weighted`. `rrf_k` defaults to 60 and must be
+  within `1..=1000`; `alpha` defaults to 0.5 and must be within `[0,1]`
+  (weighted only). Explicitly supplied values are validated even when the
+  active mode does not use them (invalid values always yield 400).
+- **`scores` is a fusion ranking score only and carries no metric semantics**:
+  RRF is `Σ 1/(rrf_k + rank)` (rank starts at 1, one term per hit list); weighted
+  is `alpha * norm(dense) + (1-alpha) * norm(sparse)`, with each modality
+  min-max normalized over the filtered candidates (a single-element list
+  normalizes to 1.0, a missing modality counts as 0).
+- `dense_scores` follows the collection `metric` (same conversion as 2.2);
+  `sparse_scores` is the raw BM25 score. A hit that missed a modality has
+  `null` in that position. `metric` explains `dense_scores` only; the `fusion`
+  block echoes the effective mode and the parameters actually used.
+- `filters` / `ef_search` / `include_payload` mean the same as in normal
+  search; filtering is hnsw / flat only and applies to both paths.
+- Both paths over-fetch `4×k` candidates, fuse, then cut to `k`; the `k` /
+  `ef_search` limits match normal search.
+- Error codes: missing collection 404; `sparse=none` collection or empty
+  `sparse` 400; dimensionality / term / fusion-parameter violations 400;
+  read-only / follower / fencing 503.
+- BM25 (`k1=1.2`, `b=0.75`): `idf = ln(1 + (N-df+0.5)/(df+0.5))`, `tf` is
+  the client weight, `dl = Σ weights`, `avgdl = Σdl / N`; N=0 returns empty.
+  Higher scores are more relevant. A sparse collection's `status` additionally
+  echoes `doc_count` / `term_count` / `posting_count` / `dead_postings`.
+- Sparse data is written only through HTTP and the SDKs; pgwire AUB1 batch
+  rows carry no sparse field (see Section 4: pgwire offers fusion **queries**
+  only).
+- Memory ledger (one posting per (doc, term)): ~24 B per posting, ~12–16 B per
+  (doc, term) in the forward index, plus term/doc map buckets and fragmentation.
+  1M documents × 8 terms is roughly 192 MB of postings + 100–150 MB forward
+  index + 40–60 MB maps ≈ 330–400 MB; trust `status` / `dead_postings`
+  measurements and **never plan on smaller per-entry numbers**. Dead postings
+  are reclaimed by compaction on the write path once `dead > live`;
+  `dead_postings` exposes the amplification.
 
 ### 2.4 Delete and Status
 
@@ -254,9 +420,11 @@ curl -sS --noproxy '*' -X DELETE \
 | `GET /v1/openapi.json` | OpenAPI document (can be pasted into Swagger UI) |
 | `GET /v1/collections` | List Collections |
 | `PUT /v1/collections/{name}` | Explicitly create a collection (write permission; fixes dims/metric/backend/HNSW in one shot) |
+| `POST /v1/collections/{name}/fusion/search` | Dense+sparse fusion search (collection must be `sparse=bm25`; `scores` is ranking-only) |
 | `GET /v1/collections/{name}/export` | Streaming NDJSON logical export (header/records/footer; backup/migration) |
 | `DELETE /v1/admin/collections/{name}` | Drop a whole collection (admin, irreversible, WAL-first) |
-| `GET /metrics` | Prometheus metrics (authentication exempt) |
+| `GET /metrics` | Prometheus metrics (authentication exempt; includes the per-collection `houyidb_collection_vectors` gauge) |
+| `GET /v1/version` | Version/capability probe; `build_sha` is the short git SHA embedded at build time |
 | `GET /v1/index/status` | Primary index (/v1/vectors path) status |
 | `POST /v1/optimize` | Drain the build queue / trigger compaction |
 | `POST /v1/wal/checkpoint` | WAL checkpoint |
@@ -332,6 +500,18 @@ hits = col.hybrid_search(
     filters=[Filter("price", "lt", 10)], include_payload=True)
 print(hits)
 
+# Sparse + fusion (requires an explicit sparse="bm25" collection; see 2.3.1)
+client.create_collection("docs", 8, index_type="flat", sparse="bm25")
+docs = client.collection("docs")
+docs.upsert([
+    Vector(id=1, values=[0.92, 0.88, 0.06, 0.05, 0.05, 0.04, 0.05, 0.05],
+           sparse=[(7, 1.0), (8, 0.8)]),
+])
+hits = docs.fusion_search(
+    [0.90, 0.85, 0.05, 0.05, 0.05, 0.05, 0.05, 0.05], [(7, 1.0), (9, 0.5)], 3,
+    include_payload=True)
+print(hits)
+
 col.delete([1])
 ```
 
@@ -370,6 +550,34 @@ SELECT id FROM goods WHERE id IN (1, 3) LIMIT 3;
   protocol; see `docs/HOUYIDB_SERVER_MANUAL.en.md` in the package for details.
 - After enabling `HOUYI_AUTH_TOKEN`, the pgwire password equals that token.
 
+### 4.1 Fusion Search Directives (P4, query only)
+
+```sql
+-- The sparse and vector directives must appear together; select the collection
+-- with the houyi:collection directive
+/* houyi:collection=docs */ /* houyi:vector=0.9,0.1,0.0,0.0 */ \
+  /* houyi:sparse=7:1.0,9:0.5 */ SELECT id FROM docs LIMIT 2;
+
+-- Weighted fusion (alpha applies to weighted only; fusion defaults to rrf and
+-- alpha defaults to 0.5)
+/* houyi:collection=docs */ /* houyi:vector=0.9,0.1,0.0,0.0 */ \
+  /* houyi:sparse=7:1.0,9:0.5 */ /* houyi:fusion=weighted */ \
+  /* houyi:alpha=0.4 */ SELECT id FROM docs LIMIT 2;
+```
+
+- Sparse terms use `term:weight[,term:weight…]`; duplicate terms are summed.
+  A missing `vector` directive, or fusion/alpha parameters alone, is a syntax
+  error (SQLSTATE 42601).
+- The collection must already have been created as `sparse=bm25` through
+  HTTP/SDK, and a `houyi:collection` directive is required: a missing directive
+  or a sparse-disabled collection yields `0A000`; a missing collection yields
+  `42P01` (pgwire never creates collections implicitly); term / alpha / fusion /
+  k violations yield `22023`.
+- pgwire offers **no sparse writes**: AUB1 batch rows contain only `id + dense
+  vector`; send sparse terms through HTTP `upsert` or any SDK.
+- Fusion query results are still a single `id` column (oid 20), same as normal
+  vector search.
+
 ---
 
 ## 5. Persistence, Restart, and Recovery
@@ -391,9 +599,9 @@ SELECT id FROM goods WHERE id IN (1, 3) LIMIT 3;
   `rm -rf data/`.
 - The collections WAL uses **bounded retention** (P5.0): by default the oldest
   whole segments are removed beyond 16 × 64 MiB, starting from the manifest's
-  safe checkpoint; followers pin the floor through their durable LSN. With a
-  clustered / flat-clustered / pq-flat collection present, retention stops at
-  the last floor and reports `blocked_reason` in `/v1/wal/status`.
+  safe checkpoint; followers pin the floor through their durable LSN. All six
+  index backends support snapshot compaction, so an `unsupported_backend`
+  `blocked_reason` should no longer occur in normal operation.
 
 ---
 
@@ -421,13 +629,57 @@ SELECT id FROM goods WHERE id IN (1, 3) LIMIT 3;
 | `HOUYI_HNSW_UPPER_MULT` | `0.5` | Upper-layer degree multiplier |
 | `HOUYI_HNSW_PLAN_APPLY` | On | Read-lock planning + short write-lock commit; `0`/`false`/`off`/`no`/empty falls back to the old whole-graph locking path (about 11% faster bulk loading, slower streaming search) |
 | `HOUYI_HNSW_PARALLEL_BATCH_BUILD` | Server-side `1` | Rayon parallel graph construction |
+| `HOUYI_HNSW_PARALLEL_CHUNK_SIZE` | `256` | Planning chunk size |
+| `HOUYI_HNSW_PARALLEL_PLAN_GROUP_CHUNKS` | `4` | Chunks per group (configured width = chunk × this value; acts as the cap under adaptation) |
+| `HOUYI_HNSW_PLAN_GROUP_GRAPH_DIVISOR` | `256` | Adaptive group-width cap = `max(plan_group_min, graph size / this value)`, then min-ed with the configured width; `0` disables adaptation and keeps the fixed chunk × group_chunks width |
+| `HOUYI_HNSW_PLAN_GROUP_MIN` | `16` | Floor for the adaptive **cap**: `max(this, graph size/divisor)`, then min-ed with the configured width (the final width may stay below this value) |
 | `HOUYI_HNSW_MAX_BUILD_BATCH` | Server-side `8192` | Maximum inserts per build batch |
+| `HOUYI_HNSW_GROUP_REPAIR` | `4,16` | Post-group orphan repair: group members with L0 degree below `min_degree` are re-linked within an id-order ±`window` neighborhood (grouped commit paths only; format `min[,window]`, window defaults to 16; `off`/`0`/empty disables it for A/B; invalid values warn and fall back to the default) |
+| `HOUYI_HNSW_UPPER_EF` | `64` | **Floor** for the query-side upper-layer descent beam (search entry navigation only; does not change build semantics): with adaptation on, the actual width is `max(this, ceil(layer node estimate/8))` with the adaptive part capped at 4096 (~12.5% layer coverage at 250k, ~6.5% at 1M); this value can be explicitly set to `1..=4096` (higher = slower) to force a wider beam on smaller graphs for A/B. Invalid values warn and fall back to 64. The build side intentionally keeps beam 1 |
+| `HOUYI_HNSW_UPPER_EF_ADAPTIVE` | On | Adaptation switch for the upper beam; `0/false/off/no` pins the width to `HOUYI_HNSW_UPPER_EF` (latency A/B / rollback only; disabling it can bring back wrong-cluster landings on 50k clustered corpora) |
 | `HOUYI_HNSW_KEEP_PRUNED` | `0` | keepPruned links (slightly higher recall, slower build/query; not recommended for large collections) |
 
 > Recommendation: start with the defaults. For QPS, set
 > `HOUYI_HNSW_LAYER0_MULT=1`; for recall, keep the default 2×. Do not switch
 > between the two directly on the same old graph snapshot (snapshot
 > compatibility triggers a rebuild).
+>
+> Plan group width: during batched construction each group plans its neighbors
+> against the **pre-group graph snapshot**, so siblings within a group are
+> invisible to each other. On clustered data, in-batch siblings are each
+> other's nearest neighbors; a fixed large group lets symmetric pruning turn
+> them into islands after commit, and recall stays flat as ef grows. The
+> default adaptive width **cap** is about 1/256 of the graph and never below 16;
+> the final width is further min-ed with the configured width. This preserves
+> quality on small graphs and throughput on large ones; only raise
+> `HOUYI_HNSW_PLAN_GROUP_GRAPH_DIVISOR` (or set `0`) when deliberately trading
+> quality for build throughput.
+>
+> On large clustered collections (e.g. a single 50k-point collection with 64
+> clusters of ~800 points) the adaptive width (~195) still stays below the
+> cluster size: a whole group of siblings is pruned into a pocket unreachable
+> from the entry point, so **whole-cluster queries return the wrong cluster and
+> raising ef barely helps**. After a grouped commit, members with L0 degree
+> below 4 are therefore re-linked to robust siblings within an id-order ±16
+> window (`HOUYI_HNSW_GROUP_REPAIR`, default `4,16`); the query-side
+> upper-layer beam scales with layer size (floor `HOUYI_HNSW_UPPER_EF`, default
+> 64; the layer node estimate is `graph points/M^layer`, and the width is
+> estimate/8 with the adaptive part capped at 4096, navigation only;
+> `HOUYI_HNSW_UPPER_EF_ADAPTIVE=0` disables adaptation for latency A/B, but
+> disabling it can bring back wrong-cluster landings on 50k clustered corpora;
+> adaptation adds a small query-time cost)
+> so cross-cluster navigation does not fall into a wrong local minimum. The 4096
+> cap keeps ~6.5% coverage at 1M; larger graphs can explicitly set
+> `HOUYI_HNSW_UPPER_EF` to 4096 for a wider beam (query cost rises accordingly). In
+> addition, once the build queue drains, the engine runs a connectivity
+> backstop on **every layer**: a
+> per-layer BFS from the entry point reconnects each broken in-layer component
+> to the nearest reachable anchor with spare capacity (same rule as L0). An
+> upper-layer orphan is otherwise fatal — the query descent lands directly on
+> a wrong cluster's L0 entry and a wider ef cannot recover it.
+> 50k large-cluster regression gate:
+> `./scripts/clustered_recall_50k_gate.sh` (release; covers the default,
+> legacy serial, legacy HTTP, and production-shaped cases).
 
 ### 6.3 Filtering
 
@@ -447,7 +699,9 @@ curl -sS --noproxy '*' http://127.0.0.1:17000/v1/collections/goods/status
 ```
 
 `/metrics` is in Prometheus text format and can be connected directly to
-Grafana. Server logs go to stdout/stderr (Rust `tracing`; adjustable via
+Grafana; `houyidb_collection_vectors{collection=...}` reports the indexed vector
+count per collection. `/v1/version`'s `build_sha` identifies the exact built
+commit. Server logs go to stdout/stderr (Rust `tracing`; adjustable via
 `RUST_LOG=info`).
 
 ---
@@ -479,14 +733,25 @@ HOUYI_TRIAL_HTTP_ADDR=0.0.0.0:17000 \
 - The collections WAL has bounded retention (default 16 × 64 MiB). A follower
   that falls behind the retained range receives `BEHIND_RETAINED` and must run
   the full resync in `docs/runbooks/collections-retention-resync.en.md`; it never
-  wipes itself. Replication protocol v8 is not rolling-compatible across
+  wipes itself. Replication protocol v12 is not rolling-compatible across
   versions, so upgrade all replicas together (see the server manual).
 - Scalar pages are append-only: re-upserting the same id appends a new row, and
   both filtering and payload read-back only see the last row per id (stale
   values stop matching as soon as they are overwritten). A check runs every
   10 minutes and compacts when at least 50% of rows are stale, reclaiming
-  physical rows without changing query results. clustered / flat-clustered /
-  pq-flat do not support snapshot compaction yet.
+  physical rows without changing query results.
+- Every index backend supports collection snapshot compaction. Lazy-build
+  backends (clustered / flat-clustered / pq-flat) are **one-shot**: they do
+  **not** auto-build on restore, so a collection that was unbuilt before restart
+  stays unbuilt (empty searches) until an explicit build. A built pq-flat
+  restores its compact state bit-for-bit (no retraining) and keeps post-build
+  buffered rows as pending.
+  **Once built (`built=true`), new writes only fill the pending buffer; they are
+  never merged into the index and remain unsearchable** until the collection is
+  dropped and recreated. The `lazy_build` object in
+  `GET /v1/collections/{name}/status` reports `built` / `buffered` /
+  `rebuild_required` (`rebuild_required=true` means a built index still has
+  buffered writes; eager backends omit this field).
 - Array/object values in payload are treated as JSON text columns, so filtering
   semantics are limited.
 - Backend/metric support matrix: hnsw / flat / clustered / flat-clustered
@@ -495,6 +760,18 @@ HOUYI_TRIAL_HTTP_ADDR=0.0.0.0:17000 \
 - HII L1 (GPU CAGRA) / L2 (NVMe DiskANN) are not implemented; `simd-avx512` is
   only a skeleton.
 - Filtered search is supported only by the hnsw / flat backends.
+- Sparse terms are client-supplied and the core **does not tokenize**;
+  `sparse=bm25` is hnsw / flat only, immutable after creation, allows ≤1024
+  pairs per document and ≤64 pairs per query, with `term_id` in
+  `1..=2^24-1`. Sparse writes exist only in HTTP/SDK; pgwire supports fusion
+  queries only.
+- **Downgrade prohibition (sparse)**: collection snapshot v3, manifest
+  `format_version=4`, and replication protocol v12 make older binaries reject
+  cleanly (no silent downgrade). However, the sparse fields in the collections
+  WAL are additive optional fields that older binaries **silently ignore** on
+  replay—downgrading before a snapshot exists loses the sparse index. Take a
+  snapshot first, or confirm there are no `sparse=bm25` collections, before
+  downgrading.
 - Single request body limit is 64MB.
 
 ---

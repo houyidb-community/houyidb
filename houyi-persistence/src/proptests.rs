@@ -558,29 +558,73 @@ fn arb_payload_map() -> impl Strategy<Value = serde_json::Map<String, serde_json
 /// unit tests rather than the roundtrip generator.
 fn arb_create_options() -> impl Strategy<Value = CollectionCreateOptions> {
     let metric = prop::sample::select(vec!["cosine", "l2", "ip", "l1"]);
+    // bm25 仅 hnsw/flat：roundtrip 生成器的 index_type 固定 hnsw，故两种模式都合法。
+    // EN: bm25 is hnsw/flat-only; the roundtrip generator fixes hnsw, so both
+    // modes are legal.
+    let sparse = prop::option::of(prop::sample::select(vec!["none", "bm25"]));
     prop_oneof![
         Just(CollectionCreateOptions::default()),
         // Select 不实现 Copy：复用同一策略必须显式 clone。
         // EN: Select is not Copy, so reuse requires an explicit clone.
-        metric.clone().prop_map(|m| CollectionCreateOptions {
+        (metric.clone(), sparse.clone()).prop_map(|(m, sparse)| CollectionCreateOptions {
             metric: Some(m.to_string()),
+            sparse: sparse.map(|s| s.to_string()),
             ..Default::default()
         }),
-        metric.prop_flat_map(|m| {
-            (
-                Just(m.to_string()),
-                2usize..=1024,
-                1usize..=65_536,
-                1usize..=65_536,
-            )
-                .prop_map(|(metric, m, efc, efs)| CollectionCreateOptions {
+        (metric, sparse,)
+            .prop_flat_map(|(m, sparse)| {
+                // rabitq 只允许 l2/cosine：生成器按度量裁剪候选，非法组合留在点测。
+                // EN: rabitq is l2/cosine-only: the generator prunes candidates by
+                // metric, and invalid combinations stay in focused unit tests.
+                let quantizations = if matches!(m, "l2" | "cosine") {
+                    vec!["none", "int8", "rabitq"]
+                } else {
+                    vec!["none", "int8"]
+                };
+                (
+                    Just(m.to_string()),
+                    2usize..=1024,
+                    1usize..=65_536,
+                    1usize..=65_536,
+                    prop::option::of(prop::sample::select(vec!["f32", "f16"])),
+                    prop::option::of(prop::sample::select(quantizations)),
+                    Just(sparse.map(|s| s.to_string())),
+                )
+            })
+            .prop_map(|(metric, m, efc, efs, dtype, quantization, sparse)| {
+                CollectionCreateOptions {
                     metric: Some(metric),
                     hnsw_m: Some(m),
                     hnsw_ef_construction: Some(efc),
                     hnsw_ef_search: Some(efs),
-                })
-        }),
+                    vector_dtype: dtype.map(|d| d.to_string()),
+                    quantization: quantization.map(|q| q.to_string()),
+                    sparse,
+                }
+            },)
     ]
+}
+
+/// 生成规范化的稀疏词项（term 升序、无重复、权重有限为正），与 WAL 写入侧
+/// 的归一化口径一致，保证 roundtrip 等值断言成立。
+/// EN: Generates canonical sparse terms (ascending, no duplicates, finite
+/// positive weights) matching the WAL writer's normalization, so roundtrip
+/// equality holds.
+fn arb_sparse_terms() -> impl Strategy<Value = Vec<(u32, f32)>> {
+    prop::collection::vec((1u32..8, 0.1f32..5.0), 0..5).prop_map(|terms| {
+        let mut sorted = terms;
+        sorted.sort_unstable_by_key(|(term, _)| *term);
+        let mut out: Vec<(u32, f32)> = Vec::with_capacity(sorted.len());
+        for (term, weight) in sorted {
+            match out.last_mut() {
+                Some((last_term, last_weight)) if *last_term == term => {
+                    *last_weight += weight;
+                }
+                _ => out.push((term, weight)),
+            }
+        }
+        out
+    })
 }
 
 fn arb_collection_wal_record() -> impl Strategy<Value = CollectionWalRecord> {
@@ -601,6 +645,7 @@ fn arb_collection_wal_record() -> impl Strategy<Value = CollectionWalRecord> {
                     prop::collection::vec(arb_finite_f32(), 4..=4),
                     prop::option::of("[a-z]{0,8}"),
                     prop::option::of(arb_payload_map()),
+                    prop::option::of(arb_sparse_terms()),
                 ),
                 0..6,
             ),
@@ -610,11 +655,12 @@ fn arb_collection_wal_record() -> impl Strategy<Value = CollectionWalRecord> {
                 dim: 4,
                 items: items
                     .into_iter()
-                    .map(|(id, values, label, payload)| CollectionWalItem {
+                    .map(|(id, values, label, payload, sparse)| CollectionWalItem {
                         id,
                         values,
                         label,
                         payload,
+                        sparse,
                     })
                     .collect(),
             }),

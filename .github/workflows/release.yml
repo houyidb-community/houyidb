@@ -134,11 +134,18 @@ jobs:
         env:
           LOGIN_OUTCOME: ${{ steps.dockerhub-login.outcome }}
         run: echo "::warning::Docker Hub login did not succeed (outcome=$LOGIN_OUTCOME); this release pushes GHCR only. Check DOCKERHUB_USERNAME/DOCKERHUB_TOKEN."
+      - name: Compute short git SHA
+        id: short_sha
+        # Docker 上下文无 `.git`，build.rs 读不到提交；显式传入供 build_sha 嵌入。
+        # EN: The Docker context has no `.git`, so build.rs cannot read the commit;
+        # pass it explicitly for the embedded build_sha.
+        run: echo "value=${GITHUB_SHA::8}" >> "$GITHUB_OUTPUT"
       - uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
         with:
           context: .
           platforms: linux/amd64,linux/arm64
           push: true
+          build-args: HOUYIDB_GIT_SHA=${{ steps.short_sha.outputs.value }}
           tags: ${{ env.IMAGE_TAGS }}
           # GHA 缓存按分支作用域隔离：PR 的缓存仅该 PR 可读，tag 推送的 run
           # 只能恢复默认分支的缓存。因此：

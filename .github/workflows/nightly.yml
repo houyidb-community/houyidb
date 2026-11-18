@@ -1,0 +1,103 @@
+name: Nightly gates
+
+# 夜间大尺度门禁：50k×512/64 簇 release 用例单次约 15–20 秒，250k 大图用例
+# 约 4 分钟；debug 的暴力真值与构图需要更久，故都不进每次提交的
+# `cargo test --all`。此前它们只是本地纪律项，发版可以在没跑的情况下完成；
+# 放进 nightly 让大尺度复现（整簇孤岛、跨簇错落、reachability 崩塌、
+# 簇内 beam 极限）有固定执行点与红绿记录。手动触发用于发版前强制复核。
+# EN: Nightly large-scale gates: the 50k x 512 / 64-cluster release cases take
+# ~15-20 s each and the 250k large-graph case about 4 minutes; debug
+# brute-force truth plus builds take even longer, so none run in the per-commit
+# `cargo test --all`. They used to be local discipline only, so releases could
+# ship without them ever running. Nightly gives large-scale reproductions
+# (whole-cluster islands, cross-cluster landings, reachability collapse,
+# intra-cluster beam limits) a scheduled red/green record; manual dispatch
+# forces a pre-release check.
+on:
+  schedule:
+    # UTC 03:17：避开整点（GitHub Actions 整点排队高峰），也避开用户本地深夜。
+    # EN: 03:17 UTC — off the top of the hour (scheduler congestion) and outside
+    # EN: the user's local night.
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# group 里带上事件名：schedule 与 workflow_dispatch 在默认分支都解析为
+# refs/heads/main，若只看 ref，手动发版前复核会把在跑的定时任务取消，反之
+# 亦然——两者意图不同，不能互相取消。
+# EN: Include the event name in the group: schedule and workflow_dispatch both
+# resolve to refs/heads/main on the default branch, so keying on ref alone
+# would let a manual pre-release check cancel an in-flight scheduled run and
+# vice versa — the two intents must not cancel each other.
+concurrency:
+  group: nightly-gates-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  clustered-recall-50k:
+    name: Clustered recall 50k (release)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      # 与 ci.yml 一致：工具链与缓存 action 钉完整 commit SHA。
+      # EN: Same as ci.yml: toolchain and cache actions pinned to full SHAs.
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      # 脚本内部按用例钉住进程级 OnceLock 并清空 KEEP_PRUNED/RERANK_EXPAND，
+      # 逐行校验四个 `ok`——这里只负责在干净的 CI 环境执行它。
+      # EN: The script pins the process-wide OnceLocks per case, clears
+      # KEEP_PRUNED/RERANK_EXPAND, and line-checks all four `ok` results; this
+      # job simply runs it in a clean CI environment.
+      - name: Run 50k clustered recall gate
+        run: ./scripts/clustered_recall_50k_gate.sh
+  large-graph-navigation-250k:
+    name: Large-graph navigation 250k (release)
+    runs-on: ubuntu-24.04
+    # 250k x 512 的生产形态构图 + 暴力真值约需数分钟；给足缓存/冷构建余量。
+    # EN: The 250k x 512 production-shaped build plus brute-force truth takes
+    # minutes; leave room for cold builds and cache misses.
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      # 断言低/中 ef 不跨簇错落、ef=8192 恢复全召回；用例/脚本自行钉 env。
+      # EN: Asserts no cross-cluster landing at low/mid ef and full recall at
+      # ef=8192; the case/script pin the env themselves.
+      - name: Run 250k large-graph navigation gate
+        run: ./scripts/large_graph_navigation_250k_gate.sh
+  # 失败标注放在独立 job：同一 job 内的 `if: failure()` 在**超时**时不会执行
+  # （job 已结束），而 release 构建 + 四条 50k 用例（其中一条构图两次）恰好是最可能触发超时的
+  # 场景。job 级判定覆盖失败与超时；被并发组取代（cancelled）不算门禁失败，
+  # 不报警。注意 annotation 只在 run 页面可见；真正的推送通知（issue/webhook）
+  # 留待 P1，不在此处过度承诺。
+  # EN: The failure annotation lives in a separate job: an in-job `if: failure()`
+  # never runs on timeout (the job is already over), and the release build plus
+  # four 50k cases (one builds the index twice) is exactly the likeliest
+  # timeout path. The job-level result
+  # check covers failures and timeouts; a concurrency-superseded run
+  # (cancelled) is not a gate failure and does not alert. Note the annotation is
+  # only visible on the run page; real push notification (issue/webhook) is P1
+  # and is deliberately not promised here.
+  notify-failure:
+    name: Surface gate failure
+    needs: [clustered-recall-50k, large-graph-navigation-250k]
+    # 只对真正的 failure 报警：`cancelled` 表示本 run 被并发组的新 run 取代，
+    # 并未发生门禁失败；把它也标红会在每次快速连续触发时产生假警报。
+    # 超时在 GitHub 里同样报告为 failure，因此仍被覆盖。
+    # EN: Alert only on genuine failures: `cancelled` means this run was
+    # superseded by a newer run in the concurrency group, not a gate failure;
+    # flagging it would produce false alarms on rapid re-triggers. Timeouts are
+    # reported as `failure` by GitHub, so they stay covered.
+    if: always() && (needs.clustered-recall-50k.result == 'failure' || needs.large-graph-navigation-250k.result == 'failure')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Annotate failure
+        # 把两个 gate 的结果都写进 annotation，红色 nightly 自报是哪一个失败/超时。
+        # EN: Include both gate results so a red nightly self-identifies which
+        # gate failed or timed out.
+        run: echo "::error::nightly large-scale gate failed or timed out (50k=${{ needs.clustered-recall-50k.result }}, 250k=${{ needs.large-graph-navigation-250k.result }}); inspect the failing job log."

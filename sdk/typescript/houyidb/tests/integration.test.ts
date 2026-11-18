@@ -172,4 +172,75 @@ describe("integration", () => {
       client.deleteCollection("ts_it_admin_never_created"),
     ).rejects.toMatchObject({ name: "HouyiError", statusCode: 404 });
   });
+
+  it("sparse create + fusion search round trip", async () => {
+    const name = "ts_it_fusion";
+    try {
+      await client.deleteCollection(name);
+    } catch (err) {
+      // 清理只容忍 404（从未创建）；其他错误让用例失败。
+      // EN: Cleanup tolerates only 404 (never created); anything else fails.
+      expect(err).toMatchObject({ name: "HouyiError", statusCode: 404 });
+    }
+    const created = await client.createCollection(name, DIMS, {
+      sparse: "bm25",
+    });
+    expect(created.sparse).toBe("bm25");
+
+    const col = client.collection(name);
+    await col.upsert([
+      {
+        id: 1,
+        values: fakeEmbed("apple fruit"),
+        payload: { text: "apple fruit" },
+        sparse: [
+          [11, 1.0],
+          [12, 0.5],
+        ],
+      },
+      {
+        id: 2,
+        values: fakeEmbed("banana yellow"),
+        payload: { text: "banana yellow" },
+        sparse: [[21, 1.0]],
+      },
+    ]);
+    await waitFlushed(client, name);
+
+    const rrf = await col.fusionSearch(fakeEmbed("apple fruit"), [[11, 1.0]], 2, {
+      includePayload: true,
+    });
+    expect(rrf.fusionMode).toBe("rrf");
+    expect(rrf.rrfK).toBe(60);
+    expect(rrf.alpha).toBeNull();
+    expect(rrf.ids[0]).toBe(1n);
+    expect(rrf.hits[0]?.denseScore).not.toBeNull();
+    expect(rrf.hits[0]?.sparseScore).not.toBeNull();
+    expect(rrf.hits[0]?.payload?.text).toBe("apple fruit");
+
+    const weighted = await col.fusionSearch(
+      fakeEmbed("apple fruit"),
+      [[11, 1.0]],
+      2,
+      { fusion: "weighted", alpha: 0.5 },
+    );
+    expect(weighted.fusionMode).toBe("weighted");
+    expect(weighted.alpha).toBe(0.5);
+    expect(weighted.rrfK).toBeNull();
+    expect(weighted.ids[0]).toBe(1n);
+
+    // 空数组清空该文档的稀疏词项：稠密一路仍命中，但无 BM25 分。
+    // EN: An empty array clears the document's sparse terms: the dense path
+    // still hits it, but there is no BM25 score.
+    await col.upsert([
+      { id: 1, values: fakeEmbed("apple fruit"), sparse: [] },
+    ]);
+    await waitFlushed(client, name);
+    const cleared = await col.fusionSearch(fakeEmbed("apple fruit"), [[11, 1.0]], 2);
+    const hitOne = cleared.hits.find((h) => h.id === 1n);
+    expect(hitOne?.denseScore).not.toBeNull();
+    expect(hitOne?.sparseScore).toBeNull();
+
+    await client.deleteCollection(name);
+  });
 });

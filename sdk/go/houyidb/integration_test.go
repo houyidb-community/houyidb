@@ -279,9 +279,11 @@ func TestCreateCollectionMetricAndHnsw(t *testing.T) {
 	}
 
 	created, err := client.CreateCollection(ctx, name, testDims, &CreateCollectionOptions{
-		Metric:    "ip",
-		IndexType: "hnsw",
-		Hnsw:      &HnswConfig{M: 16, EFConstruction: 100, EFSearch: 32},
+		Metric:       "ip",
+		IndexType:    "hnsw",
+		Hnsw:         &HnswConfig{M: 16, EFConstruction: 100, EFSearch: 32},
+		VectorDtype:  "f16",
+		Quantization: "int8",
 	})
 	if err != nil {
 		t.Fatalf("create collection: %v", err)
@@ -291,6 +293,12 @@ func TestCreateCollectionMetricAndHnsw(t *testing.T) {
 	}
 	if created.Metric != "ip" || created.IndexType != "hnsw" {
 		t.Errorf("metric/index_type = %q/%q, want ip/hnsw", created.Metric, created.IndexType)
+	}
+	if created.VectorDtype != "f16" {
+		t.Errorf("vector_dtype = %q, want f16", created.VectorDtype)
+	}
+	if created.Quantization != "int8" {
+		t.Errorf("quantization = %q, want int8", created.Quantization)
 	}
 	if created.Hnsw == nil ||
 		created.Hnsw.M != 16 ||
@@ -304,6 +312,48 @@ func TestCreateCollectionMetricAndHnsw(t *testing.T) {
 		t.Errorf("second create must fail with HouyiError, got %v", err)
 	} else if conflictErr.StatusCode != 409 {
 		t.Errorf("status = %d, want 409", conflictErr.StatusCode)
+	}
+}
+
+// TestCreateCollectionRabitq rabitq 仅 l2/cosine：合法创建回显 rabitq，ip 组合 400。
+// EN: TestCreateCollectionRabitq verifies rabitq is l2/cosine-only: a valid
+// create echoes rabitq and the ip combination returns 400.
+func TestCreateCollectionRabitq(t *testing.T) {
+	client := newTestClient(t)
+	ctx := context.Background()
+	const name = "go_it_create_rabitq"
+	var cleanupErr *HouyiError
+	if err := client.DeleteCollection(ctx, name); err != nil &&
+		(!errors.As(err, &cleanupErr) || cleanupErr.StatusCode != 404) {
+		t.Fatalf("cleanup delete: %v", err)
+	}
+
+	created, err := client.CreateCollection(ctx, name, testDims, &CreateCollectionOptions{
+		Metric:       "cosine",
+		IndexType:    "hnsw",
+		VectorDtype:  "f32",
+		Quantization: "rabitq",
+	})
+	if err != nil {
+		t.Fatalf("create rabitq collection: %v", err)
+	}
+	if created.Metric != "cosine" || created.IndexType != "hnsw" ||
+		created.Quantization != "rabitq" {
+		t.Errorf("echo = %+v, want cosine/hnsw/rabitq", created)
+	}
+
+	var badErr *HouyiError
+	if _, err := client.CreateCollection(ctx, name+"_ip", testDims, &CreateCollectionOptions{
+		Metric:       "ip",
+		IndexType:    "hnsw",
+		Quantization: "rabitq",
+	}); !errors.As(err, &badErr) {
+		t.Errorf("rabitq+ip must fail with HouyiError, got %v", err)
+	} else if badErr.StatusCode != 400 {
+		t.Errorf("status = %d, want 400", badErr.StatusCode)
+	}
+	if err := client.DeleteCollection(ctx, name); err != nil {
+		t.Fatalf("cleanup after create: %v", err)
 	}
 }
 
@@ -345,6 +395,165 @@ func TestDeleteCollectionAndRecreate(t *testing.T) {
 	}
 	if indexed, _ := status["indexed_count"].(float64); indexed != 1 {
 		t.Errorf("indexed_count = %v, want 1", status["indexed_count"])
+	}
+}
+
+// TestSparseCreateAndFusionSearch bm25 建集合 → 带稀疏 upsert → 融合检索
+// （RRF/加权回显）→ sparse=[] 清空后仅剩稠密分。
+// EN: TestSparseCreateAndFusionSearch creates a bm25 collection, upserts with
+// sparse terms, runs a fusion search (RRF/weighted echoes), and verifies that
+// clearing with sparse=[] leaves the document with a dense score only.
+func TestSparseCreateAndFusionSearch(t *testing.T) {
+	client := newTestClient(t)
+	ctx := context.Background()
+	const name = "go_it_fusion"
+	// 清理只容忍 404（从未创建）；其他错误直接失败。
+	// EN: Cleanup tolerates only 404 (never created); anything else fails.
+	var cleanupErr *HouyiError
+	if err := client.DeleteCollection(ctx, name); err != nil &&
+		(!errors.As(err, &cleanupErr) || cleanupErr.StatusCode != 404) {
+		t.Fatalf("cleanup delete: %v", err)
+	}
+
+	created, err := client.CreateCollection(ctx, name, testDims, &CreateCollectionOptions{
+		IndexType: "flat",
+		Sparse:    "bm25",
+	})
+	if err != nil {
+		t.Fatalf("create sparse collection: %v", err)
+	}
+	if created.Sparse != "bm25" || created.IndexType != "flat" {
+		t.Errorf("create echo = %+v, want flat/bm25", created)
+	}
+
+	col := client.Collection(name)
+	if _, err := col.Upsert(ctx, []Vector{
+		{ID: 1, Values: fakeEmbed("apple"), Sparse: []SparseTerm{{7, 1.0}, {8, 0.5}},
+			Payload: map[string]interface{}{"text": "apple"}},
+		{ID: 2, Values: fakeEmbed("banana"), Sparse: []SparseTerm{{8, 1.0}},
+			Payload: map[string]interface{}{"text": "banana"}},
+		{ID: 3, Values: fakeEmbed("cherry"), Sparse: []SparseTerm{{9, 1.0}},
+			Payload: map[string]interface{}{"text": "cherry"}},
+	}); err != nil {
+		t.Fatalf("sparse upsert: %v", err)
+	}
+	waitFlushed(t, ctx, col)
+
+	result, err := col.FusionSearch(ctx, fakeEmbed("apple"),
+		[]SparseTerm{{7, 1.0}, {8, 0.5}}, 2, &FusionSearchOptions{IncludePayload: true})
+	if err != nil {
+		t.Fatalf("fusion search: %v", err)
+	}
+	if len(result.Hits) == 0 || result.Hits[0].ID != 1 {
+		t.Fatalf("rrf top hit = %+v, want id 1", result.Hits)
+	}
+	if result.FusionMode != "rrf" || result.RRFK == nil || *result.RRFK != 60 {
+		t.Errorf("fusion echo = %+v, want rrf/rrf_k=60", result)
+	}
+	if result.Alpha != nil {
+		t.Errorf("rrf must not echo alpha: %v", *result.Alpha)
+	}
+	top := result.Hits[0]
+	if top.DenseScore == nil || top.SparseScore == nil {
+		t.Errorf("both-modality hit must carry both scores: %+v", top)
+	}
+	if top.Payload["text"] != "apple" {
+		t.Errorf("payload text = %v, want apple", top.Payload["text"])
+	}
+	if result.Metric != "cosine" {
+		t.Errorf("metric = %q, want cosine (flat default)", result.Metric)
+	}
+
+	alpha := float32(0.25)
+	weighted, err := col.FusionSearch(ctx, fakeEmbed("apple"),
+		[]SparseTerm{{7, 1.0}}, 2,
+		&FusionSearchOptions{Fusion: "weighted", Alpha: &alpha})
+	if err != nil {
+		t.Fatalf("weighted fusion: %v", err)
+	}
+	if weighted.FusionMode != "weighted" ||
+		weighted.Alpha == nil || *weighted.Alpha != 0.25 || weighted.RRFK != nil {
+		t.Errorf("weighted echo = %+v, want weighted/alpha=0.25/no rrf_k", weighted)
+	}
+
+	// sparse=[] 清空该文档词项（缺省 nil 才是「不改」）；清空后仅剩稠密分。
+	// EN: Sparse=[] clears this document's terms (nil means "unchanged");
+	// afterwards only the dense score remains.
+	if _, err := col.Upsert(ctx, []Vector{{
+		ID: 1, Values: fakeEmbed("apple"), Sparse: []SparseTerm{},
+		Payload: map[string]interface{}{"text": "apple"},
+	}}); err != nil {
+		t.Fatalf("clear sparse: %v", err)
+	}
+	waitFlushed(t, ctx, col)
+	cleared, err := col.FusionSearch(ctx, fakeEmbed("apple"),
+		[]SparseTerm{{8, 1.0}}, 3, nil)
+	if err != nil {
+		t.Fatalf("fusion after clear: %v", err)
+	}
+	var hit1 *FusionHit
+	for i := range cleared.Hits {
+		if cleared.Hits[i].ID == 1 {
+			hit1 = &cleared.Hits[i]
+		}
+	}
+	if hit1 == nil {
+		t.Fatalf("cleared doc must stay reachable via the dense path: %+v", cleared.Hits)
+	}
+	if hit1.DenseScore == nil || hit1.SparseScore != nil {
+		t.Errorf("cleared doc = %+v, want dense-only", hit1)
+	}
+
+	if err := client.DeleteCollection(ctx, name); err != nil {
+		t.Fatalf("cleanup after test: %v", err)
+	}
+}
+
+// TestSparseCreateGuards bm25 仅 hnsw/flat（clustered 组合 400）；隐式创建的
+// none 集合上融合检索 400。
+// EN: TestSparseCreateGuards verifies bm25 is hnsw/flat-only (a clustered combo
+// is 400) and fusion search on an implicitly created none collection is 400.
+func TestSparseCreateGuards(t *testing.T) {
+	client := newTestClient(t)
+	ctx := context.Background()
+	const badName = "go_it_sparse_clustered"
+	const implicitName = "go_it_sparse_implicit"
+
+	for _, name := range []string{badName, implicitName} {
+		var cleanupErr *HouyiError
+		if err := client.DeleteCollection(ctx, name); err != nil &&
+			(!errors.As(err, &cleanupErr) || cleanupErr.StatusCode != 404) {
+			t.Fatalf("cleanup delete %s: %v", name, err)
+		}
+	}
+
+	var badErr *HouyiError
+	if _, err := client.CreateCollection(ctx, badName, testDims, &CreateCollectionOptions{
+		IndexType: "clustered",
+		Sparse:    "bm25",
+	}); !errors.As(err, &badErr) {
+		t.Fatalf("clustered+bm25 must fail with HouyiError, got %v", err)
+	} else if badErr.StatusCode != 400 {
+		t.Errorf("clustered+bm25 status = %d, want 400", badErr.StatusCode)
+	}
+
+	// 隐式创建恒为 none：带 sparse 键的融合检索被拒（400）。
+	// EN: Implicit creation is always none, so a fusion search on it yields 400.
+	if _, err := client.Collection(implicitName).Upsert(ctx, []Vector{
+		{ID: 1, Values: fakeEmbed("implicit none")},
+	}); err != nil {
+		t.Fatalf("implicit upsert: %v", err)
+	}
+	var fusionErr *HouyiError
+	if _, err := client.Collection(implicitName).FusionSearch(ctx, fakeEmbed("implicit none"),
+		[]SparseTerm{{1, 1.0}}, 1, nil); !errors.As(err, &fusionErr) {
+		t.Fatalf("fusion on none collection must fail with HouyiError, got %v", err)
+	} else if fusionErr.StatusCode != 400 {
+		t.Errorf("fusion on none status = %d, want 400", fusionErr.StatusCode)
+	}
+
+	if err := client.DeleteCollection(ctx, implicitName); err != nil {
+		t.Fatalf("cleanup implicit: %v", err)
 	}
 }
 

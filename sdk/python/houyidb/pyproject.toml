@@ -7,11 +7,21 @@ name = "houyidb"
 version = "0.2.0b8"
 description = "Python SDK for HouyiDB — single-node vector database (collections HTTP API)"
 readme = "README.md"
-requires-python = ">=3.9"
+requires-python = ">=3.10"
 license = "Apache-2.0"
 authors = [{ name = "HouyiDB Contributors" }]
 keywords = ["vector-database", "hnsw", "rag", "houyidb"]
-dependencies = ["requests>=2.28"]
+# 依赖下限即安全修复线：requests 2.34.2 / urllib3 2.8.0 修复已知漏洞（Dependabot
+# 告警）；SDK 自身只 import requests，urllib3 显式列出是为了强制解析到修复版本
+# 而非让它随 requests 的宽区间回退到旧版。`<3` 与 requests 自身的 urllib3 上界
+# 对齐，不放宽消费者已有的约束（如 botocore 的 urllib3 上限）。
+# EN: The floors are security-fix lines (requests 2.34.2 / urllib3 2.8.0 clear the
+# Dependabot advisories); the SDK imports only requests, and urllib3 is listed
+# explicitly so resolution cannot fall back to an unfixed version through
+# requests' wide range. `<3` mirrors requests' own urllib3 upper bound so this
+# constraint stays no wider than what consumers already allow (e.g. botocore's
+# urllib3 cap).
+dependencies = ["requests>=2.34.2,<3", "urllib3>=2.8.0,<3"]
 
 [project.urls]
 Homepage = "https://github.com/houyidb-community/houyidb"

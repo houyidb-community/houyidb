@@ -20,7 +20,25 @@ pub enum ColType {
 /// EN: Columnar scalar store.
 pub struct ScalarStore {
     rows: usize,
+    /// 每行对应的向量 id；旧 API 未提供 id 时按行号 0..n 填充。
+    /// EN: Vector id for each scalar row; legacy APIs without an id use the
+    /// row index 0..n.
+    row_ids: Vec<u64>,
+    /// id → 行号（显式 id 写入/覆盖 O(1)，避免逐行线性扫描）。
+    /// EN: Map id to row index so explicit-id upserts are O(1) instead of a
+    /// linear scan per write.
+    row_index: HashMap<u64, usize>,
     columns: HashMap<String, (ColType, Vec<ScalarVal>)>,
+}
+
+/// 标量页快照：列按名称排序，保证同一状态写成稳定字节。
+/// EN: Scalar-page snapshot: columns sorted by name so the same state always
+/// encodes to stable bytes.
+#[derive(Debug, Clone)]
+pub(crate) struct ScalarStoreSnapshot {
+    pub rows: usize,
+    pub row_ids: Vec<u64>,
+    pub columns: Vec<(String, ColType, Vec<ScalarVal>)>,
 }
 
 #[derive(Debug, Clone)]
@@ -41,13 +59,89 @@ impl ScalarStore {
     pub fn new() -> Self {
         ScalarStore {
             rows: 0,
+            row_ids: Vec::new(),
+            row_index: HashMap::new(),
             columns: HashMap::new(),
         }
     }
 
+    pub(crate) fn snapshot(&self) -> ScalarStoreSnapshot {
+        let mut columns: Vec<(String, ColType, Vec<ScalarVal>)> = self
+            .columns
+            .iter()
+            .map(|(name, (ty, values))| (name.clone(), ty.clone(), values.clone()))
+            .collect();
+        columns.sort_by(|a, b| a.0.cmp(&b.0));
+        ScalarStoreSnapshot {
+            rows: self.rows,
+            row_ids: self.row_ids.clone(),
+            columns,
+        }
+    }
+
+    pub(crate) fn from_snapshot(snapshot: ScalarStoreSnapshot) -> Result<Self, String> {
+        if snapshot.row_ids.len() != snapshot.rows {
+            return Err(format!(
+                "scalar row ids have {} entries, expected {}",
+                snapshot.row_ids.len(),
+                snapshot.rows
+            ));
+        }
+        let mut columns = HashMap::with_capacity(snapshot.columns.len());
+        for (name, ty, values) in snapshot.columns {
+            if values.len() != snapshot.rows {
+                return Err(format!(
+                    "scalar column '{name}' has {} values, expected {}",
+                    values.len(),
+                    snapshot.rows
+                ));
+            }
+            if columns.insert(name.clone(), (ty, values)).is_some() {
+                return Err(format!("duplicate scalar column '{name}'"));
+            }
+        }
+        let mut row_index = HashMap::with_capacity(snapshot.row_ids.len());
+        for (idx, &id) in snapshot.row_ids.iter().enumerate() {
+            if row_index.insert(id, idx).is_some() {
+                return Err(format!("duplicate scalar row id {id}"));
+            }
+        }
+        Ok(ScalarStore {
+            rows: snapshot.rows,
+            row_ids: snapshot.row_ids,
+            row_index,
+            columns,
+        })
+    }
+
     /// 添加一行标量数据 / Append a row of scalars
-    /// EN: Append a row of scalar data.
+    /// 行号兼容仅在显式 id 尚未占用该行号时成立；混合使用时请一律改用显式 id。
+    /// EN: Append a row of scalar data. Row-index compatibility only holds while
+    /// explicit ids have not occupied that index; mixed usage should use
+    /// explicit ids exclusively.
     pub fn push_row(&mut self, row: &[(&str, ScalarVal)]) {
+        // 旧 API 按行号取 id；显式 id 可能已占用该行号，因此跳到首个空闲 id，
+        // 避免同一 id 出现两行（否则 row_index 与 row_ids 会指向不同行）。
+        // EN: Legacy callers derive the id from the row count; explicit ids may
+        // already occupy that slot, so advance to the first free id. Otherwise
+        // one id would map to two rows and row_index would disagree with row_ids.
+        let mut id = self.rows as u64;
+        while self.row_index.contains_key(&id) {
+            id += 1;
+        }
+        self.write_row_with_id(id, row);
+    }
+
+    /// 以显式向量 id 写入标量行（混合检索按 id 关联，而不是行号）；同 id
+    /// 已存在时整行覆盖而非追加，保证 row_ids 唯一。内部写入原语。
+    /// EN: Write a scalar row for an explicit vector id (hybrid search associates
+    /// by id, not row index). An existing id is replaced wholesale instead of
+    /// appended, so row_ids stays unique. Internal write primitive.
+    fn write_row_with_id(&mut self, id: u64, row: &[(&str, ScalarVal)]) {
+        if let Some(&idx) = self.row_index.get(&id) {
+            self.overwrite_row_at(idx, row);
+            return;
+        }
         for (col, val) in row {
             let (_col_type, vec) = self
                 .columns
@@ -62,7 +156,37 @@ impl ScalarStore {
                 vec.push(ScalarVal::Missing);
             }
         }
+        self.row_index.insert(id, self.row_ids.len());
+        self.row_ids.push(id);
         self.rows += 1;
+    }
+
+    /// 以显式 id 覆盖写入整行标量（不存在则追加）；旧行值全部先置 Missing，
+    /// 避免旧标签在更新后仍命中。这是显式 id 写入的规范入口。
+    /// EN: Replace the whole scalar row for an explicit id (append if absent);
+    /// prior values are cleared to Missing so stale tags cannot keep matching.
+    /// This is the canonical explicit-id entry point.
+    pub fn upsert_row_with_id(&mut self, id: u64, row: &[(&str, ScalarVal)]) {
+        self.write_row_with_id(id, row);
+    }
+
+    /// 覆盖指定行：先把该行所有列置 Missing，再写入新列值。
+    /// EN: Overwrite one row by clearing every column at that index, then
+    /// writing the new values.
+    fn overwrite_row_at(&mut self, idx: usize, row: &[(&str, ScalarVal)]) {
+        for (_ty, vec) in self.columns.values_mut() {
+            if let Some(slot) = vec.get_mut(idx) {
+                *slot = ScalarVal::Missing;
+            }
+        }
+        for (col, val) in row {
+            let (_ty, vec) = self
+                .columns
+                .entry(col.to_string())
+                .or_insert_with(|| (val.col_type(), vec![ScalarVal::Missing; self.rows]));
+            vec.resize(self.rows, ScalarVal::Missing);
+            vec[idx] = val.clone();
+        }
     }
 
     /// 过滤 → 匹配行索引列表。
@@ -110,6 +234,18 @@ impl ScalarStore {
                 .filter_map(|(i, &m)| if m { Some(i as u64) } else { None })
                 .collect(),
         )
+    }
+
+    /// 过滤 → 匹配的**向量 id** 列表（混合检索用；行号只用于内部列访问）。
+    /// EN: Filter to the matching **vector ids** for hybrid search; row indices
+    /// remain internal to column access.
+    pub fn filter_ids(&self, filters: &[FilterOp]) -> Option<Vec<u64>> {
+        self.filter(filters).map(|indices| {
+            indices
+                .into_iter()
+                .map(|i| self.row_ids[i as usize])
+                .collect()
+        })
     }
 }
 
@@ -214,9 +350,63 @@ fn compare(a: &ScalarVal, b: &ScalarVal) -> Option<std::cmp::Ordering> {
     }
 }
 
+/// 解析标量值字符串 / Parse a scalar value from its wire string.
+/// "int:42" | "float:0.8" | "text:beach" | "ts:1717200000"
+pub(crate) fn parse_scalar(raw: &str) -> Result<ScalarVal, String> {
+    if let Some(v) = raw.strip_prefix("int:") {
+        v.parse()
+            .map(ScalarVal::Int)
+            .map_err(|e| format!("invalid int scalar {raw:?}: {e}"))
+    } else if let Some(v) = raw.strip_prefix("float:") {
+        v.parse()
+            .map(ScalarVal::Float)
+            .map_err(|e| format!("invalid float scalar {raw:?}: {e}"))
+    } else if let Some(v) = raw.strip_prefix("text:") {
+        Ok(ScalarVal::Text(v.to_string()))
+    } else if let Some(v) = raw.strip_prefix("ts:") {
+        v.parse()
+            .map(ScalarVal::Timestamp)
+            .map_err(|e| format!("invalid timestamp scalar {raw:?}: {e}"))
+    } else {
+        Ok(ScalarVal::Text(raw.to_string()))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn explicit_and_legacy_writes_keep_unique_row_ids() {
+        let mut store = ScalarStore::new();
+        store.upsert_row_with_id(1, &[("tag", ScalarVal::Text("explicit".into()))]);
+        // 旧 API 的 id 由行号推导，此时行号 0 被显式 id 1 之后的下一个空闲
+        // 行号本应是 1，但 1 已占用；必须跳过而不是生成重复 id。
+        // EN: The legacy id comes from the row count; slot 1 is already taken,
+        // so it must advance instead of emitting a duplicate id.
+        store.push_row(&[("tag", ScalarVal::Text("legacy".into()))]);
+        let snap = store.snapshot();
+        assert_eq!(snap.rows, 2);
+        let unique: std::collections::HashSet<u64> = snap.row_ids.iter().copied().collect();
+        assert_eq!(
+            unique.len(),
+            2,
+            "row ids must stay unique: {:?}",
+            snap.row_ids
+        );
+
+        // 同 id 再写必须整行覆盖，不能新增第三行。
+        // EN: Rewriting the same id must replace the row, not add a third one.
+        store.upsert_row_with_id(1, &[("tag", ScalarVal::Text("replaced".into()))]);
+        let snap = store.snapshot();
+        assert_eq!(snap.rows, 2);
+        let ids = store.filter_ids(&[FilterOp {
+            column: "tag".into(),
+            op: FilterOpType::Eq,
+            value: ScalarVal::Text("replaced".into()),
+        }]);
+        assert_eq!(ids, Some(vec![1]));
+    }
 
     #[test]
     fn test_scalar_filter() {
@@ -407,7 +597,7 @@ fn test_missing_padding_never_equals_user_values() {
 fn test_search_hybrid_unknown_column_returns_empty() {
     use crate::db::MobileDB;
     let db = MobileDB::new();
-    db.get_or_create("c", 4, "flat");
+    db.get_or_create("c", 4, "flat").unwrap();
     db.insert("c", 0, &[1.0, 0.0, 0.0, 0.0]).unwrap();
     db.insert("c", 1, &[0.0, 1.0, 0.0, 0.0]).unwrap();
     db.insert_scalars("c", &[("tag", "text:a")]).unwrap();

@@ -41,20 +41,40 @@ export function toVectorId(id: VectorIdInput): bigint {
 }
 
 /**
- * 一条待写入向量：id + 分量 + 可选 label/payload。
- * EN: A vector to write: id + components + optional label/payload.
+ * 稀疏词项对：``[term_id, weight]``，term_id 取值 ``[1, 2^24-1]``、weight
+ * 有限且为正；重复 term 由服务端求和。
+ * EN: A sparse term pair: ``[term_id, weight]`` with term_id in ``[1, 2^24-1]``
+ * and a finite positive weight; duplicate terms are summed by the server.
+ */
+export type SparseTerm = [number, number];
+
+/**
+ * 一条待写入向量：id + 分量 + 可选 label/payload/sparse 词项。
+ *
+ * ``sparse`` 仅对 ``sparse: "bm25"`` 的集合有效：缺省表示不改该文档的稀疏
+ * 词项，``[]`` 表示清空。
+ * EN: A vector to write: id + components + optional label/payload/sparse
+ * terms. ``sparse`` only applies to ``sparse: "bm25"`` collections: absent
+ * means the document's sparse terms are unchanged, and ``[]`` clears them.
  */
 export interface Vector {
   id: VectorIdInput;
   values: number[];
   label?: string;
   payload?: Record<string, unknown>;
+  sparse?: SparseTerm[];
 }
 
 export function vectorToJson(v: Vector): Record<string, unknown> {
   const doc: Record<string, unknown> = { id: toVectorId(v.id), values: v.values };
   if (v.label !== undefined) doc.label = v.label;
   if (v.payload && Object.keys(v.payload).length > 0) doc.payload = v.payload;
+  // 缺省键 = 不改，空数组 = 清空：两种语义必须靠「键存在性」区分，不能用空值
+  // 到 undefined 的转换抹平。
+  // EN: An absent key means unchanged and an empty array means clear: the two
+  // semantics must be distinguished by key presence, never flattened by
+  // converting empty values to undefined.
+  if (v.sparse !== undefined) doc.sparse = v.sparse;
   return doc;
 }
 
@@ -131,6 +151,102 @@ export class SearchResult {
       };
     });
     return new SearchResult(hits, body.metric);
+  }
+}
+
+/**
+ * 单条融合命中：id + 融合分 + 两路原始分 + 可选 payload。
+ *
+ * 融合分只表达排序（RRF 或加权），不属于任何度量口径；``denseScore`` 按
+ * 集合度量换算、仅稠密一路命中时存在；``sparseScore`` 为 BM25 原始分、
+ * 仅稀疏一路命中时存在。
+ * EN: One fusion hit: id + fused score + both raw modality scores + optional
+ * payload. The fused score only expresses ranking (RRF or weighted) and
+ * belongs to no metric; ``denseScore`` is converted under the collection
+ * metric and exists only when the dense path hit; ``sparseScore`` is the raw
+ * BM25 score and exists only when the sparse path hit.
+ */
+export interface FusionHit {
+  id: bigint;
+  score: number;
+  denseScore: number | null;
+  sparseScore: number | null;
+  payload: Record<string, unknown> | null;
+}
+
+/**
+ * 融合检索响应：hits 按融合分从高到低排列，附生效参数回显。
+ *
+ * ``metric`` 仅用于解释 ``denseScore``；``fusionMode`` 为生效模式
+ * （``rrf`` | ``weighted``）；``rrfK`` 仅 rrf 模式回显、``alpha`` 仅
+ * weighted 模式回显（缺席为 null）。
+ * EN: Fusion response: hits ordered by fused score, highest first, with the
+ * effective parameters echoed. ``metric`` explains ``denseScore`` only;
+ * ``fusionMode`` is the effective mode (``rrf`` | ``weighted``); ``rrfK`` is
+ * echoed only under rrf and ``alpha`` only under weighted (absent is null).
+ */
+export class FusionResult {
+  constructor(
+    public readonly hits: FusionHit[],
+    public readonly metric?: string,
+    public readonly fusionMode?: string,
+    public readonly rrfK: number | null = null,
+    public readonly alpha: number | null = null,
+  ) {}
+
+  get ids(): bigint[] {
+    return this.hits.map((h) => h.id);
+  }
+
+  get scores(): number[] {
+    return this.hits.map((h) => h.score);
+  }
+
+  /**
+   * 从原始响应文本解析（ids 数组经 bigint 防腐蚀处理，见 json.ts）。
+   * 可选字段缺席（旧服务端/精简响应）时按 null 容忍。
+   * EN: Parse from the raw response text (the ids array is protected against
+   * corruption via bigint, see json.ts). Absent optional fields (older servers
+   * or trimmed responses) are tolerated as null.
+   */
+  static fromRawJson(raw: string): FusionResult {
+    const body = parseSearchResponse(raw);
+    const ids = body.ids ?? [];
+    const scores = body.scores ?? [];
+    // scores 是融合排序键，服务端保证与 ids 等长；短数组会让命中拿到
+    // undefined 分值（静默错排），因此按协议违例直接报错而不是伪造分值。
+    // 模态数组仍按可选字段容忍：缺席表示该路全部未命中。
+    // EN: scores is the fused ranking key and the server guarantees it is
+    // parallel to ids; a short array would leave hits with undefined scores
+    // (silent misordering), so treat it as a protocol violation instead of
+    // faking values. Modality arrays stay optional-field tolerant: absent
+    // means that path missed every hit.
+    if (scores.length !== ids.length) {
+      throw new Error(
+        `malformed fusion response: scores length ${scores.length} != ids length ${ids.length}`,
+      );
+    }
+    const denseScores = body.dense_scores ?? [];
+    const sparseScores = body.sparse_scores ?? [];
+    const payloads = body.payloads;
+    const hits = ids.map((i, idx) => {
+      const id = BigInt(i);
+      return {
+        id,
+        score: scores[idx],
+        denseScore: denseScores[idx] ?? null,
+        sparseScore: sparseScores[idx] ?? null,
+        payload: payloads?.[id.toString()] ?? null,
+      };
+    });
+    const fusion = body.fusion;
+    return new FusionResult(
+      hits,
+      body.metric,
+      fusion?.mode,
+      fusion?.rrf_k ?? null,
+      fusion?.alpha ?? null,
+    );
   }
 }
 

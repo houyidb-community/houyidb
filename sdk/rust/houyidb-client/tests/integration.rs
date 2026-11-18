@@ -21,8 +21,8 @@
 //! data in the hot buffer).
 
 use houyidb_client::{
-    stable_id, Client, Collection, CreateCollectionOptions, Filter, FilterOp, HnswConfig,
-    HouyiError, SearchOptions, Vector,
+    stable_id, Client, Collection, CreateCollectionOptions, Filter, FilterOp, FusionOptions,
+    HnswConfig, HouyiError, SearchOptions, Vector,
 };
 use std::collections::HashMap;
 use std::time::Duration;
@@ -120,6 +120,7 @@ fn upsert_search_round_trip() {
             id: stable_id(&format!("rust-doc-{i}")),
             values: fake_embed(text),
             label: None,
+            sparse: None,
             payload: Some(payload(&[
                 ("text", (*text).into()),
                 ("category", categories[i].into()),
@@ -171,6 +172,7 @@ fn hybrid_search_filters() {
             id: stable_id(&format!("rust-hybrid-{i}")),
             values: fake_embed(text),
             label: None,
+            sparse: None,
             payload: Some(payload(&[
                 ("text", (*text).into()),
                 ("category", categories[i].into()),
@@ -219,12 +221,14 @@ fn mixed_payload_key_sets() {
             id: 1,
             values: fake_embed("row-a"),
             label: None,
+            sparse: None,
             payload: Some(payload(&[("a", 1.into())])),
         },
         Vector {
             id: 2,
             values: fake_embed("row-b"),
             label: None,
+            sparse: None,
             payload: Some(payload(&[("b", 2.into())])),
         },
     ])
@@ -270,6 +274,7 @@ fn large_u64_id_round_trip() {
         id,
         values: fake_embed("uint64 probe"),
         label: None,
+        sparse: None,
         payload: Some(payload(&[("tag", "big".into())])),
     }])
     .expect("upsert");
@@ -301,6 +306,7 @@ fn delete_by_ids_and_filters() {
         id: probe_id,
         values: fake_embed("delete probe"),
         label: None,
+        sparse: None,
         payload: Some(payload(&[("tag", "del".into())])),
     }])
     .expect("upsert");
@@ -349,6 +355,7 @@ fn collection_name_with_reserved_chars() {
         id: 42,
         values: fake_embed("quoted"),
         label: None,
+        sparse: None,
         payload: Some(payload(&[("k", "v".into())])),
     }];
     col.upsert(&vectors).expect("upsert to quoted collection");
@@ -369,6 +376,7 @@ fn delete_collection_and_recreate() {
         id: 7,
         values: fake_embed("drop me"),
         label: None,
+        sparse: None,
         payload: Some(payload(&[("tag", "drop".into())])),
     }])
     .expect("upsert");
@@ -389,6 +397,7 @@ fn delete_collection_and_recreate() {
         id: 8,
         values: fake_embed("fresh"),
         label: None,
+        sparse: None,
         payload: None,
     }])
     .expect("recreate");
@@ -445,6 +454,12 @@ fn create_collection_ip_metric_round_trip() {
                     ef_construction: 100,
                     ef_search: 64,
                 }),
+                // f16 存储：1.0/2.0 在 f16 网格上精确，分数仍可严格比较。
+                // EN: f16 storage: 1.0/2.0 are exact on the f16 grid, so scores
+                // remain strictly comparable.
+                vector_dtype: Some("f16".to_string()),
+                quantization: None,
+                sparse: None,
             },
         )
         .expect("explicit create");
@@ -453,6 +468,11 @@ fn create_collection_ip_metric_round_trip() {
     assert_eq!(created.dims, TEST_DIMS);
     assert_eq!(created.metric, "ip");
     assert_eq!(created.index_type, "hnsw");
+    assert_eq!(created.vector_dtype.as_deref(), Some("f16"));
+    // 未量化集合的回显是 `"none"`（服务端总是回报生效值）。
+    // EN: an unquantized collection echoes `"none"` (the server always reports
+    // the effective value).
+    assert_eq!(created.quantization.as_deref(), Some("none"));
     let hnsw = created.hnsw.expect("hnsw parameters echoed");
     assert_eq!(
         (hnsw.m, hnsw.ef_construction, hnsw.ef_search),
@@ -471,12 +491,14 @@ fn create_collection_ip_metric_round_trip() {
             id: 1,
             values: short.clone(),
             label: None,
+            sparse: None,
             payload: None,
         },
         Vector {
             id: 2,
             values: long,
             label: None,
+            sparse: None,
             payload: None,
         },
     ])
@@ -495,4 +517,213 @@ fn create_collection_ip_metric_round_trip() {
 
     let status = col.status().expect("status");
     assert_eq!(status.get("metric").and_then(|v| v.as_str()), Some("ip"));
+}
+
+/// 显式建 rabitq 集合（仅 l2/cosine）：回显 rabitq，ip 组合返回 400。
+/// EN: Explicit creation with rabitq (l2/cosine-only): the echo is rabitq and
+/// the ip combination returns 400.
+#[test]
+fn create_collection_rabitq_round_trip() {
+    let Some((client, _)) = connect("rust_it_create_rabitq") else {
+        return;
+    };
+
+    match client.delete_collection("rust_it_create_rabitq") {
+        Ok(()) | Err(HouyiError::Http { status: 404, .. }) => {}
+        Err(other) => panic!("cleanup delete failed: {other:?}"),
+    }
+
+    let created = client
+        .create_collection(
+            "rust_it_create_rabitq",
+            TEST_DIMS,
+            &CreateCollectionOptions {
+                metric: Some("cosine".to_string()),
+                index_type: Some("hnsw".to_string()),
+                hnsw: Some(HnswConfig {
+                    m: 16,
+                    ef_construction: 100,
+                    ef_search: 64,
+                }),
+                vector_dtype: Some("f32".to_string()),
+                quantization: Some("rabitq".to_string()),
+                sparse: None,
+            },
+        )
+        .expect("explicit rabitq create");
+    assert_eq!(created.metric, "cosine");
+    assert_eq!(created.index_type, "hnsw");
+    assert_eq!(created.quantization.as_deref(), Some("rabitq"));
+
+    // rabitq + ip 违反 l2/cosine-only 约束：服务端 fail-fast 400。
+    // EN: rabitq + ip violates the l2/cosine-only constraint: the server fails
+    // fast with 400.
+    let bad = client.create_collection(
+        "rust_it_create_rabitq_ip",
+        TEST_DIMS,
+        &CreateCollectionOptions {
+            metric: Some("ip".to_string()),
+            index_type: Some("hnsw".to_string()),
+            hnsw: Some(HnswConfig {
+                m: 16,
+                ef_construction: 100,
+                ef_search: 64,
+            }),
+            vector_dtype: None,
+            quantization: Some("rabitq".to_string()),
+            sparse: None,
+        },
+    );
+    match bad {
+        Err(HouyiError::Http { status: 400, .. }) => {}
+        other => panic!("rabitq+ip must return 400, got {other:?}"),
+    }
+
+    client
+        .delete_collection("rust_it_create_rabitq")
+        .expect("cleanup after create");
+}
+
+/// 稀疏创建 + 稀疏写入 + 融合检索：两路分数口径分离，`[]` 清空词项生效。
+/// EN: Sparse creation + sparse writes + fusion search: the two modality
+/// scores stay distinct and `[]` really clears terms.
+#[test]
+fn sparse_fusion_round_trip() {
+    let Some((client, col)) = connect("rust_it_fusion") else {
+        return;
+    };
+
+    match client.delete_collection("rust_it_fusion") {
+        Ok(()) | Err(HouyiError::Http { status: 404, .. }) => {}
+        Err(other) => panic!("cleanup delete failed: {other:?}"),
+    }
+
+    let created = client
+        .create_collection(
+            "rust_it_fusion",
+            TEST_DIMS,
+            &CreateCollectionOptions {
+                metric: Some("cosine".to_string()),
+                index_type: Some("hnsw".to_string()),
+                hnsw: Some(HnswConfig {
+                    m: 16,
+                    ef_construction: 100,
+                    ef_search: 64,
+                }),
+                vector_dtype: None,
+                quantization: None,
+                sparse: Some("bm25".to_string()),
+            },
+        )
+        .expect("explicit sparse create");
+    assert_eq!(created.sparse.as_deref(), Some("bm25"));
+
+    col.upsert(&[
+        Vector {
+            id: 1,
+            values: fake_embed("apple fruit"),
+            label: None,
+            payload: Some(payload(&[("text", "apple fruit".into())])),
+            sparse: Some(vec![(11, 1.0), (12, 0.5)]),
+        },
+        Vector {
+            id: 2,
+            values: fake_embed("banana yellow"),
+            label: None,
+            payload: None,
+            sparse: Some(vec![(21, 1.0)]),
+        },
+    ])
+    .expect("sparse upsert");
+    wait_flushed(&col);
+
+    let opts = FusionOptions {
+        include_payload: true,
+        ..Default::default()
+    };
+    let result = col
+        .fusion_search(&fake_embed("apple fruit"), &[(11, 1.0)], 3, &opts)
+        .expect("fusion search");
+    assert_eq!(result.fusion_mode, "rrf");
+    assert_eq!(result.rrf_k, Some(60));
+    assert_eq!(result.alpha, None);
+    assert_eq!(result.metric, "cosine");
+    let top = result.hits.first().expect("at least one fusion hit");
+    assert_eq!(top.id, 1, "the only both-modality doc must rank first");
+    assert!(top.dense_score.is_some(), "dense score missing: {top:?}");
+    assert!(top.sparse_score.is_some(), "sparse score missing: {top:?}");
+    for pair in result.hits.windows(2) {
+        assert!(
+            pair[0].score >= pair[1].score,
+            "fused scores must be descending: {:?}",
+            (pair[0].score, pair[1].score)
+        );
+    }
+
+    // weighted 模式：只回显 alpha（rrf_k 为 None），且两路分数仍在。
+    // EN: weighted mode echoes only alpha (rrf_k is None), and both modality
+    // scores remain present.
+    let weighted_opts = FusionOptions {
+        fusion: Some("weighted".to_string()),
+        alpha: Some(0.5),
+        ..Default::default()
+    };
+    let weighted = col
+        .fusion_search(&fake_embed("apple fruit"), &[(11, 1.0)], 2, &weighted_opts)
+        .expect("weighted fusion");
+    assert_eq!(weighted.fusion_mode, "weighted");
+    assert_eq!(weighted.alpha, Some(0.5));
+    assert_eq!(weighted.rrf_k, None);
+
+    // 空词项数组 = 清空：同一 id 的稀疏分必须消失，稠密仍能命中。
+    // EN: an empty term array clears: the same id loses its sparse score while
+    // the dense path still hits.
+    col.upsert(&[Vector {
+        id: 1,
+        values: fake_embed("apple fruit"),
+        label: None,
+        payload: None,
+        sparse: Some(Vec::new()),
+    }])
+    .expect("clear sparse terms");
+    let cleared = col
+        .fusion_search(&fake_embed("apple fruit"), &[(11, 1.0)], 2, &opts)
+        .expect("fusion after clear");
+    let hit = cleared
+        .hits
+        .iter()
+        .find(|h| h.id == 1)
+        .expect("dense path still hits id 1");
+    assert!(
+        hit.sparse_score.is_none(),
+        "empty list must clear sparse terms: {hit:?}"
+    );
+
+    // 未启稀疏的集合上融合检索 400（显式拒绝而非半路结果）。
+    // EN: fusion on a collection without sparse returns 400 (explicit refusal,
+    // not a half-modal result).
+    let plain = client.collection("rust_it_fusion_plain");
+    plain
+        .upsert(&[Vector {
+            id: 1,
+            values: fake_embed("plain"),
+            label: None,
+            payload: None,
+            sparse: None,
+        }])
+        .expect("implicit plain collection");
+    match plain.fusion_search(&fake_embed("plain"), &[(1, 1.0)], 1, &opts) {
+        Err(HouyiError::Http { status: 400, .. }) => {}
+        other => panic!("fusion on sparse=none must return 400, got {other:?}"),
+    }
+
+    // 两个集合都在本用例内创建，一并清理，避免残留影响后续复跑。
+    // EN: Both collections are created inside this test; delete them together
+    // so a re-run starts clean.
+    client
+        .delete_collection("rust_it_fusion_plain")
+        .expect("cleanup plain after fusion");
+    client
+        .delete_collection("rust_it_fusion")
+        .expect("cleanup after fusion");
 }

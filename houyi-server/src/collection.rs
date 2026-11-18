@@ -3,7 +3,8 @@
 
 use crate::index_backend::IndexBackend;
 use houyi_core::{HouyiPage, ScalarPredicate, ScalarValue};
-use houyi_vector::{BuilderWorker, DistanceMetric, FlushPolicy};
+use houyi_vector::sparse::{Bm25Index, SparseMode, SparseStats};
+use houyi_vector::{BuilderWorker, DistanceMetric, FlushPolicy, Quantization, VectorDtype};
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -423,6 +424,33 @@ pub struct Collection {
     /// otherwise the metric requested at creation).
     pub(crate) metric: DistanceMetric,
     pub(crate) index_type: String,
+    /// 存储向量编码（创建后不可变）：f32 默认；f16 仅 hnsw 后端。
+    /// EN: Stored vector encoding (immutable after creation): f32 by default;
+    /// f16 only for the hnsw backend.
+    pub(crate) vector_dtype: VectorDtype,
+    /// 图侧量化（创建后不可变）：none 默认；int8 仅 hnsw 后端。主表始终保留
+    /// 原始向量，int8 只压缩图内副本，最终 top-k 在原始向量上精确重排。
+    /// EN: Graph-side quantization (immutable after creation): none by default;
+    /// int8 only for the hnsw backend. The main store always keeps raw vectors;
+    /// int8 only shrinks the in-graph copy, and the final top-k is reranked
+    /// exactly on raw vectors.
+    pub(crate) quantization: Quantization,
+    /// 稀疏索引模式（P4）：创建后不可变；唯一例外是冷启动「legacy 图快照恢复
+    /// 先行、WAL create 记录后重放」时由 none 对账升级为 bm25（图快照头不含
+    /// 稀疏模式，create 记录才是事实）。以 [`SparseMode::code`] 存储，对外一律
+    /// 经 [`Self::sparse_mode`]。
+    /// EN: Sparse index mode (P4): immutable after creation. The sole exception is
+    /// cold-start reconciliation from none to bm25 when a legacy graph-snapshot
+    /// restore created the collection first and the replayed `collection_create`
+    /// record (the authoritative fact) requires bm25. Stored as the enum code;
+    /// only [`Self::sparse_mode`] crosses the type boundary.
+    sparse_mode: std::sync::atomic::AtomicU8,
+    /// 稀疏倒排索引（仅 bm25 模式使用）。`OnceLock` 使冷启动对账可在 `&self`
+    /// 上惰性初始化空索引，随后由 WAL 重放/快照填充；喷模式集合永不触碰。
+    /// EN: Sparse inverted index (bm25 mode only). `OnceLock` lets cold-start
+    /// reconciliation lazily initialize an empty index through `&self`, which
+    /// WAL replay/snapshot then fills; none-mode collections never touch it.
+    sparse: std::sync::OnceLock<std::sync::RwLock<Bm25Index>>,
     #[allow(dead_code)]
     pub(crate) created_at: u64,
     /// 索引后端：crate 外的二进制/集成测试会直接驱动（排空异步 builder）。
@@ -474,6 +502,17 @@ pub struct Collection {
     /// [`ensure_create_logged`]), so the create always precedes any mutation of
     /// this Arc in the WAL — including across a delete/recreate race.
     create_logged: std::sync::atomic::AtomicBool,
+    /// 是否由 collections WAL 的 upsert 重放入口在「无 create 记录」时隐式建立。
+    /// 这是稀疏对账（none → bm25）的唯一依据：快照恢复的集合 `create_logged`
+    /// 同样为 false，但其稀疏模式由快照/manifest 承载，后续稀疏 upsert 属腐坏
+    /// 记录，必须拒绝而不是静默升级（OCR 9fda139）。
+    /// EN: Whether this collection was implicitly built by the collections-WAL
+    /// upsert replay entry while the create record was missing. This is the sole
+    /// basis for sparse reconciliation (none -> bm25): a snapshot-restored
+    /// collection also has `create_logged == false`, but its sparse mode comes
+    /// from the snapshot/manifest, so a later sparse upsert is corruption and
+    /// must be rejected instead of silently upgrading (OCR 9fda139).
+    implicit_upsert_built: std::sync::atomic::AtomicBool,
     /// 已成功应用的最后一条 WAL LSN（P5.0）：快照 checkpoint 只能用到它。
     /// WAL 已 append 但后端/标量写失败的记录不推进——留给重放，不能被快照跳过。
     /// EN: Last successfully applied WAL LSN (P5.0). Snapshot checkpoints may only
@@ -497,6 +536,17 @@ pub struct Collection {
     /// Builder worker keep-alive handle for the HNSW backend; reclaimed with the
     /// runtime at process exit.
     _builder_worker: Option<BuilderWorker>,
+}
+
+/// bm25 稀疏索引只允许可过滤后端（集合创建与冷启动对账共用一条判据，
+/// 避免两处规则漂移；两处分属 Collection 与 CollectionManager 的 impl，
+/// 因此作为模块级自由函数）。
+/// EN: bm25 sparse indexes only allow the filterable backends (creation and
+/// cold-start reconciliation share one predicate so the rule cannot drift;
+/// they live in Collection's and CollectionManager's impls respectively, so the
+/// predicate is a module-level free function).
+fn sparse_bm25_backend_supported(index_type: &str) -> bool {
+    matches!(index_type, "hnsw" | "flat")
 }
 
 impl Collection {
@@ -531,6 +581,114 @@ impl Collection {
         self.metric
     }
 
+    /// 存储向量编码（创建后不可变；WAL/快照记录与状态端点共用）。
+    /// EN: Stored vector encoding (immutable after creation; shared by WAL/snapshot
+    /// records and status endpoints).
+    pub fn vector_dtype(&self) -> VectorDtype {
+        self.vector_dtype
+    }
+
+    /// 图侧量化（创建后不可变；仅 hnsw 后端可为 int8）。
+    /// EN: Graph-side quantization (immutable after creation; only the hnsw
+    /// backend may use int8).
+    pub fn quantization(&self) -> Quantization {
+        self.quantization
+    }
+
+    /// 当前稀疏索引模式（Acquire 读，与对账升级的 Release 写配对）。
+    /// 存储码未知属内存腐坏：panic 留痕，绝不静默当作 none。
+    /// EN: Current sparse mode (Acquire load, paired with the Release store in
+    /// reconciliation). An unknown code is memory corruption: panic with a trace
+    /// instead of silently degrading to none.
+    pub fn sparse_mode(&self) -> SparseMode {
+        let code = self.sparse_mode.load(Ordering::Acquire);
+        SparseMode::from_code(code).unwrap_or_else(|| {
+            panic!("collection sparse_mode atomic holds unknown code {code} (memory corruption?)")
+        })
+    }
+
+    /// 稀疏索引句柄：仅 bm25 模式可见；none 模式恒 `None`（调用方据此拒绝
+    /// 稀疏写入/查询）。bm25 集合必定返回可用的 `RwLock<Bm25Index>`。
+    /// EN: Sparse index handle: only visible in bm25 mode; none-mode collections
+    /// always return `None` (callers reject sparse writes/queries on that basis).
+    /// A bm25 collection always yields a usable `RwLock<Bm25Index>`.
+    pub(crate) fn sparse_index(&self) -> Option<&std::sync::RwLock<Bm25Index>> {
+        if self.sparse_mode() != SparseMode::Bm25 {
+            return None;
+        }
+        Some(
+            self.sparse
+                .get_or_init(|| std::sync::RwLock::new(Bm25Index::new())),
+        )
+    }
+
+    /// 状态/指标用稀疏统计；none 模式返回 `Ok(None)`（不是 0 统计）。
+    /// http status 端点（Phase D）接入前暂由测试使用。
+    /// EN: Sparse stats for status/metrics; none mode returns `Ok(None)` (not a
+    /// zeroed stat set). Used by tests until the HTTP status endpoint (Phase D)
+    /// consumes it.
+    #[allow(dead_code)]
+    pub(crate) fn sparse_stats(&self) -> Result<Option<SparseStats>, String> {
+        let Some(lock) = self.sparse_index() else {
+            return Ok(None);
+        };
+        let index = lock
+            .read()
+            .map_err(|e| format!("sparse lock poisoned: {e}"))?;
+        Ok(Some(index.stats()))
+    }
+
+    /// 冷启动稀疏模式对账：现存集合为 none 而记录要求 bm25 时升级（事实来源
+    /// 是重放的 create 记录，或 create 记录丢失时的稀疏 upsert）；反向与任何
+    /// 其他分叉一律拒绝。升级只发生一次且仅由重放入口调用（serve 之前 /
+    /// follower apply 串行），之后模式重新成为不可变事实。空索引由后续
+    /// upsert/快照重放填充。
+    /// EN: Cold-start reconciliation: upgrade none to bm25 when a record requires
+    /// it (the fact comes from a replayed create record, or from a sparse upsert
+    /// when that record is missing); the reverse and any other divergence are
+    /// rejected. Upgrade happens once, only from the replay entry (before
+    /// serving / serialized follower apply); afterwards the mode is immutable
+    /// again. Later upsert/snapshot replay fills the empty index.
+    pub(crate) fn reconcile_sparse_mode(&self, requested: SparseMode) -> Result<(), String> {
+        let current = self.sparse_mode();
+        if current == requested {
+            return Ok(());
+        }
+        if current == SparseMode::None && requested == SparseMode::Bm25 {
+            // 升级同样受「bm25 仅限 hnsw|flat」创建约束：隐式建出的集合采用
+            // 服务端默认后端（可能是 clustered/pq-flat/hii-l0），不校验会让
+            // 集合变成永远无法编码快照的形态（manifest 编码会拒绝，重启即失败）。
+            // EN: The upgrade is bound by the same "bm25 only on hnsw|flat"
+            // creation rule; implicitly built collections use the server default
+            // backend (possibly clustered/pq-flat/hii-l0), and skipping the check
+            // yields a shape whose snapshot can never encode (the manifest
+            // encoder rejects it), failing the next restart.
+            if !sparse_bm25_backend_supported(&self.index_type) {
+                return Err(format!(
+                    "collection '{}' has index_type={:?}, sparse bm25 requires 'hnsw'|'flat'",
+                    self.name, self.index_type
+                ));
+            }
+            self.sparse_mode
+                .store(SparseMode::Bm25.code(), Ordering::Release);
+            // 显式初始化空索引：升级后 [`Self::sparse_index`] 恒可用。
+            // EN: Initialize the empty index explicitly so `sparse_index` is
+            // always usable after the upgrade.
+            let _ = self.sparse_index();
+            tracing::warn!(
+                collection = %self.name,
+                "collection sparse mode reconciled none -> bm25 during replay"
+            );
+            return Ok(());
+        }
+        Err(format!(
+            "collection '{}' has sparse={}, record requires {}",
+            self.name,
+            current.as_str(),
+            requested.as_str()
+        ))
+    }
+
     /// 置位删除哨兵；由删除流程在持有写锁时调用（重放/follower apply 同）。
     /// EN: Set the drop sentinel; called by the delete flow while holding the
     /// write lock (cold replay and follower apply do the same).
@@ -551,6 +709,34 @@ impl Collection {
     /// EN: Mark the create record durable (only after a successful append).
     pub(crate) fn mark_create_logged(&self) {
         self.create_logged
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    /// 是否由无 create 记录的 upsert 重放隐式建立（Acquire 读，与
+    /// `mark_implicit_upsert_built` 的 Release 写配对）。
+    /// EN: Whether the collection was implicitly built by upsert replay without
+    /// a create record (Acquire pairs with the Release store in
+    /// `mark_implicit_upsert_built`).
+    pub(crate) fn implicit_upsert_built(&self) -> bool {
+        self.implicit_upsert_built
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// 标记「由无 create 记录的 upsert 重放隐式建立」（仅重放入口在新建时调用）。
+    /// 标记的读者（后续 upsert 记录的稀疏对账）与写者串行在同一条 apply 流里
+    /// ——启动重放或 follower 实时 apply 二选一；follower 上该集合可与服务线程
+    /// 共享同一 `Arc`，因此原子类型 + Release/Acquire 按跨线程可见性设计，
+    /// 不依赖「单线程」假设。
+    /// EN: Mark "implicitly built by upsert replay without a create record"
+    /// (called by the replay entry only, and only when it created the collection).
+    /// The marker's reader (sparse reconciliation of later upsert records) and
+    /// writer run serially inside one apply stream — either startup replay or a
+    /// follower's live apply; on a follower the collection may be shared with
+    /// serving threads through the same `Arc`, so the atomic type with
+    /// Release/Acquire is designed for cross-thread visibility and does not
+    /// assume single-threadedness.
+    pub(crate) fn mark_implicit_upsert_built(&self) {
+        self.implicit_upsert_built
             .store(true, std::sync::atomic::Ordering::Release);
     }
 
@@ -709,6 +895,27 @@ impl Collection {
     }
 }
 
+/// 重放时稀疏模式分叉的对账策略（创建后模式不可变，分叉只能来自重放）。
+/// EN: Divergence reconciliation policy for the sparse mode during replay
+/// (the mode is immutable after creation, so divergence only comes from replay).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SparseReconcile {
+    /// 严格比对，任何分叉都拒绝（实时写入 / 快照恢复入口）。
+    /// EN: Strict; any divergence is rejected (live write / snapshot restore).
+    Never,
+    /// 允许 none → bm25（create 记录重放：该记录就是模式事实）。
+    /// EN: Allow none -> bm25 (create-record replay: the record is the fact).
+    Always,
+    /// 仅当集合由无 create 记录的 upsert 重放隐式建立时允许 none → bm25；
+    /// create 记录丢失时，后续稀疏 upsert 才携带模式事实。快照恢复的集合
+    /// 不适用（模式由快照/manifest 承载）。
+    /// EN: Allow none -> bm25 only when the collection was implicitly built by
+    /// upsert replay without a create record; with a lost create record, a later
+    /// sparse upsert carries the mode fact. Snapshot-restored collections do not
+    /// qualify (the snapshot/manifest carries the mode).
+    IfImplicitUpsert,
+}
+
 impl CollectionManager {
     pub fn new(default_dims: usize, default_index_type: &str) -> Self {
         CollectionManager {
@@ -759,6 +966,13 @@ impl CollectionManager {
         (index_type, metric)
     }
 
+    /// 默认 index_type（恢复路径据此决定走历史隐式创建还是按快照度量显式建后端）。
+    /// EN: Default index type (recovery uses it to choose between legacy implicit
+    /// creation and an explicit backend built with the snapshot's metric).
+    pub fn default_index_type(&self) -> &str {
+        &self.default_index_type
+    }
+
     /// 建集合参数的前置校验（不落 WAL 就能证明后端可构造）。
     /// EN: Pre-validate creation parameters so a WAL record is never written for a
     /// backend that cannot be constructed (that would poison cold replay).
@@ -767,11 +981,23 @@ impl CollectionManager {
         dims: usize,
         metric: DistanceMetric,
         hnsw: Option<HnswParams>,
+        vector_dtype: VectorDtype,
+        quantization: Quantization,
+        sparse: SparseMode,
     ) -> Result<(), String> {
         if dims == 0 {
             return Err("collection dims must be > 0".to_string());
         }
-        Self::create_backend(index_type, dims, metric, hnsw).map(|_| ())
+        Self::create_backend(
+            index_type,
+            dims,
+            metric,
+            hnsw,
+            vector_dtype,
+            quantization,
+            sparse,
+        )
+        .map(|_| ())
     }
 
     /// index_type → 后端构造（集合创建与快照恢复共用，未知类型/不支持度量 fail-fast）。
@@ -780,13 +1006,27 @@ impl CollectionManager {
     /// restore; unknown types and unsupported metric/index combinations fail fast).
     /// HNSW parameters are meaningful only for the hnsw backend; passing them to
     /// another backend is a caller error rather than a silent no-op.
+    #[allow(clippy::too_many_arguments)]
     fn create_backend(
         index_type: &str,
         dims: usize,
         metric: DistanceMetric,
         hnsw: Option<HnswParams>,
+        vector_dtype: VectorDtype,
+        quantization: Quantization,
+        sparse: SparseMode,
     ) -> Result<IndexBackend, String> {
         IndexBackend::metric_supported(index_type, metric)?;
+        // 稀疏融合检索的过滤器路径只覆盖 hnsw/flat；其他后端建 bm25 会让
+        // 「建了却查不了（带过滤）」成为静默陷阱，创建期直接 fail-fast。
+        // EN: Filtered fusion search is only implemented for hnsw/flat; allowing
+        // bm25 on other backends would create a silent "built but can't query
+        // with filters" trap, so reject it at creation.
+        if sparse == SparseMode::Bm25 && !sparse_bm25_backend_supported(index_type) {
+            return Err(format!(
+                "sparse bm25 is only supported for index_type 'hnsw'|'flat' (got {index_type:?})"
+            ));
+        }
         if let Some(p) = hnsw {
             if index_type != "hnsw" {
                 return Err(format!(
@@ -795,8 +1035,49 @@ impl CollectionManager {
             }
             p.validate()?;
         }
+        // f16 存储只存在于 HNSW 路径；其他后端没有 dtype 形参，静默忽略会让
+        // 创建声明与后端实际存储分叉，因此在构造入口统一 fail-fast。
+        // EN: f16 storage exists only on the HNSW path; other backends have no
+        // dtype parameter, and silently ignoring it would diverge the creation
+        // declaration from actual storage — fail fast here.
+        if vector_dtype != VectorDtype::F32 && index_type != "hnsw" {
+            return Err(format!(
+                "vector_dtype {} is only supported for index_type 'hnsw' (got {index_type:?})",
+                vector_dtype.as_str()
+            ));
+        }
+        // 图侧量化同理：int8 只存在于 HNSW 路径，其他后端没有量化形参；
+        // 静默忽略会让创建声明与后端实际存储分叉（fail-fast）。
+        // EN: Graph-side quantization follows the same rule: int8 exists only on
+        // the HNSW path and other backends have no quantization parameter;
+        // silently ignoring it would diverge the declaration from actual storage
+        // (fail fast).
+        if quantization != Quantization::None && index_type != "hnsw" {
+            return Err(format!(
+                "quantization {} is only supported for index_type 'hnsw' (got {index_type:?})",
+                quantization.as_str()
+            ));
+        }
+        // RaBitQ 的 1 bit/dim 估计器依赖余弦/平方 L2 的几何语义；ip/l1
+        // 没有对应的角度表述，创建期必须拒绝，避免落到无意义的距离核。
+        // EN: The RaBitQ 1-bit/dim estimator relies on cosine/squared-L2
+        // geometry; ip/l1 have no angle-based form, so reject them at creation
+        // rather than falling through to a meaningless distance kernel.
+        if quantization == Quantization::RaBitQ
+            && !matches!(metric, DistanceMetric::L2 | DistanceMetric::Cosine)
+        {
+            return Err(format!(
+                "rabitq quantization requires metric l2|cosine (got {})",
+                metric.as_str()
+            ));
+        }
         let backend = match index_type {
-            "hnsw" => IndexBackend::new_hnsw_with_metric(dims, metric),
+            "hnsw" => IndexBackend::new_hnsw_with_metric_and_dtype_and_quantization(
+                dims,
+                metric,
+                vector_dtype,
+                quantization,
+            ),
             "clustered" => IndexBackend::new_clustered_with_metric(dims, metric),
             "flat-clustered" => IndexBackend::new_flat_clustered_with_metric(dims, metric),
             "flat" => IndexBackend::new_flat_with_metric(dims, metric),
@@ -844,14 +1125,28 @@ impl CollectionManager {
         name: &str,
         new_dims: Option<usize>,
     ) -> Result<(Arc<Collection>, bool), String> {
-        self.get_or_create_impl(name, new_dims, None, None, None, true)
+        self.get_or_create_impl(
+            name,
+            new_dims,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            true,
+            SparseReconcile::Never,
+        )
     }
 
     /// 按快照/WAL 记录（含度量与 HNSW 参数）创建 collection；记录中的度量缺失时
-    /// 退回 [`Self::default_metric_for_index_type`]。
+    /// 退回 [`Self::default_metric_for_index_type`]。仅保留给既有单元测试；
+    /// 生产恢复/重放路径一律显式传 quantization。
     /// EN: Create a collection from a snapshot/WAL record carrying the metric and
     /// HNSW parameters; a missing metric falls back to
-    /// [`Self::default_metric_for_index_type`].
+    /// [`Self::default_metric_for_index_type`]. Kept only for existing unit
+    /// tests; production restore/replay paths always pass quantization explicitly.
+    #[cfg(test)]
     pub(crate) fn get_or_create_typed_with_metric(
         &self,
         name: &str,
@@ -859,8 +1154,51 @@ impl CollectionManager {
         index_type: &str,
         metric: Option<DistanceMetric>,
         hnsw: Option<HnswParams>,
+        vector_dtype: Option<VectorDtype>,
     ) -> Result<(Arc<Collection>, bool), String> {
-        self.get_or_create_impl(name, Some(dims), Some(index_type), metric, hnsw, true)
+        self.get_or_create_typed_with_metric_and_quantization(
+            name,
+            dims,
+            index_type,
+            metric,
+            hnsw,
+            vector_dtype,
+            None,
+            None,
+        )
+    }
+
+    /// 同 [`get_or_create_typed_with_metric`](Self::get_or_create_typed_with_metric)，
+    /// 额外携带图侧量化（P2）与稀疏模式（P4）；`None` = 旧记录（不比对、按
+    /// 未量化/无稀疏创建）。legacy 图快照恢复拿不到稀疏模式，故传 `None`。
+    /// EN: Same as `get_or_create_typed_with_metric` plus graph-side quantization
+    /// (P2) and sparse mode (P4); `None` = legacy record (not compared, built
+    /// unquantized/without sparse). Legacy graph-snapshot restore cannot know the
+    /// sparse mode and therefore passes `None`.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn get_or_create_typed_with_metric_and_quantization(
+        &self,
+        name: &str,
+        dims: usize,
+        index_type: &str,
+        metric: Option<DistanceMetric>,
+        hnsw: Option<HnswParams>,
+        vector_dtype: Option<VectorDtype>,
+        quantization: Option<Quantization>,
+        sparse: Option<SparseMode>,
+    ) -> Result<(Arc<Collection>, bool), String> {
+        self.get_or_create_impl(
+            name,
+            Some(dims),
+            Some(index_type),
+            metric,
+            hnsw,
+            vector_dtype,
+            quantization,
+            sparse,
+            true,
+            SparseReconcile::Never,
+        )
     }
 
     /// 重放专用创建入口：现存集合只校验 dims/index_type/metric，**不**校验
@@ -874,6 +1212,10 @@ impl CollectionManager {
     /// atomics, while the `collection_create` record holds creation-time
     /// parameters; a strict comparison would abort cold start when a covered
     /// create record is replayed after snapshot restore (OCR 195e6be #11).
+    // 仅保留给既有单元测试的兼容入口；生产复制/重放路径一律显式传 quantization。
+    // EN: Compatibility entry kept only for existing unit tests; production
+    // replication/replay paths always pass quantization explicitly.
+    #[cfg(test)]
     pub(crate) fn get_or_create_replayed(
         &self,
         name: &str,
@@ -881,10 +1223,111 @@ impl CollectionManager {
         index_type: &str,
         metric: Option<DistanceMetric>,
         hnsw: Option<HnswParams>,
+        vector_dtype: Option<VectorDtype>,
     ) -> Result<(Arc<Collection>, bool), String> {
-        self.get_or_create_impl(name, Some(dims), Some(index_type), metric, hnsw, false)
+        self.get_or_create_replayed_with_quantization(
+            name,
+            dims,
+            index_type,
+            metric,
+            hnsw,
+            vector_dtype,
+            None,
+            None,
+        )
     }
 
+    /// 重放专用入口 + 图侧量化（P2）+ 稀疏模式（P4）；`None` = 旧记录（不比对、
+    /// 按未量化/无稀疏创建）。稀疏对账升级（none → bm25）在本入口（create
+    /// 记录重放）与 [`Self::get_or_create_for_collection_upsert`]（无 create
+    /// 记录的 upsert 重放）生效；其余入口严格拒绝。
+    /// EN: Replay-only entry plus graph-side quantization (P2) and sparse mode
+    /// (P4); `None` = legacy record (not compared, built unquantized/without
+    /// sparse). The sparse reconciliation upgrade (none -> bm25) applies through
+    /// this entry (create-record replay) and
+    /// [`Self::get_or_create_for_collection_upsert`] (upsert replay without a
+    /// create record); every other entry rejects it.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn get_or_create_replayed_with_quantization(
+        &self,
+        name: &str,
+        dims: usize,
+        index_type: &str,
+        metric: Option<DistanceMetric>,
+        hnsw: Option<HnswParams>,
+        vector_dtype: Option<VectorDtype>,
+        quantization: Option<Quantization>,
+        sparse: Option<SparseMode>,
+    ) -> Result<(Arc<Collection>, bool), String> {
+        self.get_or_create_impl(
+            name,
+            Some(dims),
+            Some(index_type),
+            metric,
+            hnsw,
+            vector_dtype,
+            quantization,
+            sparse,
+            false,
+            SparseReconcile::Always,
+        )
+    }
+
+    /// collections WAL 重放专用入口：`collection_create` 记录缺失时，按
+    /// 本批 upsert 是否携带稀疏数据决定新建集合的稀疏模式（带稀疏 → bm25，
+    /// 否则 none）。现存集合的模式对账取决于它是否由本重放流的 upsert
+    /// 隐式建立（`implicit_upsert_built`，与是否存在 create 记录无关，
+    /// 因为快照恢复的集合同样没有 create 记录）：隐式建立时允许
+    /// none → bm25——否则「先 dense-only 批、后稀疏批」的合法历史会被
+    /// 误判为腐坏（OCR 裁决）；其余情况（显式 create 记录、快照恢复）
+    /// 模式是权威事实，严格比对，不允许静默升级。
+    /// 本方法由单条串行 apply 流调用（启动重放与 follower 实时 apply 共用），
+    /// 标记位按跨线程可见性设计，不依赖单线程假设。
+    ///
+    /// EN: Collections-WAL replay entry: when the `collection_create` record is
+    /// missing, the new collection's sparse mode follows whether this upsert
+    /// batch carries sparse data (sparse -> bm25, otherwise none). For an
+    /// existing collection, reconciliation depends on whether it was
+    /// implicitly built by this replay stream's upserts (`implicit_upsert_built`,
+    /// independent of whether a create record exists, since snapshot-restored
+    /// collections also lack one): implicit builds allow none -> bm25 —
+    /// otherwise the legitimate "dense-only batch first, sparse batch later"
+    /// history would be misclassified as corruption (OCR adjudication); all
+    /// other cases (explicit create record, snapshot restore) treat the mode as
+    /// authoritative and compare strictly, never silently upgrading. This
+    /// method is called from one serial apply stream (startup replay and live
+    /// follower apply share it); the marker is designed for cross-thread
+    /// visibility rather than assuming single-threadedness.
+    pub(crate) fn get_or_create_for_collection_upsert(
+        &self,
+        name: &str,
+        new_dims: Option<usize>,
+        sparse_hint: Option<SparseMode>,
+    ) -> Result<(Arc<Collection>, bool), String> {
+        let (col, created) = self.get_or_create_impl(
+            name,
+            new_dims,
+            None,
+            None,
+            None,
+            None,
+            None,
+            sparse_hint,
+            false,
+            SparseReconcile::IfImplicitUpsert,
+        )?;
+        if created {
+            // 本入口新建 = create 记录缺失时的隐式建立；后续 upsert 记录若携带
+            // 稀疏数据，可据此对账 none → bm25（快照恢复的集合不会走到这里）。
+            // EN: Created by this entry means an implicit build while the create
+            // record was missing; later upsert records carrying sparse data may
+            // reconcile none -> bm25 on that basis (snapshot restores never do).
+            col.mark_implicit_upsert_built();
+        }
+        Ok((col, created))
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn get_or_create_impl(
         &self,
         name: &str,
@@ -892,7 +1335,11 @@ impl CollectionManager {
         requested_index_type: Option<&str>,
         requested_metric: Option<DistanceMetric>,
         requested_hnsw: Option<HnswParams>,
+        requested_vector_dtype: Option<VectorDtype>,
+        requested_quantization: Option<Quantization>,
+        requested_sparse: Option<SparseMode>,
         strict_hnsw: bool,
+        sparse_reconcile: SparseReconcile,
     ) -> Result<(Arc<Collection>, bool), String> {
         let mut guard = self.collections.lock().unwrap();
         if let Some(col) = guard.get(name) {
@@ -919,6 +1366,73 @@ impl CollectionManager {
                         col.metric.as_str(),
                         m.as_str()
                     ));
+                }
+            }
+            // 存储编码创建后不可变：记录/快照显式携带时必须与现存集合一致，
+            // 分叉意味着 WAL/快照与内存态描述的不是同一个集合（重放/恢复拒绝）。
+            // EN: The storage encoding is immutable after creation: when a record
+            // or snapshot carries one explicitly it must match the live collection;
+            // divergence means WAL/snapshot and memory describe different
+            // collections (replay/restore rejects it).
+            if let Some(d) = requested_vector_dtype {
+                if col.vector_dtype != d {
+                    return Err(format!(
+                        "collection '{name}' has vector_dtype={}, record requires {}",
+                        col.vector_dtype.as_str(),
+                        d.as_str()
+                    ));
+                }
+            }
+            // 图侧量化创建后不可变：记录/快照显式携带时同样严格比对（含显式
+            // none），分叉意味着记录与内存态描述的不是同一个集合。
+            // EN: Graph-side quantization is immutable after creation: an explicit
+            // record/snapshot value (including an explicit none) must match the
+            // live collection; divergence means they describe different collections.
+            if let Some(q) = requested_quantization {
+                if col.quantization != q {
+                    return Err(format!(
+                        "collection '{name}' has quantization={}, record requires {}",
+                        col.quantization.as_str(),
+                        q.as_str()
+                    ));
+                }
+            }
+            // 稀疏模式创建后不可变：记录显式携带时严格比对。例外只有冷启动
+            // 对账（none → bm25）：create 记录重放（legacy 图快照恢复先建集合、
+            // 快照头不含稀疏模式，create 记录才是事实），以及 create 记录丢失
+            // 后由 dense-only 批次隐式建立的集合（后续稀疏 upsert 携带事实）。
+            // 对账能力由显式策略控制，避免和 HNSW 严格比对策略耦联（OCR 裁决）。
+            // EN: The sparse mode is immutable after creation: an explicit
+            // record value must match. The only exceptions are cold-start
+            // reconciliation (none -> bm25): create-record replay (a legacy
+            // graph-snapshot restore creates the collection before the mode is
+            // known, and the create record is the fact), and a collection
+            // implicitly built by dense-only batches after the create record was
+            // lost (a later sparse upsert carries the fact). The capability is an
+            // explicit policy so it no longer rides on the HNSW strictness flag
+            // (OCR adjudication).
+            if let Some(s) = requested_sparse {
+                let current = col.sparse_mode();
+                if current != s {
+                    let may_reconcile = match sparse_reconcile {
+                        SparseReconcile::Never => false,
+                        SparseReconcile::Always => true,
+                        // 只认「upsert 重放隐式建立」，不是「create_logged=false」：
+                        // 快照恢复的集合同样没有 create 记录，但模式已是权威事实。
+                        // EN: Only "implicitly built by upsert replay", not
+                        // "create_logged == false": snapshot-restored collections
+                        // also lack a create record, yet their mode is authoritative.
+                        SparseReconcile::IfImplicitUpsert => col.implicit_upsert_built(),
+                    };
+                    if may_reconcile && current == SparseMode::None && s == SparseMode::Bm25 {
+                        col.reconcile_sparse_mode(s)?;
+                    } else {
+                        return Err(format!(
+                            "collection '{name}' has sparse={}, record requires {}",
+                            current.as_str(),
+                            s.as_str()
+                        ));
+                    }
                 }
             }
             // 记录带 HNSW 参数时同样要求与现存集合一致：只比 dims/index_type/metric
@@ -974,7 +1488,27 @@ impl CollectionManager {
         let index_type = requested_index_type.unwrap_or(&self.default_index_type);
         let metric =
             requested_metric.unwrap_or_else(|| Self::default_metric_for_index_type(index_type));
-        let backend = Self::create_backend(index_type, dims, metric, requested_hnsw)?;
+        // 缺省 f32：旧 WAL/快照（无 dtype 字段）与隐式创建都落在这里。
+        // EN: f32 by default: legacy WAL/snapshot records (no dtype field) and
+        // implicit creation both land here.
+        let vector_dtype = requested_vector_dtype.unwrap_or(VectorDtype::F32);
+        // 缺省 none：旧 WAL/快照（无量化字段）与隐式创建都落在这里。
+        // EN: none by default: legacy WAL/snapshot records (no quantization field)
+        // and implicit creation both land here.
+        let quantization = requested_quantization.unwrap_or(Quantization::None);
+        // 缺省 none：旧记录与隐式创建（首批 upsert 建集合）恒为无稀疏。
+        // EN: none by default: legacy records and implicit creation (first
+        // upsert) always start without sparse.
+        let sparse_mode = requested_sparse.unwrap_or(SparseMode::None);
+        let backend = Self::create_backend(
+            index_type,
+            dims,
+            metric,
+            requested_hnsw,
+            vector_dtype,
+            quantization,
+            sparse_mode,
+        )?;
 
         // HNSW 后端需要异步构图 worker 才能把待构图队列 flush 成可检索状态；
         // 「哪个后端需要 worker」的分发规则集中在 IndexBackend 适配层，此处不重复
@@ -1010,6 +1544,17 @@ impl CollectionManager {
             dims,
             metric,
             index_type: index_type.to_string(),
+            vector_dtype,
+            quantization,
+            sparse_mode: std::sync::atomic::AtomicU8::new(sparse_mode.code()),
+            // bm25 集合预置空索引（mode==Bm25 ⇒ 句柄恒可用）；none 保持未初始化。
+            // EN: bm25 collections pre-install an empty index (mode==Bm25 implies
+            // a usable handle); none stays uninitialized.
+            sparse: if sparse_mode == SparseMode::Bm25 {
+                std::sync::OnceLock::from(std::sync::RwLock::new(Bm25Index::new()))
+            } else {
+                std::sync::OnceLock::new()
+            },
             created_at: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
@@ -1020,6 +1565,7 @@ impl CollectionManager {
             ha_level: std::sync::atomic::AtomicU8::new(self.default_ha_level.code()),
             deleted: std::sync::atomic::AtomicBool::new(false),
             create_logged: std::sync::atomic::AtomicBool::new(false),
+            implicit_upsert_built: std::sync::atomic::AtomicBool::new(false),
             applied_lsn: AtomicU64::new(0),
             last_compaction_unix: AtomicU64::new(0),
             last_compaction_dropped: AtomicU64::new(0),
@@ -1095,6 +1641,20 @@ pub(crate) fn ensure_create_logged(
         hnsw_m: hnsw.map(|()| p.m),
         hnsw_ef_construction: hnsw.map(|()| p.ef_construction),
         hnsw_ef_search: hnsw.map(|()| p.ef_search),
+        // 编码是创建时事实：hnsw 恒写入（含显式 f32），非 hnsw 为 None。
+        // EN: The encoding is a creation-time fact: always written for hnsw
+        // (explicit f32 included), None for other backends.
+        vector_dtype: hnsw.map(|()| col.vector_dtype.as_str().to_string()),
+        // 量化同 dtype 纪律：hnsw 恒写入（含显式 none），非 hnsw 为 None。
+        // EN: Quantization follows the dtype discipline: always written for hnsw
+        // (explicit none included), None for other backends.
+        quantization: hnsw.map(|()| col.quantization.as_str().to_string()),
+        // 稀疏模式是创建事实：恒写入规范串（含 none）。bm25 仅 hnsw/flat
+        // 可构造，非法组合在解码/重放侧 fail-fast。
+        // EN: The sparse mode is a creation fact: always written as its canonical
+        // string (none included). bm25 is only constructible on hnsw/flat; illegal
+        // combinations fail fast at decode/replay.
+        sparse: Some(col.sparse_mode().as_str().to_string()),
     };
     let payload = houyi_persistence::collection_wal::encode_collection_create_with_options(
         name,
@@ -1120,6 +1680,16 @@ mod tests {
         match payloads.get(&id).and_then(|r| r.get("color")) {
             Some(ScalarValue::Text(s)) => s.clone(),
             other => panic!("missing color for id {id}: {other:?}"),
+        }
+    }
+
+    /// `Collection` 不实现 Debug，`unwrap_err` 的 `T: Debug` 约束不成立。
+    /// EN: `Collection` implements no Debug, so `unwrap_err`'s `T: Debug` bound
+    /// does not hold.
+    fn expect_create_err<T>(result: Result<T, String>, what: &str) -> String {
+        match result {
+            Ok(_) => panic!("{what}: expected an error"),
+            Err(e) => e,
         }
     }
 
@@ -1219,13 +1789,27 @@ mod tests {
             ef_search: 256,
         };
         let (_, created) = mgr
-            .get_or_create_typed_with_metric("c", 4, "hnsw", Some(DistanceMetric::Cosine), Some(a))
+            .get_or_create_typed_with_metric(
+                "c",
+                4,
+                "hnsw",
+                Some(DistanceMetric::Cosine),
+                Some(a),
+                None,
+            )
             .unwrap();
         assert!(created);
         // 同参数重复创建：幂等（重放重复 create 记录）。
         // EN: Same parameters are idempotent (duplicate create records on replay).
         let (_, created) = mgr
-            .get_or_create_typed_with_metric("c", 4, "hnsw", Some(DistanceMetric::Cosine), Some(a))
+            .get_or_create_typed_with_metric(
+                "c",
+                4,
+                "hnsw",
+                Some(DistanceMetric::Cosine),
+                Some(a),
+                None,
+            )
             .unwrap();
         assert!(!created);
         let b = HnswParams { m: 32, ..a };
@@ -1238,6 +1822,7 @@ mod tests {
             "hnsw",
             Some(DistanceMetric::Cosine),
             Some(b),
+            None,
         ) {
             Err(e) => e,
             Ok(_) => panic!("different hnsw params must conflict"),
@@ -1261,21 +1846,34 @@ mod tests {
             ef_search: 256,
         };
         let (col, created) = mgr
-            .get_or_create_typed_with_metric("c", 4, "hnsw", Some(DistanceMetric::Cosine), Some(a))
+            .get_or_create_typed_with_metric(
+                "c",
+                4,
+                "hnsw",
+                Some(DistanceMetric::Cosine),
+                Some(a),
+                None,
+            )
             .unwrap();
         assert!(created);
         col.backend.set_hnsw_m(32).unwrap();
         col.backend.set_hnsw_ef_construction(800).unwrap();
         col.backend.set_hnsw_ef_search(512).unwrap();
         let (_, created) = mgr
-            .get_or_create_replayed("c", 4, "hnsw", Some(DistanceMetric::Cosine), Some(a))
+            .get_or_create_replayed("c", 4, "hnsw", Some(DistanceMetric::Cosine), Some(a), None)
             .unwrap();
         assert!(!created);
-        let err =
-            match mgr.get_or_create_replayed("c", 4, "flat", Some(DistanceMetric::Cosine), None) {
-                Err(e) => e,
-                Ok(_) => panic!("index_type drift must still conflict on replay"),
-            };
+        let err = match mgr.get_or_create_replayed(
+            "c",
+            4,
+            "flat",
+            Some(DistanceMetric::Cosine),
+            None,
+            None,
+        ) {
+            Err(e) => e,
+            Ok(_) => panic!("index_type drift must still conflict on replay"),
+        };
         assert!(err.contains("index_type"), "got: {err}");
         // 度量漂移同样必须 fail-fast，不能只锁定 index_type 分支
         // （OCR cf1d19f #02）。
@@ -1286,6 +1884,7 @@ mod tests {
             4,
             "hnsw",
             Some(DistanceMetric::InnerProduct),
+            None,
             None,
         ) {
             Err(e) => e,
@@ -1314,6 +1913,59 @@ mod tests {
         .is_err());
         assert!(HnswParams { m: 2, ..base }.validate().is_ok());
         assert!(HnswParams { m: 1024, ..base }.validate().is_ok());
+    }
+
+    #[test]
+    fn vector_dtype_is_immutable_and_hnsw_only() {
+        // 编码是创建时事实：同值幂等、异值冲突、非 hnsw 后端拒绝。
+        // EN: The encoding is a creation-time fact: same value is idempotent,
+        // a different value conflicts, and non-hnsw backends are rejected.
+        let mgr = CollectionManager::new(4, "hnsw");
+        let (col, created) = mgr
+            .get_or_create_typed_with_metric(
+                "c",
+                4,
+                "hnsw",
+                Some(DistanceMetric::Cosine),
+                None,
+                Some(VectorDtype::F16),
+            )
+            .unwrap();
+        assert!(created);
+        assert_eq!(col.vector_dtype(), VectorDtype::F16);
+        let (_, created) = mgr
+            .get_or_create_replayed(
+                "c",
+                4,
+                "hnsw",
+                Some(DistanceMetric::Cosine),
+                None,
+                Some(VectorDtype::F16),
+            )
+            .unwrap();
+        assert!(!created);
+        let err = match mgr.get_or_create_replayed(
+            "c",
+            4,
+            "hnsw",
+            Some(DistanceMetric::Cosine),
+            None,
+            Some(VectorDtype::F32),
+        ) {
+            Err(e) => e,
+            Ok(_) => panic!("vector_dtype drift must conflict"),
+        };
+        assert!(err.contains("vector_dtype"), "got: {err}");
+        assert!(mgr
+            .get_or_create_typed_with_metric(
+                "flatc",
+                4,
+                "flat",
+                Some(DistanceMetric::Cosine),
+                None,
+                Some(VectorDtype::F16),
+            )
+            .is_err());
     }
 
     #[test]
@@ -1423,5 +2075,254 @@ mod tests {
         let current = mgr.get("same-name").expect("recreated collection stays");
         assert!(Arc::ptr_eq(&current, &new));
         assert!(!new.is_deleted());
+    }
+
+    /// P4：稀疏模式仅允许 hnsw/flat；none 在任何后端都合法。
+    /// EN: P4 — bm25 is only valid on hnsw/flat; none is valid on every backend.
+    #[test]
+    fn sparse_bm25_is_only_valid_for_hnsw_and_flat() {
+        for ok in ["hnsw", "flat"] {
+            CollectionManager::validate_create(
+                ok,
+                4,
+                DistanceMetric::Cosine,
+                None,
+                VectorDtype::F32,
+                Quantization::None,
+                SparseMode::Bm25,
+            )
+            .expect("bm25 must be accepted on hnsw|flat");
+        }
+        // 每个后端用其原生度量，让失败面落在稀疏校验本身而非度量校验。
+        // EN: Give each backend a metric it natively supports so the failure
+        // lands on the sparse rule rather than the metric check.
+        for (bad, metric) in [
+            ("clustered", DistanceMetric::L2),
+            ("flat-clustered", DistanceMetric::L2),
+            ("pq-flat", DistanceMetric::L2),
+            ("hii-l0", DistanceMetric::Cosine),
+        ] {
+            let err = CollectionManager::validate_create(
+                bad,
+                4,
+                metric,
+                None,
+                VectorDtype::F32,
+                Quantization::None,
+                SparseMode::Bm25,
+            )
+            .expect_err("bm25 must be rejected on non hnsw|flat backends");
+            assert!(err.contains("sparse bm25"), "unexpected error: {err}");
+        }
+        CollectionManager::validate_create(
+            "clustered",
+            4,
+            DistanceMetric::Cosine,
+            None,
+            VectorDtype::F32,
+            Quantization::None,
+            SparseMode::None,
+        )
+        .expect("none remains valid anywhere");
+    }
+
+    /// P4：稀疏模式是不可变事实——严格（非重放）路径的显式分叉双向拒绝。
+    /// EN: P4 — the sparse mode is immutable; explicit divergence on the strict
+    /// (non-replay) path is rejected in both directions.
+    #[test]
+    fn strict_create_conflicts_on_sparse_mode_divergence() {
+        let mgr = CollectionManager::new(4, "hnsw");
+        let (col, created) = mgr
+            .get_or_create_typed_with_metric_and_quantization(
+                "bm25",
+                4,
+                "hnsw",
+                Some(DistanceMetric::Cosine),
+                None,
+                None,
+                None,
+                Some(SparseMode::Bm25),
+            )
+            .unwrap();
+        assert!(created);
+        assert_eq!(col.sparse_mode(), SparseMode::Bm25);
+        let err = expect_create_err(
+            mgr.get_or_create_typed_with_metric_and_quantization(
+                "bm25",
+                4,
+                "hnsw",
+                Some(DistanceMetric::Cosine),
+                None,
+                None,
+                None,
+                Some(SparseMode::None),
+            ),
+            "recreate as none must be rejected",
+        );
+        assert!(
+            err.contains("sparse=bm25") && err.contains("requires none"),
+            "unexpected error: {err}"
+        );
+
+        let (plain, _) = mgr
+            .get_or_create_typed_with_metric_and_quantization(
+                "plain",
+                4,
+                "flat",
+                Some(DistanceMetric::Cosine),
+                None,
+                None,
+                None,
+                Some(SparseMode::None),
+            )
+            .unwrap();
+        assert!(plain.sparse_index().is_none());
+        let err = expect_create_err(
+            mgr.get_or_create_typed_with_metric_and_quantization(
+                "plain",
+                4,
+                "flat",
+                Some(DistanceMetric::Cosine),
+                None,
+                None,
+                None,
+                Some(SparseMode::Bm25),
+            ),
+            "recreate as bm25 must be rejected",
+        );
+        assert!(
+            err.contains("sparse=none") && err.contains("requires bm25"),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// P4：仅重放入口允许 none → bm25 的冷启动对账；反向永远拒绝。
+    /// EN: P4 — only the replay entry reconciles none -> bm25 at cold start;
+    /// the reverse is always rejected.
+    #[test]
+    fn replay_entry_reconciles_none_to_bm25_only() {
+        let mgr = CollectionManager::new(4, "hnsw");
+        let (col, _) = mgr
+            .get_or_create_typed_with_metric_and_quantization(
+                "legacy",
+                4,
+                "hnsw",
+                Some(DistanceMetric::Cosine),
+                None,
+                None,
+                None,
+                Some(SparseMode::None),
+            )
+            .unwrap();
+        assert!(col.sparse_index().is_none());
+        let (same, created) = mgr
+            .get_or_create_replayed_with_quantization(
+                "legacy",
+                4,
+                "hnsw",
+                Some(DistanceMetric::Cosine),
+                None,
+                None,
+                None,
+                Some(SparseMode::Bm25),
+            )
+            .unwrap();
+        assert!(
+            !created,
+            "reconciliation must reuse the restored collection"
+        );
+        assert!(Arc::ptr_eq(&same, &col));
+        assert_eq!(col.sparse_mode(), SparseMode::Bm25);
+        let lock = col
+            .sparse_index()
+            .expect("reconciled collection owns a sparse index");
+        assert_eq!(lock.read().unwrap().stats().doc_count, 0);
+
+        let err = expect_create_err(
+            mgr.get_or_create_replayed_with_quantization(
+                "legacy",
+                4,
+                "hnsw",
+                Some(DistanceMetric::Cosine),
+                None,
+                None,
+                None,
+                Some(SparseMode::None),
+            ),
+            "reverse reconciliation must be rejected",
+        );
+        assert!(err.contains("sparse=bm25"), "unexpected error: {err}");
+    }
+
+    /// P4：隐式创建（首次 upsert 落地）恒为 none，不得凭空建稀疏索引。
+    /// EN: P4 — implicit creation (first upsert materialization) is always none
+    /// and must never allocate a sparse index.
+    #[test]
+    fn implicit_creation_is_always_sparse_none() {
+        let mgr = CollectionManager::new(4, "hnsw");
+        let col = mgr.get_or_create("implicit", Some(4)).unwrap();
+        assert_eq!(col.sparse_mode(), SparseMode::None);
+        assert!(col.sparse_index().is_none());
+    }
+
+    /// P4 OCR 9fda139：快照恢复的集合（`create_logged=false` 但不是 upsert
+    /// 隐式建立）不参与 none → bm25 对账；后续稀疏 upsert 属腐坏记录，必须
+    /// 拒绝而不是静默升级。
+    /// EN: P4 OCR 9fda139 — a snapshot-restored collection (`create_logged ==
+    /// false` but not implicitly built by upsert replay) never reconciles
+    /// none -> bm25; a later sparse upsert is corruption and must be rejected
+    /// instead of silently upgrading.
+    #[test]
+    fn snapshot_restored_collection_rejects_sparse_upsert_reconciliation() {
+        let mgr = CollectionManager::new(4, "hnsw");
+        let (restored, created) = mgr
+            .get_or_create_typed_with_metric_and_quantization(
+                "restored",
+                4,
+                "hnsw",
+                None,
+                None,
+                None,
+                None,
+                Some(SparseMode::None),
+            )
+            .unwrap();
+        assert!(created);
+        // 快照恢复不会 mark_create_logged，但它也绝不是 upsert 隐式建立。
+        // EN: Snapshot restore never marks the create logged, and it is also not
+        // an upsert implicit build.
+        assert!(!restored.create_logged());
+        assert!(!restored.implicit_upsert_built());
+        let err = expect_create_err(
+            mgr.get_or_create_for_collection_upsert("restored", Some(4), Some(SparseMode::Bm25)),
+            "sparse upsert after snapshot restore must be rejected",
+        );
+        assert!(
+            err.contains("sparse=none") && err.contains("requires bm25"),
+            "unexpected error: {err}"
+        );
+        assert_eq!(restored.sparse_mode(), SparseMode::None);
+    }
+
+    /// P4 OCR 9fda139：允许的升级同样受「bm25 仅限 hnsw|flat」创建约束——
+    /// 隐式建立集合采用的服务端默认后端（此处 clustered）上不得升级。
+    /// EN: P4 OCR 9fda139 — the allowed upgrade is still bound by the
+    /// "bm25 only on hnsw|flat" creation rule: an implicitly built collection
+    /// using the server default backend (clustered here) must not upgrade.
+    #[test]
+    fn sparse_reconcile_rejects_non_hnsw_flat_backend() {
+        let mgr = CollectionManager::new(4, "clustered");
+        mgr.get_or_create_for_collection_upsert("implicit", Some(4), None)
+            .unwrap();
+        let err = expect_create_err(
+            mgr.get_or_create_for_collection_upsert("implicit", Some(4), Some(SparseMode::Bm25)),
+            "bm25 upgrade on clustered must be rejected",
+        );
+        assert!(
+            err.contains("hnsw") && err.contains("flat"),
+            "unexpected error: {err}"
+        );
+        let col = mgr.get("implicit").expect("collection stays");
+        assert_eq!(col.sparse_mode(), SparseMode::None);
     }
 }

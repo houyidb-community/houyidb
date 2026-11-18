@@ -63,6 +63,42 @@ impl VectorStore {
     pub fn raw_data(&self) -> (&[u64], &[f32]) {
         (&self.ids, &self.vectors)
     }
+
+    /// 校验维度后写入；FFI 边界用 Result 代替 assert，避免跨 C ABI panic。
+    /// EN: Validate dimensions then upsert; the FFI boundary returns a Result
+    /// instead of asserting so a bad length cannot panic across the C ABI.
+    pub fn try_upsert(&mut self, id: u64, vector: &[f32]) -> Result<(), String> {
+        if vector.len() != self.dims {
+            return Err(format!(
+                "dim mismatch: expected {}, got {}",
+                self.dims,
+                vector.len()
+            ));
+        }
+        self.upsert(id, vector);
+        Ok(())
+    }
+
+    /// 导出逐行 (id, vector) 快照（持久化用）。
+    /// EN: Export row-wise (id, vector) pairs for persistence.
+    pub fn rows(&self) -> Vec<(u64, Vec<f32>)> {
+        let dims = self.dims;
+        self.ids
+            .iter()
+            .enumerate()
+            .map(|(i, &id)| (id, self.vectors[i * dims..(i + 1) * dims].to_vec()))
+            .collect()
+    }
+
+    /// 取走 ID/向量数据用于建图（保留空存储占位，随后由索引状态替换）。
+    /// EN: Take ids/vectors for a build (leaves an empty store placeholder that
+    /// the backend state replaces with the built index).
+    pub fn take_for_build(&mut self) -> (Vec<u64>, Vec<f32>) {
+        let ids = std::mem::take(&mut self.ids);
+        let vectors = std::mem::take(&mut self.vectors);
+        self.id_to_idx.clear();
+        (ids, vectors)
+    }
 }
 
 #[cfg(test)]

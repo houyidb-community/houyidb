@@ -314,6 +314,108 @@ public class IntegrationTests
     }
 
     /// <summary>
+    /// 显式建 f16 + int8 hnsw 集合：vector_dtype/quantization 透传到请求、
+    /// 响应回显、status 可观测。
+    /// EN: Explicitly creates an f16 + int8 hnsw collection: vector_dtype and
+    /// quantization are forwarded in the request, echoed in the response, and
+    /// observable via status.
+    /// </summary>
+    [Fact]
+    public async Task CreateCollectionF16Int8RoundTrip()
+    {
+        var client = new HouyiClient(BaseUrl, TimeSpan.FromSeconds(3));
+        if (!await client.HealthAsync())
+        {
+            return;
+        }
+        const string name = "dotnet_it_f16_dtype";
+        // 幂等清理：上次异常退出可能残留同名集合。
+        // EN: idempotent cleanup: a previous aborted run may have left the name behind.
+        try
+        {
+            await client.DeleteCollectionAsync(name);
+        }
+        catch (HouyiException)
+        {
+            // 不存在（404）或启用了鉴权（401/403）：无需清理，直接继续。
+            // EN: missing (404) or auth enabled (401/403): nothing to clean up.
+        }
+
+        var created = await client.CreateCollectionAsync(name, TestDims, new CreateCollectionOptions
+        {
+            Metric = "l2",
+            IndexType = "hnsw",
+            VectorDtype = "f16",
+            Quantization = "int8",
+            Hnsw = new HnswParams(16, 100, 32),
+        });
+        Assert.Equal("f16", created.VectorDtype);
+        Assert.Equal("int8", created.Quantization);
+        Assert.Equal("hnsw", created.IndexType);
+
+        using var status = await client.GetCollection(name).StatusAsync();
+        Assert.Equal("f16", status.RootElement.GetProperty("vector_dtype").GetString());
+        Assert.Equal(
+            "int8", status.RootElement.GetProperty("quantization").GetString());
+
+        await client.DeleteCollectionAsync(name);
+    }
+
+    /// <summary>
+    /// 显式建 rabitq（l2/cosine-only）hnsw 集合：请求透传、响应与 status 回显；
+    /// ip 组合返回 400。
+    /// EN: Explicitly creates a rabitq (l2/cosine-only) hnsw collection: the
+    /// request is forwarded, the response and status echo it, and the ip
+    /// combination returns 400.
+    /// </summary>
+    [Fact]
+    public async Task CreateCollectionRabitqRoundTrip()
+    {
+        var client = new HouyiClient(BaseUrl, TimeSpan.FromSeconds(3));
+        if (!await client.HealthAsync())
+        {
+            return;
+        }
+        const string name = "dotnet_it_rabitq";
+        try
+        {
+            await client.DeleteCollectionAsync(name);
+        }
+        catch (HouyiException)
+        {
+            // 不存在（404）或启用了鉴权（401/403）：无需清理。
+            // EN: missing (404) or auth enabled (401/403): nothing to clean up.
+        }
+
+        var created = await client.CreateCollectionAsync(name, TestDims, new CreateCollectionOptions
+        {
+            Metric = "cosine",
+            IndexType = "hnsw",
+            VectorDtype = "f32",
+            Quantization = "rabitq",
+            Hnsw = new HnswParams(16, 100, 32),
+        });
+        Assert.Equal("cosine", created.Metric);
+        Assert.Equal("hnsw", created.IndexType);
+        Assert.Equal("rabitq", created.Quantization);
+
+        using var status = await client.GetCollection(name).StatusAsync();
+        Assert.Equal(
+            "rabitq", status.RootElement.GetProperty("quantization").GetString());
+
+        var ex = await Assert.ThrowsAsync<HouyiException>(
+            () => client.CreateCollectionAsync(name + "_ip", TestDims, new CreateCollectionOptions
+            {
+                Metric = "ip",
+                IndexType = "hnsw",
+                Quantization = "rabitq",
+            }));
+        Assert.Equal(400, ex.StatusCode);
+
+        await client.DeleteCollectionAsync(name);
+    }
+
+    /// <summary>
     /// 删除不存在的 collection 返回上游 404。
     /// EN: Dropping an unknown collection surfaces the upstream 404.
     /// </summary>
@@ -328,5 +430,160 @@ public class IntegrationTests
         var ex = await Assert.ThrowsAsync<HouyiException>(
             () => client.DeleteCollectionAsync("dotnet_it_admin_never_created"));
         Assert.Equal(404, ex.StatusCode);
+    }
+
+    /// <summary>
+    /// bm25 建集合 → 带稀疏 upsert → 融合检索（RRF/加权回显）→ sparse=[] 清空
+    /// 后仅剩稠密分。
+    /// EN: Creates a bm25 collection, upserts with sparse terms, runs a fusion
+    /// search (RRF/weighted echoes), and verifies that clearing with sparse=[]
+    /// leaves the document with a dense score only.
+    /// </summary>
+    [Fact]
+    public async Task SparseCreateAndFusionSearch()
+    {
+        var client = new HouyiClient(BaseUrl, TimeSpan.FromSeconds(3));
+        if (!await client.HealthAsync())
+        {
+            return;
+        }
+        const string name = "dotnet_it_fusion";
+        try
+        {
+            await client.DeleteCollectionAsync(name);
+        }
+        catch (HouyiException)
+        {
+            // 不存在（404）或启用了鉴权（401/403）：无需清理。
+            // EN: missing (404) or auth enabled (401/403): nothing to clean up.
+        }
+
+        var created = await client.CreateCollectionAsync(name, TestDims, new CreateCollectionOptions
+        {
+            IndexType = "flat",
+            Sparse = "bm25",
+        });
+        Assert.Equal("bm25", created.Sparse);
+        Assert.Equal("flat", created.IndexType);
+
+        var col = client.GetCollection(name);
+        await col.UpsertAsync(new[]
+        {
+            new Vector
+            {
+                Id = 1,
+                Values = FakeEmbed("apple"),
+                Payload = new Dictionary<string, object?> { ["text"] = "apple" },
+                Sparse = [new SparseTerm(7, 1.0f), new SparseTerm(8, 0.5f)],
+            },
+            new Vector
+            {
+                Id = 2,
+                Values = FakeEmbed("banana"),
+                Payload = new Dictionary<string, object?> { ["text"] = "banana" },
+                Sparse = [new SparseTerm(8, 1.0f)],
+            },
+            new Vector
+            {
+                Id = 3,
+                Values = FakeEmbed("cherry"),
+                Payload = new Dictionary<string, object?> { ["text"] = "cherry" },
+                Sparse = [new SparseTerm(9, 1.0f)],
+            },
+        });
+        await WaitFlushedAsync(col);
+
+        var result = await col.FusionSearchAsync(
+            FakeEmbed("apple"),
+            [new SparseTerm(7, 1.0f), new SparseTerm(8, 0.5f)],
+            2,
+            new FusionOptions { IncludePayload = true });
+        Assert.NotEmpty(result.Hits);
+        Assert.Equal(1UL, result.Hits[0].Id);
+        Assert.Equal("rrf", result.FusionMode);
+        Assert.Equal(60u, result.RrfK);
+        Assert.Null(result.Alpha);
+        Assert.NotNull(result.Hits[0].DenseScore);
+        Assert.NotNull(result.Hits[0].SparseScore);
+        Assert.Equal("apple", result.Hits[0].Payload!["text"].GetString());
+        Assert.Equal("cosine", result.Metric);
+
+        var weighted = await col.FusionSearchAsync(
+            FakeEmbed("apple"), [new SparseTerm(7, 1.0f)], 2,
+            new FusionOptions { Fusion = "weighted", Alpha = 0.25f });
+        Assert.Equal("weighted", weighted.FusionMode);
+        Assert.Equal(0.25f, weighted.Alpha);
+        Assert.Null(weighted.RrfK);
+
+        // sparse=[] 清空该文档词项（null 才是「不改」）；清空后仅剩稠密分。
+        // EN: sparse=[] clears this document's terms (null means "unchanged");
+        // afterwards only the dense score remains.
+        await col.UpsertAsync(new[]
+        {
+            new Vector
+            {
+                Id = 1,
+                Values = FakeEmbed("apple"),
+                Payload = new Dictionary<string, object?> { ["text"] = "apple" },
+                Sparse = [],
+            },
+        });
+        await WaitFlushedAsync(col);
+        var cleared = await col.FusionSearchAsync(
+            FakeEmbed("apple"), [new SparseTerm(8, 1.0f)], 3);
+        var cleared1 = cleared.Hits.SingleOrDefault(h => h.Id == 1);
+        Assert.NotNull(cleared1);
+        Assert.NotNull(cleared1.DenseScore);
+        Assert.Null(cleared1.SparseScore);
+
+        await client.DeleteCollectionAsync(name);
+    }
+
+    /// <summary>
+    /// bm25 仅 hnsw/flat（clustered 组合 400）；隐式创建的 none 集合上融合检索 400。
+    /// EN: bm25 is hnsw/flat-only (a clustered combo is 400); fusion search on an
+    /// implicitly created none collection is 400.
+    /// </summary>
+    [Fact]
+    public async Task SparseCreateGuards()
+    {
+        var client = new HouyiClient(BaseUrl, TimeSpan.FromSeconds(3));
+        if (!await client.HealthAsync())
+        {
+            return;
+        }
+        const string badName = "dotnet_it_sparse_clustered";
+        const string implicitName = "dotnet_it_sparse_implicit";
+        foreach (var name in new[] { badName, implicitName })
+        {
+            try
+            {
+                await client.DeleteCollectionAsync(name);
+            }
+            catch (HouyiException)
+            {
+                // 不存在（404）或启用了鉴权（401/403）：无需清理。
+                // EN: missing (404) or auth enabled (401/403): nothing to clean up.
+            }
+        }
+
+        var bad = await Assert.ThrowsAsync<HouyiException>(
+            () => client.CreateCollectionAsync(badName, TestDims, new CreateCollectionOptions
+            {
+                IndexType = "clustered",
+                Sparse = "bm25",
+            }));
+        Assert.Equal(400, bad.StatusCode);
+
+        // 隐式创建恒为 none：融合检索被拒（400）。
+        // EN: implicit creation is always none, so fusion search is rejected (400).
+        await client.GetCollection(implicitName)
+            .UpsertAsync(new[] { new Vector { Id = 1, Values = FakeEmbed("implicit none") } });
+        var fusionErr = await Assert.ThrowsAsync<HouyiException>(
+            () => client.GetCollection(implicitName).FusionSearchAsync(
+                FakeEmbed("implicit none"), [new SparseTerm(1, 1.0f)], 1));
+        Assert.Equal(400, fusionErr.StatusCode);
+
+        await client.DeleteCollectionAsync(implicitName);
     }
 }

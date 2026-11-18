@@ -156,16 +156,54 @@ def test_create_collection_metric_and_hnsw(base_url):
         metric="ip",
         index_type="hnsw",
         hnsw=HnswParams(m=16, ef_construction=100, ef_search=32),
+        vector_dtype="f16",
+        quantization="int8",
     )
     assert created["created"] is True
     assert created["collection"] == name
     assert created["metric"] == "ip"
     assert created["index_type"] == "hnsw"
+    assert created["vector_dtype"] == "f16"
+    assert created["quantization"] == "int8"
     assert created["hnsw"] == {"m": 16, "ef_construction": 100, "ef_search": 32}
     with pytest.raises(HouyiError) as exc_info:
         client.create_collection(name, 16, metric="ip", index_type="hnsw")
     assert exc_info.value.status_code == 409
     client.delete_collection(name)
+
+
+def test_create_collection_rabitq(base_url):
+    """rabitq 仅 l2/cosine：合法创建回显 rabitq，ip 组合返回 400。
+    EN: rabitq is l2/cosine-only: a valid create echoes rabitq, while an ip
+    combination returns 400.
+    """
+    client = HouyiClient(base_url)
+    name = "py_it_create_rabitq"
+    try:
+        client.delete_collection(name)
+    except HouyiError as exc:
+        assert exc.status_code == 404, exc
+    created = client.create_collection(
+        name,
+        16,
+        metric="cosine",
+        index_type="hnsw",
+        vector_dtype="f32",
+        quantization="rabitq",
+    )
+    assert created["created"] is True
+    assert created["metric"] == "cosine"
+    assert created["index_type"] == "hnsw"
+    assert created["quantization"] == "rabitq"
+    with pytest.raises(HouyiError) as exc_info:
+        client.create_collection(
+            name + "_ip", 16, metric="ip", index_type="hnsw", quantization="rabitq"
+        )
+    assert exc_info.value.status_code == 400
+    client.delete_collection(name)
+    with pytest.raises(HouyiError) as exc_info:
+        client.delete_collection(name + "_ip")
+    assert exc_info.value.status_code == 404
 
 
 def test_delete_collection_and_recreate(base_url):
@@ -194,3 +232,107 @@ def test_delete_missing_collection_404(base_url):
     with pytest.raises(HouyiError) as exc_info:
         client.delete_collection("py_it_admin_never_created")
     assert exc_info.value.status_code == 404
+
+
+def test_sparse_create_and_fusion_search(base_url):
+    """bm25 集合：稀疏写入 + RRF/加权融合 + 清空稀疏词项。
+
+    EN: bm25 collection: sparse writes + RRF/weighted fusion + clearing sparse
+    terms.
+    """
+    client = HouyiClient(base_url)
+    name = "py_it_fusion"
+    try:
+        client.delete_collection(name)
+    except HouyiError as exc:
+        assert exc.status_code == 404, exc
+    created = client.create_collection(name, 16, sparse="bm25")
+    assert created["sparse"] == "bm25"
+    col = client.collection(name)
+    col.upsert(
+        [
+            Vector(
+                id=1,
+                values=fake_embed("apple fruit"),
+                payload={"text": "apple fruit"},
+                sparse=[(11, 1.0), (12, 0.5)],
+            ),
+            Vector(
+                id=2,
+                values=fake_embed("banana yellow"),
+                payload={"text": "banana yellow"},
+                sparse=[(21, 1.0)],
+            ),
+        ]
+    )
+    wait_flushed(col)
+
+    rrf = col.fusion_search(
+        fake_embed("apple fruit"), [(11, 1.0)], 2, include_payload=True
+    )
+    assert rrf.fusion_mode == "rrf"
+    assert rrf.rrf_k == 60
+    assert rrf.alpha is None
+    assert rrf.ids and rrf.ids[0] == 1
+    top = rrf.hits[0]
+    assert top.dense_score is not None
+    assert top.sparse_score is not None
+    assert top.payload is not None and top.payload["text"] == "apple fruit"
+
+    weighted = col.fusion_search(
+        fake_embed("apple fruit"),
+        [(11, 1.0)],
+        2,
+        fusion="weighted",
+        alpha=0.5,
+    )
+    assert weighted.fusion_mode == "weighted"
+    assert weighted.alpha == 0.5
+    assert weighted.rrf_k is None
+    assert weighted.ids[0] == 1
+
+    # 空数组清空该文档的稀疏词项：仍可被稠密一路命中，但无 BM25 分。
+    # EN: An empty array clears the document's sparse terms: the dense path
+    # still hits it, but there is no BM25 score.
+    col.upsert([Vector(id=1, values=fake_embed("apple fruit"), sparse=[])])
+    wait_flushed(col)
+    cleared = col.fusion_search(fake_embed("apple fruit"), [(11, 1.0)], 2)
+    hit_one = next(h for h in cleared.hits if h.id == 1)
+    assert hit_one.dense_score is not None
+    assert hit_one.sparse_score is None
+
+    client.delete_collection(name)
+
+
+def test_fusion_on_none_collection_is_400(col):
+    """未开启稀疏的集合调用融合检索返回 400（不隐式升级）。
+
+    EN: Calling fusion search on a collection without sparse returns 400 (no
+    implicit upgrade).
+    """
+    with pytest.raises(HouyiError) as exc_info:
+        col.fusion_search(fake_embed("apple"), [(11, 1.0)], 2)
+    assert exc_info.value.status_code == 400
+
+
+def test_create_sparse_requires_hnsw_or_flat(base_url):
+    """bm25 仅 hnsw/flat：clustered 组合返回 400；flat 组合成功回显。
+
+    EN: bm25 is hnsw/flat-only: a clustered combination returns 400, while a
+    flat combination succeeds and is echoed.
+    """
+    client = HouyiClient(base_url)
+    with pytest.raises(HouyiError) as exc_info:
+        client.create_collection(
+            "py_it_fusion_bad_backend", 16, index_type="clustered", sparse="bm25"
+        )
+    assert exc_info.value.status_code == 400
+    name = "py_it_fusion_flat"
+    try:
+        client.delete_collection(name)
+    except HouyiError as exc:
+        assert exc.status_code == 404, exc
+    created = client.create_collection(name, 16, index_type="flat", sparse="bm25")
+    assert created["sparse"] == "bm25"
+    assert created["index_type"] == "flat"
+    client.delete_collection(name)

@@ -16,15 +16,16 @@ use houyi_core::ScalarValue;
 use houyi_persistence::collection_snapshot_file::{
     collection_snapshots_dir, decode_collection_snapshot_payload,
     encode_collection_snapshot_payload, snapshot_file_name, CollectionManifest,
-    CollectionManifestEntry, CollectionSnapshotPayload, SnapshotHnswParams, SnapshotScalar,
-    SnapshotScalarRow,
+    CollectionManifestEntry, CollectionSnapshotPayload, SnapshotHnswParams, SnapshotQuantization,
+    SnapshotScalar, SnapshotScalarRow, SnapshotSparseIndex, SnapshotVectorDtype,
 };
 use houyi_persistence::encryption::Encryption;
 use houyi_persistence::graph_snapshot_file::{
     read_graph_snapshot_with_encryption, write_graph_snapshot_atomic_with_encryption,
 };
 use houyi_persistence::ha_level::HaLevel;
-use houyi_vector::DistanceMetric;
+use houyi_vector::sparse::{Bm25Index, SparseMode};
+use houyi_vector::{DistanceMetric, Quantization, VectorDtype};
 
 use crate::collection::CollectionManager;
 use crate::recovery::{drain_pending_builder, GraphSnapshotMetrics};
@@ -691,8 +692,28 @@ pub async fn write_collection_snapshots(
         .min()
         .unwrap_or(barrier);
     let max_checkpoint = entries.iter().map(|e| e.checkpoint_lsn).max().unwrap_or(0);
+    // 版本按内容精确匹配：任一 bm25 稀疏条目必须 v4（v1–v3 读取方不认稀疏
+    // 位/段）；否则沿用 P3 规则——含 rabitq 必须 v3（v2 读取方不认 rabitq 码位），
+    // 仅 int8 为 v2（v1 读取方会把 int8 集合静默恢复成未量化图），其余 v1。
+    // validate_manifest 同口径拒绝反例（format 4 ⇔ 至少一个稀疏条目）。
+    // EN: The version matches the content exactly: any bm25 sparse entry forces
+    // v4 (v1–v3 readers know neither the sparse bit nor the section); otherwise
+    // the P3 rule applies — rabitq forces v3, int8-only is v2, otherwise v1.
+    // validate_manifest rejects the inverse cases (format 4 iff >=1 sparse entry).
+    let format_version = if entries.iter().any(|e| e.sparse.is_some()) {
+        4
+    } else if entries
+        .iter()
+        .any(|e| e.quantization == Some(SnapshotQuantization::RaBitQ.as_u8()))
+    {
+        3
+    } else if entries.iter().any(|e| e.quantization.is_some()) {
+        2
+    } else {
+        1
+    };
     let manifest = CollectionManifest {
-        format_version: 1,
+        format_version,
         manifest_seq: previous_seq.saturating_add(1),
         created_at_unix: std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -772,6 +793,25 @@ async fn snapshot_one(
             .lock()
             .map_err(|e| format!("scalar_lock_poisoned:{name}:{e}"))?
             .snapshot_view();
+        // 稀疏视图：bm25 集合在写锁内取只读视图（与标量锁不嵌套——标量 guard
+        // 已在上一条表达式中释放）；none 集合为 None（不输出稀疏段/位）。
+        // EN: Sparse view: a bm25 collection takes a read view under the write
+        // lock (never nested with the scalar lock — the scalar guard was released
+        // above); none collections yield None (no sparse section/bit).
+        let sparse = match col.sparse_index() {
+            Some(lock) => {
+                let index = lock
+                    .read()
+                    .map_err(|e| format!("sparse_lock_poisoned:{name}:{e}"))?;
+                let view = index.snapshot_view();
+                Some(SnapshotSparseIndex {
+                    doc_count: view.doc_count,
+                    total_len: view.total_len,
+                    terms: view.terms,
+                })
+            }
+            None => None,
+        };
         let checkpoint = col.applied_lsn();
         let ha_level = col.ha_level().code();
         // 度量/HNSW 参数在锁内定格：图快照字节本身按该度量构建，恢复时若按
@@ -801,6 +841,7 @@ async fn snapshot_one(
         (
             rows,
             tombstones,
+            sparse,
             checkpoint,
             ha_level,
             metric,
@@ -808,7 +849,7 @@ async fn snapshot_one(
             early_vectors,
         )
     };
-    let (rows, tombstones, checkpoint, ha_level, metric, hnsw, early_vectors) = store;
+    let (rows, tombstones, sparse, checkpoint, ha_level, metric, hnsw, early_vectors) = store;
     let (kind, vector_count, vector_bytes) = match early_vectors {
         Some(v) => v,
         None => {
@@ -829,6 +870,38 @@ async fn snapshot_one(
                 .collect(),
         })
         .collect();
+    // 图侧量化是集合事实：int8 / rabitq 分别由 payload flags bit1 / bit2 承载，
+    // 未量化写显式 `Some(None)`（v2 payload 语义；None 仅属于 v1 历史快照）。
+    // 经快照字节而不做穷尽 match：`Quantization` 为 `#[non_exhaustive]`，未来
+    // 变体必须先扩展快照编码，未知字节在此 fail-closed，不得静默写成未量化。
+    // 同一份映射同时供 payload 与 manifest entry 使用，避免两处漂移。
+    // EN: Graph-side quantization is a collection fact: int8 / rabitq ride
+    // payload flags bit1 / bit2, and unquantized collections write explicit
+    // `Some(None)` (v2 payload semantics; None belongs only to legacy v1
+    // snapshots). Map through the snapshot byte instead of an exhaustive match:
+    // `Quantization` is `#[non_exhaustive]`, so a future variant must extend the
+    // snapshot encoding first; an unknown byte fails closed here rather than
+    // being silently written as unquantized. The same mapping feeds both the
+    // payload and the manifest entry so the two cannot drift.
+    let graph_quantization = match col.quantization().to_snapshot_byte() {
+        0 => None,
+        1 => Some(SnapshotQuantization::Int8),
+        2 => Some(SnapshotQuantization::RaBitQ),
+        byte => {
+            return Err(format!(
+                "unsupported quantization for snapshot: {} ({byte})",
+                col.quantization().as_str()
+            ))
+        }
+    };
+    // manifest 稀疏条目与 payload 稀疏段必须同源：二者都从锁内取得的
+    // `sparse` 视图推导，避免锁外再读 atomic 与模式对账（none → bm25）
+    // 竞态时出现「段在/条目不在」的半状态。
+    // EN: The manifest sparse entry and the payload sparse section must share one
+    // source: both derive from the locked `sparse` view, so re-reading the atomic
+    // outside the lock cannot race with mode reconciliation (none -> bm25) and
+    // produce a half state (section present, entry absent, or vice versa).
+    let sparse_entry = sparse.is_some().then_some(1);
     let payload = CollectionSnapshotPayload {
         checkpoint_lsn: checkpoint,
         name: name.to_string(),
@@ -837,11 +910,38 @@ async fn snapshot_one(
         ha_level,
         metric: Some(metric),
         hnsw,
+        // 编码是集合事实：f32 也显式写入，f16 由 payload flags bit0 承载。
+        // 经快照字节而非穷尽 match 映射：`VectorDtype` 为 `#[non_exhaustive]`
+        // （为后续量化 dtype 预留），未来变体必须先扩展快照编码，未知字节在此
+        // fail-closed，不得静默写成 f32。
+        // EN: The encoding is a collection fact: f32 is written explicitly too,
+        // and f16 rides payload flags bit0. Map through the snapshot byte instead
+        // of an exhaustive match: `VectorDtype` is `#[non_exhaustive]` (reserved
+        // for future quantized dtypes), so a future variant must extend the
+        // snapshot encoding first; an unknown byte fails closed here rather than
+        // being silently written as f32.
+        vector_dtype: Some(
+            SnapshotVectorDtype::from_u8(col.vector_dtype().to_snapshot_byte()).ok_or_else(
+                || {
+                    format!(
+                        "unsupported vector dtype for snapshot: {}",
+                        col.vector_dtype().as_str()
+                    )
+                },
+            )?,
+        ),
+        quantization: Some(graph_quantization.unwrap_or(SnapshotQuantization::None)),
         vector_kind: kind,
         vector_count,
         vector_bytes,
         scalars,
         tombstones,
+        // 稀疏段追加在墓碑之后：Some 使编码器写 payload v3 并置 flags bit3，
+        // None 保持 v2（旧二进制在版本/位两层干净拒绝 v3）。
+        // EN: The sparse section is appended after tombstones: Some makes the
+        // encoder emit payload v3 with flags bit3; None stays v2 (old binaries
+        // cleanly reject v3 at both the version and flag layers).
+        sparse,
     };
     let payload_bytes = encode_collection_snapshot_payload(&payload)
         .map_err(|e| format!("payload_encode_failed:{name}:{e}"))?;
@@ -879,6 +979,21 @@ async fn snapshot_one(
         index_type: col.index_type.clone(),
         ha_level,
         metric: Some(metric),
+        vector_dtype: Some(col.vector_dtype().to_snapshot_byte()),
+        // int8 / rabitq 分别写出 `Some(1)` / `Some(2)`；未量化保持 None
+        // （manifest 域只允许 1、2；未知字节在上方映射处已 fail-closed）。
+        // EN: int8 / rabitq write `Some(1)` / `Some(2)` respectively; unquantized
+        // stays None (manifest domain allows only 1 and 2; unknown bytes already
+        // fail closed in the mapping above).
+        quantization: graph_quantization.map(SnapshotQuantization::as_u8),
+        // 稀疏条目只表达 bm25（1）；none 保持 None，且与锁内取得的 payload
+        // 稀疏段严格同源。清单 format 4 与「至少一个稀疏条目」双向等价，由
+        // 编码侧推导与 validate_manifest 共同保证。
+        // EN: The sparse entry only expresses bm25 (1); none stays None and shares
+        // its source with the payload sparse section captured under the lock.
+        // Manifest format 4 and "at least one sparse entry" are mutually
+        // equivalent, enforced by the encoder derivation and validate_manifest.
+        sparse: sparse_entry,
         vector_kind: kind as u8,
         file,
         file_len,
@@ -1045,6 +1160,31 @@ async fn load_collection_snapshots_inner(
             || payload.index_type != entry.index_type
             || payload.ha_level != entry.ha_level
             || entry.metric.is_some_and(|m| payload.metric != Some(m))
+            // 旧 manifest 的 dtype 为 None（f32 语义），不强制比对；新 manifest
+            // 必须与 payload 一致，否则磁盘上两份记录描述的不是同一个集合。
+            // EN: Legacy manifests carry dtype=None (f32 semantics) and skip the
+            // comparison; new manifests must agree with the payload, otherwise the
+            // two on-disk records describe different collections.
+            || entry
+                .vector_dtype
+                .is_some_and(|d| payload.vector_dtype.map(|t| t.as_u8()).unwrap_or(0) != d)
+            // 量化同 dtype：旧 manifest 的 None 表示未量化语义、不强制比对；
+            // 新 manifest 与 payload 必须描述同一个集合。
+            // EN: Quantization mirrors dtype: legacy manifests carry None
+            // (unquantized semantics) and skip the check; new manifests must agree
+            // with the payload so both on-disk records describe one collection.
+            || entry
+                .quantization
+                .is_some_and(|q| payload.quantization.map(|t| t.as_u8()).unwrap_or(0) != q)
+            // 稀疏四重一致性的加载层校验：清单条目与 payload 段的「存在性」必须
+            // 相同（v3 ⇔ bit3 ⇔ 段 ⇔ format 4 ⇔ 条目由编解码与 validate_manifest
+            // 保证；此处锁死最后一段）。旧 manifest/payload 双侧均为 None。
+            // EN: Load-layer check of the four-way sparse consistency: the manifest
+            // entry and payload section must agree on presence (v3 <-> bit3 <->
+            // section <-> format 4 <-> entry is guaranteed by the codec and
+            // validate_manifest; this locks the last pair). Legacy records carry
+            // None on both sides.
+            || entry.sparse.is_some() != payload.sparse.is_some()
             || payload.vector_kind as u8 != entry.vector_kind
         {
             return snapshot_load_failure(
@@ -1078,13 +1218,60 @@ async fn load_collection_snapshots_inner(
             ef_construction: p.ef_construction as usize,
             ef_search: p.ef_search as usize,
         });
+        // v1 快照无 dtype（None → f32）；f16 只能由 hnsw 图快照携带（解码已校验）。
+        // 未知 dtype 字节必须 fail-closed：静默回退 None 会让 f16 数据被当作
+        // f32 装载（或反之），损坏恢复结果。
+        // EN: v1 snapshots carry no dtype (None → f32); f16 can only come from an
+        // hnsw graph snapshot (validated at decode). An unknown dtype byte must
+        // fail closed: silently mapping it to None would load f16 data as f32
+        // (or vice versa) and corrupt the recovery result.
+        let vector_dtype = match payload.vector_dtype {
+            Some(t) => Some(VectorDtype::from_snapshot_byte(t.as_u8()).ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!(
+                        "collection snapshot: unsupported vector dtype byte {}",
+                        t.as_u8()
+                    ),
+                )
+            })?),
+            None => None,
+        };
+        // v1 快照无量化字段：映射为 None 并走显式创建入口——None 即旧记录的
+        // 逐字节同旧行为。v2 起 int8、v3 起 rabitq 必须到达建后端入口，否则图
+        // 快照恢复会因期望不符整份拒绝，且静默建未量化图与写入侧语义分叉。
+        // EN: v1 snapshots carry no quantization field: map it to None and use the
+        // explicit creation entry — None is byte-for-byte identical to the legacy
+        // behavior. From v2 on (int8) and v3 on (rabitq), the value must reach the
+        // backend constructor or graph restore rejects the snapshot wholesale,
+        // and silently building an unquantized graph would diverge from the
+        // writer's semantics.
+        let quantization = payload.quantization.map(|q| match q {
+            SnapshotQuantization::None => Quantization::None,
+            SnapshotQuantization::Int8 => Quantization::Int8,
+            SnapshotQuantization::RaBitQ => Quantization::RaBitQ,
+        });
+        // 稀疏模式由 payload 段决定（清单存在性已在上方交叉校验）：v1/v2 无段
+        // → 显式 none；v3 有段 → bm25。显式传入使恢复入口与磁盘事实严格比对。
+        // EN: The sparse mode comes from the payload section (manifest presence was
+        // cross-checked above): v1/v2 with no section -> explicit none; v3 with a
+        // section -> bm25. Passing it explicitly makes restore compare against the
+        // on-disk fact.
+        let sparse = Some(if payload.sparse.is_some() {
+            SparseMode::Bm25
+        } else {
+            SparseMode::None
+        });
         let (col, _) = manager
-            .get_or_create_typed_with_metric(
+            .get_or_create_typed_with_metric_and_quantization(
                 &payload.name,
                 payload.dims as usize,
                 &payload.index_type,
                 metric,
                 hnsw,
+                vector_dtype,
+                quantization,
+                sparse,
             )
             .map_err(std::io::Error::other)?;
         col.backend
@@ -1117,6 +1304,34 @@ async fn load_collection_snapshots_inner(
             .lock()
             .map_err(|e| std::io::Error::other(e.to_string()))? =
             crate::collection::CollectionScalars::from_rows(rows, payload.tombstones);
+        // 稀疏索引重建：解码侧已校验排序/tf/doc_count/墓碑交叉；内核重建仍
+        // 复核结构不变量（防御性双检），失败按 InvalidData 拒绝整份快照。
+        // EN: Rebuild the sparse index: the decoder already validated ordering,
+        // tf, doc_count, and tombstone cross-checks; the kernel rebuild re-verifies
+        // structural invariants (defense in depth) and a failure rejects the
+        // snapshot as InvalidData.
+        if let Some(view) = payload.sparse {
+            let index = Bm25Index::from_snapshot(view.doc_count, view.total_len, view.terms)
+                .map_err(|e| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!("restore {} sparse index: {e}", payload.name),
+                    )
+                })?;
+            let lock = col.sparse_index().ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!(
+                        "restore {} sparse index: collection has sparse={}",
+                        payload.name,
+                        col.sparse_mode().as_str()
+                    ),
+                )
+            })?;
+            *lock
+                .write()
+                .map_err(|e| std::io::Error::other(e.to_string()))? = index;
+        }
         if let Some(level) = HaLevel::from_code(payload.ha_level) {
             col.set_ha_level(level);
         }
@@ -1235,6 +1450,7 @@ fn cleanup_unreferenced(dir: &Path, manifest: &CollectionManifest, keep_recent: 
 mod tests {
     use super::*;
     use crate::recovery::CollectionsReplayStats;
+    use houyi_persistence::collection_snapshot_file::SnapshotVectorKind;
     use houyi_persistence::collection_wal::{CollectionWalItem, CollectionWalRecord};
     use houyi_persistence::FileWal;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -1280,6 +1496,7 @@ mod tests {
                     .unwrap()
                     .clone(),
             ),
+            sparse: None,
         }];
         let upsert =
             houyi_persistence::collection_wal::encode_collection_upsert_batch("docs", 4, &items)
@@ -1477,37 +1694,155 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// P5.0.2：不支持的 backend 只阻塞 manifest，不产生删除/半快照。
-    /// EN: P5.0.2 — an unsupported backend blocks the manifest without deleting
-    /// or half-writing snapshots.
+    /// P5 快照压缩：懒构建后端（clustered 未建态 / pq-flat 已建态）均提交 manifest，
+    /// 加载后数据等价——pq-flat 检索逐位一致、待建行保留；clustered 原始行完整且
+    /// 保持未构图（与无快照冷启动一致，重启前也未构图）。
+    /// EN: Lazy backends (unbuilt clustered / built pq-flat) commit the manifest and
+    /// load equivalently — pq-flat searches bit-identically with pending rows kept,
+    /// clustered keeps every raw row and stays unbuilt (matching cold start without
+    /// a snapshot, which was equally unbuilt before restart).
     #[tokio::test]
-    async fn unsupported_backend_blocks_manifest() {
-        let dir = temp_dir("unsupported-backend");
+    async fn lazy_backend_snapshots_commit_and_load_equivalent() {
+        let dir = temp_dir("lazy-backend-snapshot");
         let cols_path = dir.join("bench.wal");
         let (wal, _) = WalHandle::open(&cols_path, crate::types::WalWriteMode::Sync).unwrap();
         let wal = Arc::new(wal);
-        let manager = Arc::new(CollectionManager::new(4, "pq-flat"));
-        manager
-            .get_or_create_typed_with_metric("docs", 4, "pq-flat", None, None)
-            .unwrap();
-        let metrics = Arc::new(GraphSnapshotMetrics::default());
 
+        let rows: Vec<(u64, Vec<f32>)> = (0..200u64)
+            .map(|id| {
+                (
+                    id,
+                    (0..16)
+                        .map(|j| ((id as usize * 13 + j * 7) % 200) as f32 / 200.0)
+                        .collect(),
+                )
+            })
+            .collect();
+
+        let manager = Arc::new(CollectionManager::new(16, "pq-flat"));
+        let (built, _) = manager
+            .get_or_create_typed_with_metric("built", 16, "pq-flat", None, None, None)
+            .unwrap();
+        built.backend.insert_batch(rows.clone()).await.unwrap();
+        assert_eq!(built.backend.optimize_build().await, 200);
+        // 构图后的写入只进缓冲（永不入图），快照必须把它作为待建行保留。
+        // Post-build writes stay buffered; the snapshot must retain them as pending.
+        built
+            .backend
+            .insert_batch(vec![(300, vec![0.5_f32; 16])])
+            .await
+            .unwrap();
+        let (unbuilt, _) = manager
+            .get_or_create_typed_with_metric("lazy", 16, "clustered", None, None, None)
+            .unwrap();
+        unbuilt
+            .backend
+            .insert_batch(rows[..32].to_vec())
+            .await
+            .unwrap();
+        let (unbuilt_fc, _) = manager
+            .get_or_create_typed_with_metric("lazy-fc", 16, "flat-clustered", None, None, None)
+            .unwrap();
+        unbuilt_fc
+            .backend
+            .insert_batch(rows[..16].to_vec())
+            .await
+            .unwrap();
+
+        let metrics = Arc::new(GraphSnapshotMetrics::default());
         let outcome =
             write_collection_snapshots(&manager, &wal, &cols_path, None, &metrics, true).await;
-        assert!(outcome.manifest.is_none());
         assert!(
-            outcome
-                .blocked_reason
-                .as_deref()
-                .is_some_and(|r| r.contains("unsupported_backend:docs")),
-            "got: {:?}",
+            outcome.blocked_reason.is_none(),
+            "lazy backends must not block: {:?}",
             outcome.blocked_reason
         );
+        let manifest = outcome.manifest.expect("manifest must commit");
+        assert_eq!(manifest.collections.len(), 3);
+        let built_entry = manifest
+            .collections
+            .iter()
+            .find(|e| e.name == "built")
+            .unwrap();
+        assert_eq!(
+            built_entry.vector_kind,
+            SnapshotVectorKind::PqFlatState as u8
+        );
+        assert_eq!(built_entry.vector_count, 201);
+        let lazy_entry = manifest
+            .collections
+            .iter()
+            .find(|e| e.name == "lazy")
+            .unwrap();
+        assert_eq!(
+            lazy_entry.vector_kind,
+            SnapshotVectorKind::BufferedRawF32 as u8
+        );
+        assert_eq!(lazy_entry.vector_count, 32);
+        let fc_entry = manifest
+            .collections
+            .iter()
+            .find(|e| e.name == "lazy-fc")
+            .unwrap();
+        assert_eq!(
+            fc_entry.vector_kind,
+            SnapshotVectorKind::BufferedRawF32 as u8
+        );
+        assert_eq!(fc_entry.vector_count, 16);
+
+        let fresh = Arc::new(CollectionManager::new(16, "pq-flat"));
+        let loaded = load_collection_snapshots(&fresh, &cols_path, 0, None, &metrics)
+            .await
+            .unwrap();
+        assert!(loaded.is_some(), "manifest must load");
+        let restored = fresh.get("built").expect("built collection restored");
+        assert_eq!(restored.backend.pending_build_count().await, 1);
+        assert_eq!(restored.backend.indexed_count().await, 200);
+        for seed in 0..5u64 {
+            let q: Vec<f32> = (0..16)
+                .map(|j| ((seed as usize * 17 + j * 5) % 97) as f32 / 97.0)
+                .collect();
+            assert_eq!(
+                built
+                    .backend
+                    .search_scored_with_ef_override(&q, 5, None, None)
+                    .await,
+                restored
+                    .backend
+                    .search_scored_with_ef_override(&q, 5, None, None)
+                    .await,
+                "seed {seed}: pq-flat search must be bit-identical after load"
+            );
+        }
+        let restored_lazy = fresh.get("lazy").expect("clustered collection restored");
+        let mut exported = restored_lazy
+            .backend
+            .export_snapshot_vectors()
+            .await
+            .unwrap();
+        exported.sort_by_key(|(id, _)| *id);
+        assert_eq!(exported, rows[..32].to_vec());
         assert!(
-            !collection_snapshots_dir(&cols_path)
-                .join("collections.manifest")
-                .exists(),
-            "blocked cycle must not commit a manifest"
+            restored_lazy
+                .backend
+                .search_scored_with_ef_override(&[0.42_f32; 16], 5, None, None)
+                .await
+                .is_empty(),
+            "unbuilt clustered must stay unbuilt after load"
+        );
+        let restored_fc = fresh
+            .get("lazy-fc")
+            .expect("flat-clustered collection restored");
+        let mut exported_fc = restored_fc.backend.export_snapshot_vectors().await.unwrap();
+        exported_fc.sort_by_key(|(id, _)| *id);
+        assert_eq!(exported_fc, rows[..16].to_vec());
+        assert!(
+            restored_fc
+                .backend
+                .search_scored_with_ef_override(&[0.42_f32; 16], 5, None, None)
+                .await
+                .is_empty(),
+            "unbuilt flat-clustered must stay unbuilt after load"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1658,6 +1993,7 @@ mod tests {
             values: vec![0.0, 1.0, 0.0, 0.0],
             label: None,
             payload: None,
+            sparse: None,
         }];
         let appended = wal
             .append(
@@ -1837,7 +2173,7 @@ mod tests {
         let dir = temp_dir("dropped-absent");
         let (manager, cols_path, _entries, metrics) = seeded(&dir).await;
         manager
-            .get_or_create_typed_with_metric("other", 4, "flat", None, None)
+            .get_or_create_typed_with_metric("other", 4, "flat", None, None, None)
             .unwrap();
         let other = manager.get("other").unwrap();
         {
@@ -1889,6 +2225,516 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// P1.5：f16 编码经 collection 快照 roundtrip：manifest 记录编码字节，
+    /// 恢复按同一编码重建 hnsw 后端（不是默认 f32）。
+    /// EN: P1.5 — f16 encoding roundtrips through a collection snapshot: the
+    /// manifest records the byte and restore rebuilds the hnsw backend with the
+    /// same encoding (not the f32 default).
+    #[tokio::test]
+    async fn f16_dtype_roundtrips_through_snapshot() {
+        let dir = temp_dir("f16-dtype-roundtrip");
+        let wal_path = dir.join("bench.wal");
+        let cols_path = houyi_persistence::collection_wal::collections_wal_path_for(&wal_path);
+        let (wal, _) = WalHandle::open(&cols_path, crate::types::WalWriteMode::Sync).unwrap();
+        let wal = Arc::new(wal);
+        let manager = Arc::new(CollectionManager::new(4, "hnsw"));
+        manager
+            .get_or_create_typed_with_metric(
+                "vec",
+                4,
+                "hnsw",
+                Some(DistanceMetric::Cosine),
+                None,
+                Some(VectorDtype::F16),
+            )
+            .unwrap();
+        let items = vec![CollectionWalItem {
+            id: 1,
+            values: vec![1.0, 0.0, 0.0, 0.0],
+            label: None,
+            payload: None,
+            sparse: None,
+        }];
+        let upsert =
+            houyi_persistence::collection_wal::encode_collection_upsert_batch("vec", 4, &items)
+                .unwrap();
+        let entry = wal.append(upsert).unwrap();
+        let mut stats = CollectionsReplayStats::default();
+        let mut skipped = 0usize;
+        let mut poison = crate::recovery::PoisonedRowLog::new();
+        crate::recovery::apply_collection_wal_record(
+            &manager,
+            entry.lsn,
+            CollectionWalRecord::UpsertBatch {
+                name: "vec".to_string(),
+                dim: 4,
+                items,
+            },
+            |_| None,
+            &mut stats,
+            &mut skipped,
+            &mut poison,
+        )
+        .await
+        .unwrap();
+        let metrics = Arc::new(GraphSnapshotMetrics::default());
+        let outcome =
+            write_collection_snapshots(&manager, &wal, &cols_path, None, &metrics, true).await;
+        let manifest = outcome.manifest.expect("manifest must commit");
+        assert_eq!(manifest.collections.len(), 1);
+        assert_eq!(
+            manifest.collections[0].vector_dtype,
+            Some(1),
+            "manifest must record f16"
+        );
+        drop(wal);
+
+        // 默认后端故意设为 flat：恢复必须以快照记录为准建 hnsw/f16。
+        // EN: The default backend is deliberately flat: restore must follow the
+        // snapshot record and build hnsw/f16.
+        let fresh = Arc::new(CollectionManager::new(4, "flat"));
+        let loaded = load_collection_snapshots(&fresh, &cols_path, 0, None, &metrics)
+            .await
+            .unwrap()
+            .expect("manifest must load");
+        assert!(loaded.checkpoints.contains_key("vec"));
+        let restored = fresh.get("vec").expect("collection restored");
+        assert_eq!(restored.vector_dtype(), VectorDtype::F16);
+        assert_eq!(restored.index_type, "hnsw");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// P2：int8 量化经 collection 快照 roundtrip——payload flags bit1、manifest
+    /// 记录 quantization 且 format_version 升到 2；恢复后的 collection 仍是
+    /// int8 图后端，主表原始值（精确 rescore 的来源）与写入值逐位一致。
+    /// EN: P2 — int8 quantization roundtrips through a collection snapshot: payload
+    /// flags bit1, manifest records quantization with format_version 2, the
+    /// restored collection keeps the int8 graph backend, and the main store still
+    /// holds the original values that exact rescore reads.
+    #[tokio::test]
+    async fn int8_quantization_roundtrips_through_snapshot() {
+        let dir = temp_dir("int8-quantization-roundtrip");
+        let wal_path = dir.join("bench.wal");
+        let cols_path = houyi_persistence::collection_wal::collections_wal_path_for(&wal_path);
+        let (wal, _) = WalHandle::open(&cols_path, crate::types::WalWriteMode::Sync).unwrap();
+        let wal = Arc::new(wal);
+        let manager = Arc::new(CollectionManager::new(4, "hnsw"));
+        manager
+            .get_or_create_typed_with_metric_and_quantization(
+                "vec",
+                4,
+                "hnsw",
+                Some(DistanceMetric::Cosine),
+                None,
+                Some(VectorDtype::F16),
+                Some(houyi_vector::Quantization::Int8),
+                None,
+            )
+            .unwrap();
+        let values = vec![1.0, 0.0, 0.0, 0.0];
+        let items = vec![CollectionWalItem {
+            id: 1,
+            values: values.clone(),
+            label: None,
+            payload: None,
+            sparse: None,
+        }];
+        let upsert =
+            houyi_persistence::collection_wal::encode_collection_upsert_batch("vec", 4, &items)
+                .unwrap();
+        let entry = wal.append(upsert).unwrap();
+        let mut stats = CollectionsReplayStats::default();
+        let mut skipped = 0usize;
+        let mut poison = crate::recovery::PoisonedRowLog::new();
+        crate::recovery::apply_collection_wal_record(
+            &manager,
+            entry.lsn,
+            CollectionWalRecord::UpsertBatch {
+                name: "vec".to_string(),
+                dim: 4,
+                items,
+            },
+            |_| None,
+            &mut stats,
+            &mut skipped,
+            &mut poison,
+        )
+        .await
+        .unwrap();
+        let metrics = Arc::new(GraphSnapshotMetrics::default());
+        let outcome =
+            write_collection_snapshots(&manager, &wal, &cols_path, None, &metrics, true).await;
+        let manifest = outcome.manifest.expect("manifest must commit");
+        assert_eq!(manifest.collections.len(), 1);
+        // int8 ⇒ manifest v2；entry 记录 quantization=1。
+        // EN: int8 forces manifest v2; the entry records quantization=1.
+        assert_eq!(manifest.format_version, 2);
+        assert_eq!(
+            manifest.collections[0].quantization,
+            Some(SnapshotQuantization::Int8.as_u8()),
+            "manifest must record int8"
+        );
+        // payload flags bit1 携带 int8：经解码结果验证（写入侧置位由 persistence
+        // 单测覆盖）。
+        // EN: payload flags bit1 carries int8: verified through the decoded payload
+        // (the writer-side bit is covered by persistence unit tests).
+        let snap_path = collection_snapshots_dir(&cols_path).join(&manifest.collections[0].file);
+        let file = houyi_persistence::graph_snapshot_file::read_graph_snapshot(&snap_path)
+            .expect("snapshot envelope readable")
+            .expect("snapshot file present");
+        let payload = decode_collection_snapshot_payload(&file.payload).expect("payload decodes");
+        assert_eq!(payload.quantization, Some(SnapshotQuantization::Int8));
+        drop(wal);
+
+        // 默认后端故意设为 flat：恢复必须以快照记录为准建 int8 hnsw/f16。
+        // EN: The default backend is deliberately flat: restore must follow the
+        // snapshot record and build int8 hnsw/f16.
+        let fresh = Arc::new(CollectionManager::new(4, "flat"));
+        let loaded = load_collection_snapshots(&fresh, &cols_path, 0, None, &metrics)
+            .await
+            .unwrap()
+            .expect("manifest must load");
+        assert!(loaded.checkpoints.contains_key("vec"));
+        let restored = fresh.get("vec").expect("collection restored");
+        assert_eq!(restored.vector_dtype(), VectorDtype::F16);
+        assert_eq!(restored.index_type, "hnsw");
+        assert_eq!(restored.quantization(), houyi_vector::Quantization::Int8);
+        match &restored.backend {
+            crate::index_backend::IndexBackend::Hnsw(idx) => {
+                assert_eq!(idx.vector_quantization(), houyi_vector::Quantization::Int8);
+            }
+            _ => panic!("restored backend must be hnsw"),
+        }
+        // 主表保留原始写入值（v3 快照携带 source），精确 re-score 才有真值可比。
+        // EN: The main store keeps the original values (v3 carries `source`), so
+        // exact rescore compares against real values.
+        let restored_values = restored.backend.vectors_by_ids(&[1]).await;
+        assert_eq!(restored_values.len(), 1);
+        assert_eq!(restored_values[0].1, values);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// P3：rabitq 量化经 collection 快照 roundtrip——payload flags bit2、manifest
+    /// 记录 quantization=2 且 format_version 升到 3；恢复后的 collection 仍是
+    /// rabitq 图后端，主表保留原始写入值。
+    /// EN: P3 — rabitq quantization roundtrips through a collection snapshot:
+    /// payload flags bit2, manifest records quantization=2 with format_version 3,
+    /// the restored collection keeps the rabitq graph backend, and the main store
+    /// still holds the original values.
+    #[tokio::test]
+    async fn rabitq_quantization_roundtrips_through_snapshot() {
+        let dir = temp_dir("rabitq-quantization-roundtrip");
+        let wal_path = dir.join("bench.wal");
+        let cols_path = houyi_persistence::collection_wal::collections_wal_path_for(&wal_path);
+        let (wal, _) = WalHandle::open(&cols_path, crate::types::WalWriteMode::Sync).unwrap();
+        let wal = Arc::new(wal);
+        let manager = Arc::new(CollectionManager::new(4, "hnsw"));
+        manager
+            .get_or_create_typed_with_metric_and_quantization(
+                "vec",
+                4,
+                "hnsw",
+                Some(DistanceMetric::L2),
+                None,
+                Some(VectorDtype::F32),
+                Some(houyi_vector::Quantization::RaBitQ),
+                None,
+            )
+            .unwrap();
+        let values = vec![1.0, 0.0, 0.0, 0.0];
+        let items = vec![CollectionWalItem {
+            id: 1,
+            values: values.clone(),
+            label: None,
+            payload: None,
+            sparse: None,
+        }];
+        let upsert =
+            houyi_persistence::collection_wal::encode_collection_upsert_batch("vec", 4, &items)
+                .unwrap();
+        let entry = wal.append(upsert).unwrap();
+        let mut stats = CollectionsReplayStats::default();
+        let mut skipped = 0usize;
+        let mut poison = crate::recovery::PoisonedRowLog::new();
+        crate::recovery::apply_collection_wal_record(
+            &manager,
+            entry.lsn,
+            CollectionWalRecord::UpsertBatch {
+                name: "vec".to_string(),
+                dim: 4,
+                items,
+            },
+            |_| None,
+            &mut stats,
+            &mut skipped,
+            &mut poison,
+        )
+        .await
+        .unwrap();
+        let metrics = Arc::new(GraphSnapshotMetrics::default());
+        let outcome =
+            write_collection_snapshots(&manager, &wal, &cols_path, None, &metrics, true).await;
+        let manifest = outcome.manifest.expect("manifest must commit");
+        assert_eq!(manifest.collections.len(), 1);
+        // rabitq ⇒ manifest v3；entry 记录 quantization=2。
+        // EN: rabitq forces manifest v3; the entry records quantization=2.
+        assert_eq!(manifest.format_version, 3);
+        assert_eq!(
+            manifest.collections[0].quantization,
+            Some(SnapshotQuantization::RaBitQ.as_u8()),
+            "manifest must record rabitq"
+        );
+        // payload flags bit2 携带 rabitq：经解码结果验证。
+        // EN: payload flags bit2 carries rabitq: verified through the decoded payload.
+        let snap_path = collection_snapshots_dir(&cols_path).join(&manifest.collections[0].file);
+        let file = houyi_persistence::graph_snapshot_file::read_graph_snapshot(&snap_path)
+            .expect("snapshot envelope readable")
+            .expect("snapshot file present");
+        let payload = decode_collection_snapshot_payload(&file.payload).expect("payload decodes");
+        assert_eq!(payload.quantization, Some(SnapshotQuantization::RaBitQ));
+        drop(wal);
+
+        // 默认后端故意设为 flat：恢复必须以快照记录为准建 rabitq hnsw。
+        // EN: The default backend is deliberately flat: restore must follow the
+        // snapshot record and build rabitq hnsw.
+        let fresh = Arc::new(CollectionManager::new(4, "flat"));
+        let loaded = load_collection_snapshots(&fresh, &cols_path, 0, None, &metrics)
+            .await
+            .unwrap()
+            .expect("manifest must load");
+        assert!(loaded.checkpoints.contains_key("vec"));
+        let restored = fresh.get("vec").expect("collection restored");
+        assert_eq!(restored.index_type, "hnsw");
+        assert_eq!(restored.quantization(), houyi_vector::Quantization::RaBitQ);
+        match &restored.backend {
+            crate::index_backend::IndexBackend::Hnsw(idx) => {
+                assert_eq!(
+                    idx.vector_quantization(),
+                    houyi_vector::Quantization::RaBitQ
+                );
+            }
+            _ => panic!("restored backend must be hnsw"),
+        }
+        let restored_values = restored.backend.vectors_by_ids(&[1]).await;
+        assert_eq!(restored_values.len(), 1);
+        assert_eq!(restored_values[0].1, values);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// P4：bm25 稀疏索引经 collection 快照 roundtrip——manifest format 4、
+    /// 条目 sparse=1、payload v3+bit3；重启后 BM25 分数与写侧一致，且墓碑
+    /// 文档不出现在倒排索引中。
+    /// EN: P4 — the bm25 sparse index roundtrips through a collection snapshot:
+    /// manifest format 4, entry sparse=1, payload v3+bit3; after restart BM25
+    /// scores match the live index and tombstoned docs never appear in the
+    /// inverted index.
+    #[tokio::test]
+    async fn sparse_bm25_roundtrips_through_snapshot() {
+        let dir = temp_dir("sparse-bm25-roundtrip");
+        let wal_path = dir.join("bench.wal");
+        let cols_path = houyi_persistence::collection_wal::collections_wal_path_for(&wal_path);
+        let (wal, _) = WalHandle::open(&cols_path, crate::types::WalWriteMode::Sync).unwrap();
+        let wal = Arc::new(wal);
+        let manager = Arc::new(CollectionManager::new(4, "flat"));
+        manager
+            .get_or_create_typed_with_metric_and_quantization(
+                "docs",
+                4,
+                "flat",
+                Some(DistanceMetric::Cosine),
+                None,
+                None,
+                None,
+                Some(SparseMode::Bm25),
+            )
+            .unwrap();
+        let items = vec![
+            CollectionWalItem {
+                id: 1,
+                values: vec![1.0, 0.0, 0.0, 0.0],
+                label: None,
+                payload: None,
+                sparse: Some(vec![(100, 2.0), (200, 1.0)]),
+            },
+            CollectionWalItem {
+                id: 2,
+                values: vec![0.0, 1.0, 0.0, 0.0],
+                label: None,
+                payload: None,
+                sparse: Some(vec![(100, 1.0)]),
+            },
+        ];
+        let entry = wal
+            .append(
+                houyi_persistence::collection_wal::encode_collection_upsert_batch(
+                    "docs", 4, &items,
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        let mut stats = CollectionsReplayStats::default();
+        let mut skipped = 0usize;
+        let mut poison = crate::recovery::PoisonedRowLog::new();
+        crate::recovery::apply_collection_wal_record(
+            &manager,
+            entry.lsn,
+            CollectionWalRecord::UpsertBatch {
+                name: "docs".to_string(),
+                dim: 4,
+                items,
+            },
+            |_| None,
+            &mut stats,
+            &mut skipped,
+            &mut poison,
+        )
+        .await
+        .unwrap();
+        // 删除 id 2：快照只导出 live postings，墓碑之间不得互相污染。
+        // EN: Delete id 2 — the snapshot exports live postings only; tombstones
+        // must not leak into the inverted index.
+        let delete_entry = wal
+            .append(
+                houyi_persistence::collection_wal::encode_collection_delete("docs", &[2]).unwrap(),
+            )
+            .unwrap();
+        crate::recovery::apply_collection_wal_record(
+            &manager,
+            delete_entry.lsn,
+            CollectionWalRecord::Delete {
+                name: "docs".to_string(),
+                ids: vec![2],
+            },
+            |_| None,
+            &mut stats,
+            &mut skipped,
+            &mut poison,
+        )
+        .await
+        .unwrap();
+        let expected = manager
+            .get("docs")
+            .expect("collection exists")
+            .sparse_index()
+            .expect("bm25 collection owns an index")
+            .read()
+            .unwrap()
+            .search(&[(100, 1.0)], 4);
+
+        let metrics = Arc::new(GraphSnapshotMetrics::default());
+        let outcome =
+            write_collection_snapshots(&manager, &wal, &cols_path, None, &metrics, true).await;
+        let manifest = outcome.manifest.expect("manifest must commit");
+        assert_eq!(manifest.collections.len(), 1);
+        // bm25 ⇒ manifest format 4 且条目 sparse=1。
+        // EN: bm25 forces manifest format 4 with entry sparse=1.
+        assert_eq!(manifest.format_version, 4);
+        assert_eq!(manifest.collections[0].sparse, Some(1));
+        let snap_path = collection_snapshots_dir(&cols_path).join(&manifest.collections[0].file);
+        let file = houyi_persistence::graph_snapshot_file::read_graph_snapshot(&snap_path)
+            .expect("snapshot envelope readable")
+            .expect("snapshot file present");
+        let payload = decode_collection_snapshot_payload(&file.payload).expect("payload decodes");
+        let sparse = payload
+            .sparse
+            .as_ref()
+            .expect("v3 payload carries the sparse section");
+        assert_eq!(sparse.doc_count, 1);
+        assert_eq!(sparse.terms.len(), 2, "terms 100 and 200 survive");
+        assert!(
+            sparse
+                .terms
+                .iter()
+                .all(|(_, postings)| postings.iter().all(|(doc, _)| *doc == 1)),
+            "tombstoned id 2 must not appear: {sparse:?}"
+        );
+        assert!(payload.tombstones.contains(&2));
+        drop(wal);
+
+        let fresh = Arc::new(CollectionManager::new(4, "hnsw"));
+        let loaded = load_collection_snapshots(&fresh, &cols_path, 0, None, &metrics)
+            .await
+            .unwrap()
+            .expect("manifest must load");
+        assert!(loaded.checkpoints.contains_key("docs"));
+        let restored = fresh.get("docs").expect("collection restored");
+        assert_eq!(restored.index_type, "flat");
+        assert_eq!(restored.sparse_mode(), SparseMode::Bm25);
+        let index = restored
+            .sparse_index()
+            .expect("restored bm25 collection owns an index")
+            .read()
+            .unwrap();
+        let actual = index.search(&[(100, 1.0)], 4);
+        assert_eq!(actual.len(), expected.len());
+        for ((aid, ascore), (eid, escore)) in actual.iter().zip(expected.iter()) {
+            assert_eq!(aid, eid, "document order must survive the roundtrip");
+            assert!(
+                (ascore - escore).abs() < 1e-6,
+                "BM25 score drifted across restart: {ascore} vs {escore}"
+            );
+        }
+        assert_eq!(index.doc_count(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// P4：清单条目与 payload 段的稀疏存在性必须一致——清单宣称 bm25 而
+    /// payload 无段（篡改/损坏）在截断历史下必须拒绝加载。
+    /// EN: P4 — the manifest entry and payload section must agree on sparse
+    /// presence; a manifest claiming bm25 over a section-less payload (tamper/
+    /// corruption) must be rejected under truncated history.
+    #[tokio::test]
+    async fn sparse_manifest_payload_mismatch_is_rejected() {
+        let dir = temp_dir("sparse-manifest-mismatch");
+        let wal_path = dir.join("bench.wal");
+        let cols_path = houyi_persistence::collection_wal::collections_wal_path_for(&wal_path);
+        let (wal, _) = WalHandle::open(&cols_path, crate::types::WalWriteMode::Sync).unwrap();
+        let wal = Arc::new(wal);
+        let manager = Arc::new(CollectionManager::new(4, "flat"));
+        manager
+            .get_or_create_typed_with_metric_and_quantization(
+                "plain",
+                4,
+                "flat",
+                Some(DistanceMetric::Cosine),
+                None,
+                None,
+                None,
+                Some(SparseMode::None),
+            )
+            .unwrap();
+        let metrics = Arc::new(GraphSnapshotMetrics::default());
+        let outcome =
+            write_collection_snapshots(&manager, &wal, &cols_path, None, &metrics, true).await;
+        let mut manifest = outcome.manifest.expect("manifest must commit");
+        assert_eq!(manifest.format_version, 1);
+        // 篡改：条目宣称 bm25（format 4），但磁盘 payload 没有稀疏段。
+        // EN: Tamper — the entry claims bm25 (format 4) while the on-disk payload
+        // carries no sparse section.
+        manifest.format_version = 4;
+        manifest.collections[0].sparse = Some(1);
+        let manifest_path = collection_snapshots_dir(&cols_path).join("collections.manifest");
+        houyi_persistence::collection_snapshot_file::write_collection_manifest_atomic(
+            &manifest_path,
+            &manifest,
+        )
+        .expect("the tampered manifest is structurally valid");
+        drop(wal);
+
+        let fresh = Arc::new(CollectionManager::new(4, "hnsw"));
+        let result = load_collection_snapshots(&fresh, &cols_path, 1, None, &metrics).await;
+        let err = match result {
+            Ok(_) => panic!("mismatched manifest/payload must not load"),
+            Err(e) => e,
+        };
+        assert!(err.to_string().contains("metadata mismatch"), "got: {err}");
+        assert!(
+            fresh.get("plain").is_none(),
+            "decode failures must not partially mutate the manager"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// P5.0.2 关键不变量：WAL 已 append 但未成功应用的记录不得被快照 checkpoint 覆盖。
     /// EN: Key P5.0.2 invariant — a WAL record appended but not applied must not
     /// be covered by the snapshot checkpoint.
@@ -1908,6 +2754,7 @@ mod tests {
                     .unwrap()
                     .clone(),
             ),
+            sparse: None,
         }];
         let payload =
             houyi_persistence::collection_wal::encode_collection_upsert_batch("docs", 4, &items)
@@ -1956,6 +2803,9 @@ mod tests {
             index_type: "flat".to_string(),
             ha_level: 0,
             metric: Some(1),
+            vector_dtype: Some(0),
+            quantization: None,
+            sparse: None,
             vector_kind: 2,
             file: snapshot_file_name("dummy", floor, 1, 1),
             file_len: 0,

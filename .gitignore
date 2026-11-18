@@ -33,3 +33,13 @@ build/
 # EN: convention), but this repository needs to track scripts/lib.
 !scripts/lib/
 !scripts/lib/**
+
+# 本地推广/汇报材料与内部整理文档：不入库，防误提交。
+# EN: Local promotion/reporting material and internal working docs: never commit.
+promotion/
+docs/PROJECT_TIMELINE.md
+docs/HouyiDB_产品全景报告.pptx
+docs/ARCHITECTURE.md
+docs/ARCHITECTURE.pdf
+docs/architecture/
+docs/DEMO.md

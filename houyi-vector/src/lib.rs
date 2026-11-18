@@ -1,6 +1,6 @@
 use ahash::{AHashMap, AHashSet};
 use async_trait::async_trait;
-use houyi_core::config::{BuildConfig, HnswConfig, VectorConfig};
+use houyi_core::config::{effective_plan_group_size, BuildConfig, HnswConfig, VectorConfig};
 use parking_lot::RwLock as PlRwLock;
 use rayon::prelude::*;
 use std::collections::hash_map::Entry;
@@ -16,7 +16,10 @@ mod graph_snapshot;
 pub mod hii;
 mod hnsw_graph;
 
-pub use graph_snapshot::{peek_graph_snapshot_dims_metric, GraphSnapshotError};
+pub use graph_snapshot::{
+    peek_graph_snapshot_dims_metric, peek_graph_snapshot_dims_metric_dtype,
+    peek_graph_snapshot_dims_metric_dtype_quantization, GraphSnapshotError,
+};
 // 公开 `set_layer_multipliers` 供 houyi-server 启动时调用。
 // Export `set_layer_multipliers` for houyi-server startup.
 pub use hnsw_graph::set_layer_multipliers;
@@ -28,6 +31,18 @@ pub use hnsw_graph::set_layer_multipliers;
 #[doc(hidden)]
 pub use hnsw_graph::ZERO_NORM_BAND_NORM2;
 pub mod distance;
+/// f16/f32 存储编码与跨 dtype 距离核（P1.1）；公开类型经 `lib.rs` 重导出。
+/// EN: f16/f32 storage encoding and cross-dtype distance kernels (P1.1); public
+/// types are re-exported from `lib.rs`.
+mod stored_vector;
+pub use stored_vector::{
+    cosine_prenormalized, distance_between, StoredVector, VectorDtype, VectorRef,
+};
+/// 图侧 int8 标量量化（P2）；`Int8Vector`/`Int8Ref` 为 crate 内部编码。
+/// EN: Graph-side int8 scalar quantization (P2); `Int8Vector`/`Int8Ref` are
+/// crate-internal encodings.
+mod quantization;
+pub use quantization::Quantization;
 #[cfg(all(feature = "simd-neon", target_arch = "aarch64"))]
 mod distance_aarch64_neon;
 /// x86_64 + `feature = "simd-avx2"`：AVX2 距离内联模块（`distance` 内部分派）。
@@ -36,6 +51,13 @@ mod distance_aarch64_neon;
 mod distance_x86_avx2;
 pub mod hnsw_tuning;
 pub mod pq;
+/// 图侧 RaBitQ 1 bit/dim 二值量化（P3）；编码/旋转/距离核均为 crate 内部。
+/// EN: Graph-side RaBitQ 1-bit-per-dim binary quantization (P3); encoding,
+/// rotation, and distance kernels are crate-internal.
+mod rabitq;
+/// 稀疏向量 BM25 倒排索引与 dense+sparse 融合纯函数（P4）。
+/// EN: Sparse BM25 inverted index and dense+sparse fusion helpers (P4).
+pub mod sparse;
 
 pub use hnsw_tuning::{
     default_estimated_cardinality, infer_hnsw_params, load_hnsw_initial_params, InferredHnswParams,
@@ -43,6 +65,25 @@ pub use hnsw_tuning::{
 
 pub type VectorId = u64;
 const EMPTY_NEIGHBOR: u64 = u64::MAX;
+
+/// int8 图侧的 ANN 候选宽度乘数：量化距离只是近似，扩宽束宽补偿召回损失，
+/// 最终 top-k 仍由主表原始向量精确重排。
+/// EN: ANN candidate-width multiplier for int8 graphs: quantized distances are
+/// approximate, so widen the beam to recover recall; the final top-k is still
+/// reranked exactly on raw main-store vectors.
+const INT8_ANN_K_MULTIPLIER: usize = 2;
+
+/// RaBitQ 图侧的 ANN 候选宽度乘数：1 bit/dim 估计误差更大，束宽比 int8 再放大
+/// 一档；由 recall 门禁与性能门禁双约束定档。取 16 的带宽理由：每候选读
+/// `D/8` 字节码字，`16·D/8 = 2·D` 字节，恰与 int8 乘数 2 的 `2·D` 字节码字
+/// 相同——图遍历的工作集带宽与 int8 同档，而候选数多 8 倍以补 1 bit 误差。
+/// EN: ANN candidate-width multiplier for RaBitQ graphs: 1-bit-per-dim estimates
+/// carry more error than int8, so the beam is widened further; tuned by the
+/// dual recall/perf gates. The value 16 is bandwidth-justified: each candidate
+/// reads `D/8` bytes of codes, and `16·D/8 = 2·D` bytes exactly matches the
+/// int8 multiplier 2's `2·D` bytes — graph traversal costs int8-grade working
+/// set bandwidth while covering 8× more candidates for the 1-bit error.
+const RABITQ_ANN_K_MULTIPLIER: usize = 16;
 
 /// 串行合图拆成「读锁规划 + 短写锁提交」。默认开启；
 /// `HOUYI_HNSW_PLAN_APPLY` 取 `0`/`false`/`off`/`no`/空值（大小写不敏感、
@@ -59,6 +100,232 @@ fn plan_apply_enabled() -> bool {
         ),
         Err(_) => true,
     })
+}
+
+/// 解析 `HOUYI_HNSW_GROUP_REPAIR` 的原始值：缺省 `(4, 16)`；`off`/`0`/空串
+/// 关闭（唯一显式退出方式）；无法解析或非法数值（`abc`、`0,16`、`4,0`、
+/// `4,abc`）、多余字段（`4,16,32`）一律警告一次并整体回落缺省——手误绝不能
+/// 静默关掉这道召回安全网，也不能静默改用半截配置。
+/// EN: Parse the raw `HOUYI_HNSW_GROUP_REPAIR` value: default `(4, 16)`;
+/// `off`/`0`/empty disables (the only explicit opt-out); unparsable or invalid
+/// numbers (`abc`, `0,16`, `4,0`, `4,abc`) and extra fields (`4,16,32`) warn
+/// once and fall back to the whole default, so a typo can neither silently
+/// disable this recall safety net nor silently half-apply a config.
+fn parse_group_repair(raw: Option<&str>) -> Option<(usize, usize)> {
+    const DEFAULT: (usize, usize) = (4, 16);
+    let Some(raw) = raw else {
+        return Some(DEFAULT);
+    };
+    let raw = raw.trim();
+    if raw.is_empty() || raw == "0" || raw.eq_ignore_ascii_case("off") {
+        return None;
+    }
+    let mut parts = raw.split(',');
+    let min_degree = parts
+        .next()
+        .map(str::trim)
+        .and_then(|s| s.parse::<usize>().ok());
+    // 窗口令牌「存在但非法」与「存在多余字段」都是手误信号：标记后整体
+    // 回落缺省，而不是静默使用 16 或缺省尾部字段。
+    // EN: A provided-but-invalid window token or extra fields are typo signals:
+    // flag them and fall back to the whole default instead of silently using
+    // 16 or dropping the tail.
+    let mut invalid = false;
+    let window = match parts.next() {
+        Some(tok) => match tok.trim().parse::<usize>() {
+            Ok(w) if w > 0 => w,
+            _ => {
+                invalid = true;
+                DEFAULT.1
+            }
+        },
+        None => DEFAULT.1,
+    };
+    if parts.next().is_some() {
+        invalid = true;
+    }
+    match min_degree {
+        Some(m) if m > 0 && !invalid => Some((m, window)),
+        _ => {
+            tracing::warn!(
+                value = raw,
+                "invalid HOUYI_HNSW_GROUP_REPAIR; using default (4,16)"
+            );
+            Some(DEFAULT)
+        }
+    }
+}
+
+// 连通兜底的最小累计行数：小于该值的追赶式 drain 先攒行，攒够或构建
+// 突发结束（worker 空闲 tick）时再跑一次全图 BFS，避免每个 100 行小批次
+// 都扫全图放大写锁延迟。
+// EN: Minimum accumulated rows for the connectivity backstop: smaller
+// catch-up drains accumulate rows; the full-graph BFS runs once the threshold
+// is reached or the build burst ends (worker idle tick), avoiding a graph-wide
+// scan on every 100-row batch.
+#[doc(hidden)]
+pub const MIN_CONNECTIVITY_SWEEP_ROWS: usize = 256;
+
+// 空闲兜底分层：存在未扫行且连续 3 个空 tick 后，
+//   - ≥64 行：立即扫（持续写入很快成批，低频写入攒到 64 行才扫一次）；
+//   - 16..63 行：再空闲 150 tick（默认 20ms tick ≈3s）后扫；
+//   - 1..15 行：再空闲 15000 tick（≈5 分钟）后扫。该档只在分片完全空闲时
+//     可达；持续写入的分片由 ≥64 行档在攒满后兜底（或关停/drain 显式兜底），
+//     因此长跑服务不会永久遗留不可达小岛，低频写入也不会每次触发全图 BFS。
+// EN: Layered idle backstop after 3 empty ticks with unswept rows:
+//   - >=64 rows: sweep immediately (steady writers batch quickly, low-rate
+//     writers coalesce until 64 rows);
+//   - 16..63 rows: after another 150 ticks (~3s at the default 20ms tick);
+//   - 1..15 rows: after another 15_000 ticks (~5 minutes). This tier is only
+//     reachable on a fully idle shard; continuously written shards are covered
+//     by the >=64 tier once it fills (or by the explicit shutdown/drain
+//     sweep), so no unreachable island survives forever and low-rate writers
+//     never trigger a full-graph BFS per insert.
+const IDLE_CONNECTIVITY_SWEEP_TICKS: u32 = 3;
+#[doc(hidden)]
+pub const MIN_IDLE_CONNECTIVITY_SWEEP_ROWS: usize = 64;
+const IDLE_CONNECTIVITY_FORCE_SWEEP_TICKS: u32 = 150;
+const IDLE_CONNECTIVITY_FORCE_MIN_ROWS: usize = 16;
+const IDLE_CONNECTIVITY_TINY_TAIL_SWEEP_TICKS: u32 = 15_000;
+
+/// 空闲兜底判定（纯函数便于单测）：至少 3 个空 tick 且存在未扫行；随后按
+/// 尾批大小分层触发（64 即时 / 16+ 强制窗口 / 极小尾批长窗口）。
+/// EN: Idle-sweep predicate (pure for unit tests): >=3 empty ticks with unswept
+/// rows, then tiered by tail size (64 immediate / 16+ forced window / tiny-tail
+/// long window).
+fn should_run_idle_connectivity_sweep(idle_ticks: u32, unswept_rows: usize) -> bool {
+    if idle_ticks < IDLE_CONNECTIVITY_SWEEP_TICKS || unswept_rows == 0 {
+        return false;
+    }
+    if unswept_rows >= MIN_IDLE_CONNECTIVITY_SWEEP_ROWS {
+        return true;
+    }
+    if unswept_rows >= IDLE_CONNECTIVITY_FORCE_MIN_ROWS {
+        return idle_ticks >= IDLE_CONNECTIVITY_FORCE_SWEEP_TICKS;
+    }
+    idle_ticks >= IDLE_CONNECTIVITY_TINY_TAIL_SWEEP_TICKS
+}
+
+/// 分组规划后的孤点补救参数：缺省 `(4, 16)` 开启；`HOUYI_HNSW_GROUP_REPAIR`
+/// 可覆写为 `"min_degree,window"`（window 缺省 16），`off`/`0` 关闭供 A/B 与
+/// 故障排查；解析规则与回落见 `parse_group_repair`（进程内一次读取）。
+/// EN: Post-group orphan-repair params: on by default at `(4, 16)`; the
+/// `HOUYI_HNSW_GROUP_REPAIR` env (`"min_degree,window"`, window defaults to 16)
+/// overrides them, and `off`/`0` disables the pass for A/B and debugging; parse
+/// and fallback rules in `parse_group_repair` (read once per process).
+fn group_repair_params() -> Option<(usize, usize)> {
+    static CFG: std::sync::OnceLock<Option<(usize, usize)>> = std::sync::OnceLock::new();
+    *CFG.get_or_init(|| {
+        parse_group_repair(std::env::var("HOUYI_HNSW_GROUP_REPAIR").ok().as_deref())
+    })
+}
+
+/// 节点被替换或删除后的**局部**孤点补救：`remove_node` 只清理被删节点的
+/// 回边，它的旧邻居可能因此跌到 L0 度 0（替换场景下新节点按距离选邻居，
+/// 未必再连回这些邻居），成为查询不可达孤岛。这里把「本批 id + 受影响旧
+/// 邻居」作为候选集合，复用分组补救（id 顺序窗口内补到 `min_degree`）；
+/// 成本只随受影响邻居数增长，不对全图做 O(N) 扫描。受影响邻居在采集时即
+/// 按集合去重（成簇数据里 N 个替换节点的邻居高度重叠，先扩后排序会在写锁
+/// 内制造 N×M 的缓冲与排序）。候选均为持图写锁期间采集的存活节点（删除
+/// 路径持墓碑写锁，并发插入/删除被排除）。返回实际补边数，供诊断日志使用。
+/// EN: Local orphan repair after a node is replaced or deleted: `remove_node`
+/// only strips the victim's reciprocal edges, so its old neighbors can fall to
+/// L0 degree 0 (a replacement picks new neighbors by distance and may not link
+/// back), becoming query-unreachable islands. This repairs the bounded
+/// candidate set "batch ids + affected old neighbors" with the same
+/// group-repair rule (fill to `min_degree` within an id-order window); cost
+/// scales with the affected-neighbor count, not a full-graph O(N) scan.
+/// Affected neighbors are deduped at capture time as a set (on clustered data
+/// N replacements share most neighbors, and an expand-then-sort buffer would
+/// allocate/sort N×M entries inside the write lock). Candidates are captured
+/// under the graph write lock during the tombstone window, so no concurrent
+/// insert/delete can race in. Returns the number of edges actually added for
+/// diagnostics.
+fn repair_after_node_updates(
+    graph: &mut hnsw_graph::HnswGraph,
+    batch_ids: &[VectorId],
+    affected_old_neighbors: &AHashSet<VectorId>,
+) -> usize {
+    // 仅 fresh 插入时没有旧邻居被移除，无需补救。
+    // EN: With fresh-only inserts no old neighbor lost an edge; nothing to repair.
+    if affected_old_neighbors.is_empty() {
+        return 0;
+    }
+    let Some((min_degree, window)) = group_repair_params() else {
+        return 0;
+    };
+    let mut candidates: Vec<VectorId> =
+        Vec::with_capacity(batch_ids.len() + affected_old_neighbors.len());
+    candidates.extend_from_slice(batch_ids);
+    candidates.extend(affected_old_neighbors.iter().copied());
+    // 删除路径的候选集合可能只剩 1 个孤儿：补入**仍有余量**的锚点（入口点
+    // 优先，其次任一有空位的存活节点）。饱和的入口会被 `repair_group_links`
+    // 在采集阶段过滤掉，直接补入等于没补。
+    // EN: The delete path's candidate set may hold a single orphan; add an
+    // anchor that still has spare capacity (entry point first, then any live
+    // node with a free slot). A saturated entry point would be filtered out at
+    // collection time by `repair_group_links`, so adding it would be a no-op.
+    if candidates.len() == 1 {
+        let orphan = candidates[0];
+        let max_deg = graph.l0_max_degree();
+        if let Some(ep) = graph
+            .entry_point()
+            .filter(|ep| *ep != orphan && graph.l0_degree(*ep) < max_deg)
+        {
+            candidates.push(ep);
+        }
+        if candidates.len() == 1 {
+            if let Some(anchor) = graph.find_spare_l0_anchor(orphan) {
+                candidates.push(anchor);
+            }
+        }
+    }
+    candidates.sort_unstable();
+    candidates.dedup();
+    // 与 `repair_group_links` 相同地按 L0 上限钳制阈值：环境变量若把
+    // min_degree 调到高于上限，未钳制的比较会让「无可行伙伴」诊断在每次
+    // 删除都误报（健康图也永远达不到该阈值）。
+    // EN: Clamp the threshold to the L0 cap exactly as `repair_group_links`
+    // does: an env override above the cap would otherwise make the
+    // "no feasible partner" diagnostic fire on every delete, even in a
+    // healthy graph.
+    let max_deg = graph.l0_max_degree();
+    let min_degree_eff = min_degree.min(max_deg);
+    let had_orphan = candidates
+        .iter()
+        .any(|id| graph.l0_degree(*id) < min_degree_eff);
+    if candidates.len() < 2 {
+        // 无锚点可用（入口点饱和且没有其它余量节点）：这是最严重的
+        // 「无可行伙伴」形态，必须在提前返回前显式诊断。
+        // EN: No anchor (saturated entry point and no other node with spare
+        // capacity): the severest "no feasible partner" shape must be diagnosed
+        // before the early return.
+        if had_orphan {
+            tracing::debug!(
+                candidates = candidates.len(),
+                min_degree = min_degree_eff,
+                window,
+                "orphan repair found no feasible partner"
+            );
+        }
+        return 0;
+    }
+    let added = graph.repair_group_links(&candidates, min_degree, window);
+    // 区分「健康图正常 0 补边」与「确有孤儿但所有候选被窗口/饱和挡住」：
+    // 后者才是需要运维关注的诊断；前者在大图删除时每次都会发生，不能刷屏。
+    // EN: Distinguish a healthy graph's normal zero-add from a real orphan
+    // blocked by window/saturation: only the latter deserves operator
+    // attention, while the former happens on every delete in a large graph and
+    // must not spam the logs.
+    if had_orphan && added == 0 {
+        tracing::debug!(
+            candidates = candidates.len(),
+            min_degree = min_degree_eff,
+            window,
+            "orphan repair found no feasible partner"
+        );
+    }
+    added
 }
 
 /// 读锁规划/短写锁提交路径的逐批诊断日志（`HOUYI_HNSW_PLAN_APPLY_LOG=1`，默认关闭）。
@@ -288,10 +555,18 @@ impl NodeNeighbors {
             if idx >= capacity {
                 return false;
             }
-            for scan in 0..idx {
-                if self.slots[scan].load(Ordering::Acquire) == neighbor {
-                    return true;
-                }
+            // 已发布前缀内做重复检查；用迭代器避免 clippy 1.100 的
+            // needless_range_loop（语义与下标扫描一致）。
+            // EN: Duplicate check over the published prefix; use an iterator
+            // to satisfy clippy 1.100's needless_range_loop (same semantics as
+            // the indexed scan).
+            if self
+                .slots
+                .iter()
+                .take(idx)
+                .any(|slot| slot.load(Ordering::Acquire) == neighbor)
+            {
+                return true;
             }
             if self
                 .len
@@ -443,11 +718,18 @@ pub enum HnswBatchPlanMode {
 }
 
 /// 单次 `run_async_builder_once` 的结果；若本队列为空未 drain，则 `flushed==0` 且 `plan_mode==None`。
-/// EN: When the queue was empty, `flushed==0` and `plan_mode==None`.
+/// `plan_apply` 标记本批是否真正走了「读锁规划 + 短写锁提交」路径：调用方回退
+/// 到旧合图路径时为 false，使门禁能验证被测路径而不是只验证召回数字。
+/// EN: One `run_async_builder_once` outcome; when the queue was empty, `flushed==0`
+/// and `plan_mode==None`. `plan_apply` marks whether this batch really took the
+/// read-lock-plan/short-write-lock-apply path: it is false when the caller fell
+/// back to the legacy merge path, so gates can verify the exercised path rather
+/// than only the recall number.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AsyncBuilderOnceReport {
     pub flushed: usize,
     pub plan_mode: Option<HnswBatchPlanMode>,
+    pub plan_apply: bool,
 }
 
 /// 热缓冲/构建队列条目：向量 ID + 行内拷贝的向量数据。
@@ -459,12 +741,33 @@ type BufferEntry = (VectorId, Vec<f32>);
 pub struct HotBufferIndex {
     dims: usize,
     metric: DistanceMetric,
+    /// 存储编码（创建后不可变）：f32 默认；f16 在合图时一次性量化。非余弦时
+    /// 主表与图共享同一 `Arc`；余弦时主表保留原始向量、图持归一化向量。
+    /// hotbuffer/构建队列始终保留写入时的 f32 原值。
+    /// EN: Storage encoding (immutable after creation): f32 by default; f16
+    /// quantizes once at merge time. Non-cosine shares one `Arc` between the main
+    /// map and the graph; cosine keeps the raw vector in the main map and the
+    /// normalized one in the graph. The hot buffer and builder queue always hold
+    /// the raw f32 rows until merge.
+    dtype: VectorDtype,
+    /// 图侧量化方式（创建后不可变）：`none` 默认；`int8` 只压缩图内副本，
+    /// 主表/hot/构建队列始终保留原始 f32/f16 向量，最终 top-k 由主表精确重排。
+    /// EN: Graph-side quantization (immutable after creation): `none` by default;
+    /// `int8` compresses only the graph copy while the main map / hot buffer /
+    /// builder queue keep raw f32/f16 vectors, with exact final top-k rescoring.
+    quantization: Quantization,
     hot_buffer: Arc<RwLock<Vec<BufferEntry>>>,
-    /// 主存向量表：按 `id` 索引，Arc 共享避免与 HnswGraph 重复存储。
-    /// EN: `HashMap` with `Arc` sharing to avoid duplicating vectors in HnswGraph.
-    main_index: Arc<RwLock<AHashMap<VectorId, Arc<Vec<f32>>>>>,
+    /// 主存向量表：按 `id` 索引，按 `dtype` 存储（f32 默认）；图快照恢复后与
+    /// `HnswGraph::vectors` 共享同一批 `Arc`。
+    /// EN: Main vector map keyed by id, stored in `dtype` (f32 by default); after
+    /// graph-snapshot restore it shares the same `Arc`s as `HnswGraph::vectors`.
+    main_index: Arc<RwLock<AHashMap<VectorId, Arc<StoredVector>>>>,
     builder_queue: Arc<RwLock<VecDeque<BufferEntry>>>,
     metrics: Arc<BuilderMetrics>,
+    /// 自上次连通兜底以来 flush 的行数（worker 空闲时强制扫一次尾批）。
+    /// EN: Rows flushed since the last connectivity sweep (the worker forces
+    /// one final sweep when the build burst goes idle).
+    connectivity_sweep_rows: Arc<AtomicUsize>,
     /// Full HNSW graph (vectors duplicated for O(1) distance during search).
     /// 中文：标准 HNSW 分层图；与 `main_index` 同步插入。
     /// `Arc` 便于后续将构图 CPU 移出 Tokio（`spawn_blocking`）而不改调用方 API。
@@ -602,6 +905,41 @@ impl HotBufferIndex {
         )
     }
 
+    /// 带存储编码构造（P1.3）：`dtype` 创建后不可变。
+    /// EN: Construct with an explicit storage dtype (P1.3); immutable afterwards.
+    pub fn new_with_metric_and_dtype(
+        dims: usize,
+        metric: DistanceMetric,
+        dtype: VectorDtype,
+    ) -> Self {
+        Self::new_with_metric_and_config_and_dtype(
+            dims,
+            metric,
+            dtype,
+            &VectorConfig::from_env(),
+            &HnswConfig::from_env(),
+        )
+    }
+
+    /// 带存储编码与图侧量化构造（P2）；两者创建后均不可变。
+    /// EN: Construct with an explicit storage dtype and graph-side quantization
+    /// (P2); both are immutable afterwards.
+    pub fn new_with_metric_and_dtype_and_quantization(
+        dims: usize,
+        metric: DistanceMetric,
+        dtype: VectorDtype,
+        quantization: Quantization,
+    ) -> Self {
+        Self::new_with_metric_and_config_and_dtype_and_quantization(
+            dims,
+            metric,
+            dtype,
+            quantization,
+            &VectorConfig::from_env(),
+            &HnswConfig::from_env(),
+        )
+    }
+
     /// 使用外部配置构造（用于集中配置管理）。
     /// Construct with external configs.
     pub fn new_with_metric_and_config(
@@ -610,23 +948,72 @@ impl HotBufferIndex {
         vector_cfg: &VectorConfig,
         hnsw_cfg: &HnswConfig,
     ) -> Self {
+        Self::new_with_metric_and_config_and_dtype(
+            dims,
+            metric,
+            VectorDtype::F32,
+            vector_cfg,
+            hnsw_cfg,
+        )
+    }
+
+    /// 外部配置 + 存储编码构造；服务端按 collection 的 `vector_dtype` 传入。
+    /// EN: External configs plus storage dtype; the server passes the collection's
+    /// `vector_dtype` here.
+    pub fn new_with_metric_and_config_and_dtype(
+        dims: usize,
+        metric: DistanceMetric,
+        dtype: VectorDtype,
+        vector_cfg: &VectorConfig,
+        hnsw_cfg: &HnswConfig,
+    ) -> Self {
+        Self::new_with_metric_and_config_and_dtype_and_quantization(
+            dims,
+            metric,
+            dtype,
+            Quantization::None,
+            vector_cfg,
+            hnsw_cfg,
+        )
+    }
+
+    /// 外部配置 + 存储编码 + 图侧量化构造（P2）；服务端按 collection 的
+    /// `vector_dtype` 与 `quantization` 传入。旧构造器等价于 quantization=none。
+    /// EN: External configs plus storage dtype and graph-side quantization (P2);
+    /// the server passes the collection's `vector_dtype` and `quantization`. Legacy
+    /// constructors are the quantization=none alias.
+    pub fn new_with_metric_and_config_and_dtype_and_quantization(
+        dims: usize,
+        metric: DistanceMetric,
+        dtype: VectorDtype,
+        quantization: Quantization,
+        vector_cfg: &VectorConfig,
+        hnsw_cfg: &HnswConfig,
+    ) -> Self {
         let (p, _) = crate::hnsw_tuning::load_hnsw_initial_params(dims, vector_cfg);
         Self {
             dims,
             metric,
+            dtype,
+            quantization,
             hot_buffer: Arc::new(RwLock::new(Vec::new())),
             main_index: Arc::new(RwLock::new(AHashMap::new())),
             builder_queue: Arc::new(RwLock::new(VecDeque::new())),
             metrics: Arc::new(BuilderMetrics::default()),
-            hnsw: Arc::new(PlRwLock::new(hnsw_graph::HnswGraph::new(
-                dims,
-                metric,
-                p.m,
-                p.ef_construction,
-                p.ef_search,
-                hnsw_cfg.seed,
-                hnsw_cfg.max_layers,
-            ))),
+            connectivity_sweep_rows: Arc::new(AtomicUsize::new(0)),
+            hnsw: Arc::new(PlRwLock::new(
+                hnsw_graph::HnswGraph::new_with_dtype_and_quantization(
+                    dims,
+                    metric,
+                    dtype,
+                    quantization,
+                    p.m,
+                    p.ef_construction,
+                    p.ef_search,
+                    hnsw_cfg.seed,
+                    hnsw_cfg.max_layers,
+                ),
+            )),
             hnsw_m: Arc::new(AtomicUsize::new(p.m)),
             hnsw_ef_construction: Arc::new(AtomicUsize::new(p.ef_construction)),
             hnsw_ef_search: Arc::new(AtomicUsize::new(p.ef_search)),
@@ -637,6 +1024,18 @@ impl HotBufferIndex {
             write_generation: Arc::new(AtomicU64::new(0)),
             build_config: BuildConfig::from_env(),
         }
+    }
+
+    /// 存储编码（创建后不可变）。
+    /// EN: Storage encoding (immutable after creation).
+    pub fn vector_dtype(&self) -> VectorDtype {
+        self.dtype
+    }
+
+    /// 图侧量化方式（创建后不可变）。
+    /// EN: Graph-side quantization (immutable after creation).
+    pub fn vector_quantization(&self) -> Quantization {
+        self.quantization
     }
 
     /// 使用外部 build 配置（供 houyi-server 传入集中管理的配置）。
@@ -655,6 +1054,19 @@ impl HotBufferIndex {
             DistanceMetric::Cosine => cosine_distance(a, b),
             DistanceMetric::InnerProduct => distance::inner_product_distance(a, b),
             DistanceMetric::L1 => distance::l1_distance(a, b),
+        }
+    }
+
+    /// 查询（f32）与任意 dtype 存储向量的距离。f32×f32 仍走原有分派，
+    /// 保证默认路径的数值行为逐位不变；f16/混合组合在 f32 上累加。
+    /// EN: Distance between an f32 query and a stored vector of any dtype. The
+    /// f32×f32 case keeps the original dispatch so the default path stays
+    /// bit-for-bit unchanged; f16/mixed combinations accumulate in f32.
+    #[inline]
+    fn distance_ref(&self, query: &[f32], v: VectorRef<'_>) -> f32 {
+        match v {
+            VectorRef::F32(b) => self.distance(query, b),
+            VectorRef::F16(_) => distance_between(VectorRef::F32(query), v, self.metric),
         }
     }
 
@@ -706,7 +1118,7 @@ impl HotBufferIndex {
         k: usize,
         approx_sorted: &[(VectorId, f32)],
         hot: &[(VectorId, Vec<f32>)],
-        main: &AHashMap<VectorId, Arc<Vec<f32>>>,
+        main: &AHashMap<VectorId, Arc<StoredVector>>,
     ) {
         if std::env::var("HOUYI_VECTOR_SANITY_CHECK").ok().as_deref() != Some("1") {
             return;
@@ -719,7 +1131,7 @@ impl HotBufferIndex {
         let mut brute: Vec<(VectorId, f32)> = main
             .iter()
             .take(sample_cap)
-            .map(|(id, v)| (*id, self.distance(query, v)))
+            .map(|(id, v)| (*id, self.distance_ref(query, v.as_view())))
             .collect();
         brute.sort_by(|a, b| a.1.total_cmp(&b.1).then(a.0.cmp(&b.0)));
         let brute_top: Vec<VectorId> = brute.into_iter().take(k).map(|(id, _)| id).collect();
@@ -761,6 +1173,8 @@ impl HotBufferIndex {
     /// drops already-drained batches.
     pub async fn run_async_builder_once(&self) -> AsyncBuilderOnceReport {
         let cfg = self.build_config.clone();
+        let dtype = self.dtype;
+        let quantization = self.quantization;
         let builder_gate = Arc::clone(&self.builder_gate);
         let builder_queue = Arc::clone(&self.builder_queue);
         let tombstones = Arc::clone(&self.tombstones);
@@ -768,6 +1182,7 @@ impl HotBufferIndex {
         let main_index = Arc::clone(&self.main_index);
         let hnsw = Arc::clone(&self.hnsw);
         let metrics = Arc::clone(&self.metrics);
+        let connectivity_sweep_rows = Arc::clone(&self.connectivity_sweep_rows);
         let write_generation = Arc::clone(&self.write_generation);
         let hnsw_ef_search = Arc::clone(&self.hnsw_ef_search);
         let hnsw_m = Arc::clone(&self.hnsw_m);
@@ -779,6 +1194,8 @@ impl HotBufferIndex {
         let join = tokio::spawn(async move {
             let inner = tokio::spawn(Self::run_async_builder_once_inner(
                 cfg,
+                dtype,
+                quantization,
                 builder_gate,
                 builder_queue,
                 tombstones,
@@ -786,6 +1203,7 @@ impl HotBufferIndex {
                 main_index,
                 hnsw,
                 metrics,
+                Arc::clone(&connectivity_sweep_rows),
                 write_generation,
                 hnsw_ef_search,
                 hnsw_m,
@@ -816,16 +1234,57 @@ impl HotBufferIndex {
         }
     }
 
+    /// 显式执行一次全层连通性兜底（worker 空闲 tick、测试与门禁可调用）。
+    /// 返回新增桥边总数；同时把「自上次兜底以来的行数」清零。
+    /// EN: Explicitly run one all-layer connectivity backstop (worker idle tick,
+    /// tests, and gates may call it). Returns the total added bridge edges and
+    /// resets the "rows since last sweep" counter.
+    pub async fn ensure_connectivity(&self) -> usize {
+        let hnsw = Arc::clone(&self.hnsw);
+        let rows = Arc::clone(&self.connectivity_sweep_rows);
+        match tokio::task::spawn_blocking(move || {
+            // 在持图写锁时取走计数：所有扫描都在同一把图锁下串行，计数与
+            // 图内容因此一一对应，不会被并发增量或重复扣减搅乱。
+            // EN: Take the counter while holding the graph write lock: every sweep
+            // serializes on that lock, so the count matches the graph contents and
+            // concurrent increments or double subtraction cannot corrupt it.
+            let mut graph = hnsw.write();
+            let _ = rows.swap(0, Ordering::Relaxed);
+            graph.ensure_connectivity()
+        })
+        .await
+        {
+            Ok(added) => added,
+            Err(e) => {
+                tracing::warn!(error = %e, "connectivity sweep task failed");
+                0
+            }
+        }
+    }
+
+    /// 自上次连通兜底以来尚未扫描的行数（测试用于钉住尾批触发语义；不属
+    /// 稳定公共 API，仅集成门禁使用）。
+    /// EN: Rows not yet covered by a connectivity sweep (tests pin the tail
+    /// trigger semantics; not a stable public API, used only by integration
+    /// gates).
+    #[doc(hidden)]
+    pub fn unswept_rows_since_connectivity_sweep(&self) -> usize {
+        self.connectivity_sweep_rows.load(Ordering::Relaxed)
+    }
+
     #[allow(clippy::too_many_arguments)]
     async fn run_async_builder_once_inner(
         cfg: BuildConfig,
+        dtype: VectorDtype,
+        quantization: Quantization,
         builder_gate: Arc<Mutex<()>>,
         builder_queue: Arc<RwLock<VecDeque<BufferEntry>>>,
         tombstones: Arc<RwLock<AHashSet<VectorId>>>,
         commit_gate: Arc<RwLock<()>>,
-        main_index: Arc<RwLock<AHashMap<VectorId, Arc<Vec<f32>>>>>,
+        main_index: Arc<RwLock<AHashMap<VectorId, Arc<StoredVector>>>>,
         hnsw: Arc<PlRwLock<hnsw_graph::HnswGraph>>,
         metrics: Arc<BuilderMetrics>,
+        connectivity_sweep_rows: Arc<AtomicUsize>,
         write_generation: Arc<AtomicU64>,
         hnsw_ef_search: Arc<AtomicUsize>,
         hnsw_m: Arc<AtomicUsize>,
@@ -846,15 +1305,26 @@ impl HotBufferIndex {
         let drain_all = cfg.optimize_drain_all;
         let breakdown_enabled = cfg.breakdown_enabled;
         let drain_t0 = std::time::Instant::now();
+        // 本批是否把队列排空：只有排空时才做连通性兜底（否则后续 drain
+        // 还会引入新桥边，提前 BFS 既贵又可能连接后又被剪）。
+        // EN: Whether this drain empties the queue; the connectivity sweep
+        // only runs then (later drains would add new bridge edges anyway, and an
+        // early BFS is both costly and prone to links that get pruned again).
+        let queue_empty_after;
         let staged = {
             let mut queue = builder_queue.write().await;
             if queue.is_empty() {
+                queue_empty_after = true;
                 Vec::new()
             } else if drain_all {
-                queue.drain(..).collect::<Vec<_>>()
+                let staged = queue.drain(..).collect::<Vec<_>>();
+                queue_empty_after = true;
+                staged
             } else {
                 let n = queue.len().min(max_build_batch);
-                queue.drain(..n).collect::<Vec<_>>()
+                let staged = queue.drain(..n).collect::<Vec<_>>();
+                queue_empty_after = queue.is_empty();
+                staged
             }
         };
         let drain_elapsed_us = drain_t0.elapsed().as_micros();
@@ -862,6 +1332,7 @@ impl HotBufferIndex {
             return AsyncBuilderOnceReport {
                 flushed: 0,
                 plan_mode: None,
+                plan_apply: false,
             };
         }
 
@@ -893,6 +1364,7 @@ impl HotBufferIndex {
             return AsyncBuilderOnceReport {
                 flushed: 0,
                 plan_mode: None,
+                plan_apply: false,
             };
         }
         let collect_edge_metrics = cfg.collect_edge_metrics;
@@ -905,6 +1377,8 @@ impl HotBufferIndex {
         let plan_group_size = parallel_chunk_size
             .saturating_mul(parallel_plan_group_chunks)
             .max(1);
+        let plan_group_min = cfg.plan_group_min;
+        let plan_group_graph_divisor = cfg.plan_group_graph_divisor;
         let seed_serial_points = cfg.seed_serial_points;
         let commit_chunk = cfg.commit_chunk;
         let bulk_ef_cap = cfg.bulk_ef_construction_cap;
@@ -917,6 +1391,12 @@ impl HotBufferIndex {
             let mut fresh_serial_us: u128 = 0;
             let mut upsert_serial_us: u128 = 0;
             let mut serial_fallback_us: u128 = 0;
+            // 替换/删除后的局部补救实际补边数：进入 breakdown 日志，便于运维
+            // 判断安全网是否真的生效（best-effort 补救可能合法地 0 补边）。
+            // EN: Edges actually added by post-replace/delete local repair, logged
+            // in the breakdown so operators can tell whether the safety net fired
+            // (a best-effort repair may legitimately add zero edges).
+            let mut upsert_repair_edges: usize = 0;
             let mut group_count: usize = 0;
             let mut fresh_count: usize = 0;
             let mut upsert_count: usize = 0;
@@ -946,6 +1426,7 @@ impl HotBufferIndex {
                 return AsyncBuilderOnceReport {
                     flushed: 0,
                     plan_mode: None,
+                    plan_apply: false,
                 };
             }
             // 默认路径：读锁规划 + 短写锁提交（fresh 批次）；失败回退既有路径。
@@ -968,9 +1449,36 @@ impl HotBufferIndex {
                     hnsw_ef_search,
                     seed_serial_points,
                     plan_group_size,
+                    plan_group_min,
+                    plan_group_graph_divisor,
                     parallel_batch_build,
                 ) {
-                    Ok(report) => return report,
+                    Ok(report) => {
+                        // plan/apply 成功返回后队列已排空：做全层连通性兜底。
+                        // EN: After a successful plan/apply return the queue is
+                        // empty: run the all-layer connectivity backstop.
+                        // 排空且**累计** ≥256 行才做连通兜底：更小的尾批先攒
+                        // 行，等构建突发结束由 worker 空闲 tick 强制扫尾。
+                        // EN: Sweep only when the queue is empty and the
+                        // **accumulated** rows reach 256; smaller tail batches
+                        // accumulate and the worker's idle tick forces a final
+                        // sweep once the build burst ends.
+                        let rows_since = connectivity_sweep_rows
+                            .fetch_add(report.flushed, Ordering::Relaxed)
+                            + report.flushed;
+                        if queue_empty_after && rows_since >= MIN_CONNECTIVITY_SWEEP_ROWS {
+                            let mut graph = hnsw_write_guard(&hnsw);
+                            // 持图写锁取走计数（扫描彼此串行，计数与图内容对应）。
+                            // EN: Take the counter under the graph write lock (sweeps
+                            // serialize, so the count matches the graph contents).
+                            let _ = connectivity_sweep_rows.swap(0, Ordering::Relaxed);
+                            let added = graph.ensure_connectivity();
+                            if added > 0 {
+                                tracing::debug!(added, "[connectivity-sweep]");
+                            }
+                        }
+                        return report;
+                    }
                     Err(returned) => built = returned,
                 }
             }
@@ -1023,11 +1531,26 @@ impl HotBufferIndex {
                         let take = need.min(fresh_all.len());
                         let seed_t0 = std::time::Instant::now();
                         for (id, vector) in fresh_all.drain(..take) {
-                            let arc_v = Arc::new(vector);
-                            main.insert(id, Arc::clone(&arc_v));
-                            guard.insert_with_visited_entry_hint(
+                            // 一次量化、主表与图共享同一句柄（余弦时主表保留原始、
+                            // 图侧归一化）。
+                            // EN: Quantize once and share one handle between the main
+                            // map and the graph (cosine keeps raw in main, normalized
+                            // in the graph).
+                            let hnsw_graph::PreparedInsert {
+                                main: stored,
+                                graph,
+                                graph_query,
+                            } = hnsw_graph::prepare_insert_stored(
+                                guard.metric(),
+                                dtype,
+                                quantization,
+                                vector,
+                            );
+                            main.insert(id, stored);
+                            guard.insert_prepared_with_visited_entry_hint(
                                 id,
-                                arc_v,
+                                graph,
+                                graph_query.as_ref(),
                                 &mut visited_build,
                                 None,
                             );
@@ -1037,28 +1560,73 @@ impl HotBufferIndex {
                     }
                 }
 
-                // fresh 分组并行规划 + 单次批量原子合入，降低提交轮次。
-                // EN: Grouped parallel planning + single batch apply to reduce serial commit rounds.
-                let plan_group_size =
-                    parallel_chunk_size.saturating_mul(parallel_plan_group_chunks);
+                // fresh 分组并行规划 + 单次批量原子合入，降低提交轮次。组宽按
+                // 当前图规模自适应收敛（见 `effective_plan_group_size`）：每组只
+                // 对组前快照规划，组内兄弟互不可见，固定大组在成簇数据上会把
+                // 新节点剪成孤岛；小图用小组保质量，大图仍用配置上限保吞吐。
+                // EN: Grouped parallel planning + single batch apply to cut serial
+                // commit rounds. The group width adapts to the current graph
+                // (`effective_plan_group_size`): each group plans only against the
+                // pre-group snapshot and siblings are invisible to each other, so
+                // a fixed large group prunes clustered siblings into islands; small
+                // graphs use small groups for quality, large ones keep the cap.
                 let levels_t0 = std::time::Instant::now();
                 let fresh_levels = guard.draw_random_levels(fresh_all.len());
                 levels_us = levels_t0.elapsed().as_micros();
+                // 用迭代器消费而非 `drain(..take)`：自适应组宽可小到 16，而
+                // `Vec::drain` 每组都会把剩余尾部整体前移，组数一多就退化为
+                // O(n²) 的 memmove（大批量导入时可达数十 GB 级搬移）。
+                // EN: Consume through an iterator instead of `drain(..take)`: the
+                // adaptive width can be as small as 16, and `Vec::drain` memmoves
+                // the entire remainder on every group, degenerating into O(n²)
+                // moves on large imports.
+                let mut fresh_iter = fresh_all.into_iter();
                 let mut level_cursor = 0usize;
-                while !fresh_all.is_empty() {
+                loop {
+                    let remaining = fresh_iter.len();
+                    if remaining == 0 {
+                        break;
+                    }
                     group_count = group_count.saturating_add(1);
-                    let take = plan_group_size.min(fresh_all.len());
-                    let group: Vec<(VectorId, Vec<f32>)> = fresh_all.drain(..take).collect();
+                    let effective_width = effective_plan_group_size(
+                        plan_group_size,
+                        guard.len(),
+                        plan_group_min,
+                        plan_group_graph_divisor,
+                    );
+                    let take = effective_width.min(remaining);
+                    let group: Vec<(VectorId, Vec<f32>)> = fresh_iter.by_ref().take(take).collect();
                     let levels_slice = &fresh_levels[level_cursor..level_cursor + take];
                     level_cursor += take;
-                    if group.len() < parallel_min_chunk {
+                    // 自适应收窄的组仍走规划路径（即使低于 `parallel_min_chunk`）：
+                    // 串行兜底会逐点重新抽层级，丢掉本批预抽的层级计划——成簇数据
+                    // 实测会让个别簇没有上层入口，ef 16–256 下整条查询 0 命中
+                    // （mean 91.3%），而规划 16–64 宽的小组为 100% 且更快。
+                    // EN: Adaptively narrowed groups stay on the planned path even
+                    // below `parallel_min_chunk`: the serial fallback redraws levels
+                    // per point and discards the batch's pre-drawn level plan —
+                    // measured on clustered data, some clusters got no upper-layer
+                    // entry and whole queries returned 0 hits at ef 16–256 (mean
+                    // 91.3%), while planned 16–64 wide groups hit 100% and ran faster.
+                    let adaptive = effective_width < plan_group_size;
+                    if group.len() < parallel_min_chunk && !adaptive {
                         let serial_t0 = std::time::Instant::now();
                         for (id, vector) in group.into_iter() {
-                            let arc_v = Arc::new(vector);
-                            main.insert(id, Arc::clone(&arc_v));
-                            guard.insert_with_visited_entry_hint(
+                            let hnsw_graph::PreparedInsert {
+                                main: stored,
+                                graph,
+                                graph_query,
+                            } = hnsw_graph::prepare_insert_stored(
+                                guard.metric(),
+                                dtype,
+                                quantization,
+                                vector,
+                            );
+                            main.insert(id, stored);
+                            guard.insert_prepared_with_visited_entry_hint(
                                 id,
-                                arc_v,
+                                graph,
+                                graph_query.as_ref(),
                                 &mut visited_build,
                                 None,
                             );
@@ -1068,44 +1636,98 @@ impl HotBufferIndex {
                         continue;
                     }
                     let plan_t0 = std::time::Instant::now();
-                    let mut apply_plans: Vec<_> = {
+                    // 计划阶段一次量化并保留主表句柄；提交时主表与图共享同一
+                    // 向量（余弦时主表句柄为原始向量，计划内为归一化向量）。
+                    // EN: Quantize once during planning and keep the main-store
+                    // handle; the commit shares the vector between main and graph
+                    // (for cosine the main handle is raw while the plan holds the
+                    // normalized vector).
+                    let apply_plans: Vec<_> = {
                         let g_ref: &hnsw_graph::HnswGraph = &guard;
                         group
                             .into_par_iter()
                             .zip(levels_slice.par_iter().copied())
                             .map(|((id, vector), level)| {
-                                g_ref.plan_insert_with_level_unchecked(
-                                    id,
-                                    Arc::new(vector),
-                                    level,
-                                    None,
+                                let hnsw_graph::PreparedInsert {
+                                    main: stored,
+                                    graph,
+                                    graph_query,
+                                } = hnsw_graph::prepare_insert_stored(
+                                    g_ref.metric(),
+                                    dtype,
+                                    quantization,
+                                    vector,
+                                );
+                                (
+                                    g_ref.plan_insert_with_level_unchecked_prepared(
+                                        id,
+                                        graph,
+                                        graph_query.as_ref(),
+                                        level,
+                                        None,
+                                    ),
+                                    stored,
                                 )
                             })
                             .collect()
                     };
                     fresh_plan_us = fresh_plan_us.saturating_add(plan_t0.elapsed().as_micros());
                     let apply_t0 = std::time::Instant::now();
-                    for plan in &mut apply_plans {
-                        main.insert(plan.id, Arc::clone(&plan.vector));
+                    let applied_ids: Vec<VectorId> =
+                        apply_plans.iter().map(|(plan, _)| plan.id).collect();
+                    for (plan, stored) in &apply_plans {
+                        main.insert(plan.id, Arc::clone(stored));
                     }
-                    guard.apply_insert_plans(apply_plans);
+                    guard.apply_insert_plans(
+                        apply_plans.into_iter().map(|(plan, _)| plan).collect(),
+                    );
+                    // 回退分组路径与 plan/apply 共享同一孤点补救（缺省开启）。
+                    // EN: The fallback grouped path shares the same orphan repair
+                    // with plan/apply (on by default).
+                    if let Some((min_degree, window)) = group_repair_params() {
+                        let _ = guard.repair_group_links(&applied_ids, min_degree, window);
+                    }
                     fresh_apply_us = fresh_apply_us.saturating_add(apply_t0.elapsed().as_micros());
                 }
 
                 let upsert_t0 = std::time::Instant::now();
+                let upsert_ids: Vec<VectorId> = upserts_all.iter().map(|(id, _)| *id).collect();
+                let mut affected: AHashSet<VectorId> = AHashSet::new();
                 for (id, vector) in upserts_all.into_iter() {
-                    let arc_v = Arc::new(vector);
+                    let hnsw_graph::PreparedInsert {
+                        main: stored,
+                        graph,
+                        graph_query,
+                    } = hnsw_graph::prepare_insert_stored(
+                        guard.metric(),
+                        dtype,
+                        quantization,
+                        vector,
+                    );
                     match main.entry(id) {
                         Entry::Occupied(mut occ) => {
+                            // 替换前记下旧邻居：remove_node 只清理被删节点的
+                            // 回边，这些邻居可能因此跌到 0 度。
+                            // EN: Capture old neighbors before replacement:
+                            // remove_node only strips the victim's reciprocal
+                            // edges, and those neighbors may drop to degree 0.
+                            affected.extend(guard.neighbors_layer0(id));
                             let _ = guard.remove_node(id);
-                            occ.insert(Arc::clone(&arc_v));
+                            occ.insert(Arc::clone(&stored));
                         }
                         Entry::Vacant(vac) => {
-                            vac.insert(Arc::clone(&arc_v));
+                            vac.insert(Arc::clone(&stored));
                         }
                     }
-                    guard.insert_with_visited_entry_hint(id, arc_v, &mut visited_build, None);
+                    guard.insert_prepared_with_visited_entry_hint(
+                        id,
+                        graph,
+                        graph_query.as_ref(),
+                        &mut visited_build,
+                        None,
+                    );
                 }
+                upsert_repair_edges = repair_after_node_updates(&mut guard, &upsert_ids, &affected);
                 upsert_serial_us = upsert_t0.elapsed().as_micros();
             } else if commit_chunk > 0 {
                 // 短锁提交（P4.x streaming 调优）：保留原串行合图的工作量与吞吐，
@@ -1133,19 +1755,41 @@ impl HotBufferIndex {
                         .collect();
                     let mut m = main_index.blocking_write();
                     let mut g = hnsw_write_guard(&hnsw);
+                    let chunk_ids: Vec<VectorId> = chunk.iter().map(|(id, _)| *id).collect();
+                    let mut affected: AHashSet<VectorId> = AHashSet::new();
                     for (id, vector) in chunk {
-                        let arc_v = Arc::new(vector);
+                        let hnsw_graph::PreparedInsert {
+                            main: stored,
+                            graph,
+                            graph_query,
+                        } = hnsw_graph::prepare_insert_stored(
+                            g.metric(),
+                            dtype,
+                            quantization,
+                            vector,
+                        );
                         match m.entry(id) {
                             Entry::Occupied(mut occ) => {
+                                // 同并行 upsert 分支：替换前记录旧邻居供局部补救。
+                                // EN: Same as the parallel upsert arm: capture old
+                                // neighbors before replacement for local repair.
+                                affected.extend(g.neighbors_layer0(id));
                                 let _ = g.remove_node(id);
-                                occ.insert(Arc::clone(&arc_v));
+                                occ.insert(Arc::clone(&stored));
                             }
                             Entry::Vacant(vac) => {
-                                vac.insert(Arc::clone(&arc_v));
+                                vac.insert(Arc::clone(&stored));
                             }
                         }
-                        g.insert_with_visited_entry_hint(id, arc_v, &mut visited_build, None);
+                        g.insert_prepared_with_visited_entry_hint(
+                            id,
+                            graph,
+                            graph_query.as_ref(),
+                            &mut visited_build,
+                            None,
+                        );
                     }
+                    upsert_repair_edges += repair_after_node_updates(&mut g, &chunk_ids, &affected);
                     drop(g);
                     drop(m);
                     drop(ts);
@@ -1161,20 +1805,58 @@ impl HotBufferIndex {
                 serial_fallback_us = serial_t0.elapsed().as_micros();
             } else {
                 let serial_t0 = std::time::Instant::now();
+                let serial_ids: Vec<VectorId> = built.iter().map(|(id, _)| *id).collect();
+                let mut affected: AHashSet<VectorId> = AHashSet::new();
                 for (id, vector) in built.into_iter() {
-                    let arc_v = Arc::new(vector);
+                    let hnsw_graph::PreparedInsert {
+                        main: stored,
+                        graph,
+                        graph_query,
+                    } = hnsw_graph::prepare_insert_stored(
+                        guard.metric(),
+                        dtype,
+                        quantization,
+                        vector,
+                    );
                     match main.entry(id) {
                         Entry::Occupied(mut occ) => {
+                            // 同其它 upsert 分支：替换前记录旧邻居供局部补救。
+                            // EN: Same as the other upsert arms: capture old
+                            // neighbors before replacement for local repair.
+                            affected.extend(guard.neighbors_layer0(id));
                             let _ = guard.remove_node(id);
-                            occ.insert(Arc::clone(&arc_v));
+                            occ.insert(Arc::clone(&stored));
                         }
                         Entry::Vacant(vac) => {
-                            vac.insert(Arc::clone(&arc_v));
+                            vac.insert(Arc::clone(&stored));
                         }
                     }
-                    guard.insert_with_visited_entry_hint(id, arc_v, &mut visited_build, None);
+                    guard.insert_prepared_with_visited_entry_hint(
+                        id,
+                        graph,
+                        graph_query.as_ref(),
+                        &mut visited_build,
+                        None,
+                    );
                 }
+                upsert_repair_edges = repair_after_node_updates(&mut guard, &serial_ids, &affected);
                 serial_fallback_us = serial_t0.elapsed().as_micros();
+            }
+            // 队列排空时的全层连通性兜底：补齐分组补救覆盖不到的
+            // 「整簇分量（成员度数都 ≥min_degree、对外无桥）」。
+            // EN: All-layer connectivity backstop once the queue is empty: fixes the
+            // whole-cluster components that group repair cannot cover (every
+            // member at >= min_degree, no external bridge).
+            // 同 plan/apply 分支：排空且累计 ≥256 行才做全图兜底。
+            // EN: As in the plan/apply arm: full-graph backstop only when the
+            // queue is empty and accumulated rows reach 256.
+            let rows_since = connectivity_sweep_rows.fetch_add(count, Ordering::Relaxed) + count;
+            if queue_empty_after && rows_since >= MIN_CONNECTIVITY_SWEEP_ROWS {
+                let _ = connectivity_sweep_rows.swap(0, Ordering::Relaxed);
+                let added = guard.ensure_connectivity();
+                if added > 0 {
+                    tracing::debug!(added, "[connectivity-sweep]");
+                }
             }
             let delta = if collect_edge_metrics {
                 let edge_after = guard.edge_count_hint();
@@ -1219,6 +1901,7 @@ impl HotBufferIndex {
                     groups = group_count,
                     fresh = fresh_count,
                     upserts = upsert_count,
+                    upsert_repair_edges,
                     edges_delta = delta,
                     "[optimize-breakdown]"
                 );
@@ -1230,6 +1913,9 @@ impl HotBufferIndex {
                 } else {
                     HnswBatchPlanMode::Serial
                 }),
+                // 旧合图路径（plan/apply 未接管或回退）。
+                // EN: Legacy merge path (plan/apply did not take over or fell back).
+                plan_apply: false,
             }
         })
         .await
@@ -1249,7 +1935,7 @@ impl HotBufferIndex {
     /// back on precondition failure so the caller falls back.
     #[allow(clippy::too_many_arguments)]
     fn plan_apply_fresh(
-        main_index: &RwLock<AHashMap<VectorId, Arc<Vec<f32>>>>,
+        main_index: &RwLock<AHashMap<VectorId, Arc<StoredVector>>>,
         hnsw: &PlRwLock<hnsw_graph::HnswGraph>,
         metrics: &BuilderMetrics,
         tombstones: &RwLock<AHashSet<VectorId>>,
@@ -1260,12 +1946,23 @@ impl HotBufferIndex {
         ef_search: usize,
         seed_serial_points: usize,
         plan_group_size: usize,
+        plan_group_min: usize,
+        plan_group_graph_divisor: usize,
         parallel_plan: bool,
     ) -> Result<AsyncBuilderOnceReport, Vec<BufferEntry>> {
         if built.is_empty() {
+            // 空批没有发生任何规划/提交，与队列空返回同形：`plan_apply` 的合同
+            // 是「本批真实走了读锁规划 + 短写锁提交」，若在此声称 true，按该
+            // 字段计数的调用方会把空批当成一次 plan/apply。
+            // EN: An empty batch plans and applies nothing; use the same no-op
+            // shape as the empty-queue returns. The `plan_apply` contract is
+            // "this batch really ran read-lock plan + short write-lock apply";
+            // claiming true here would make callers that count the field treat
+            // an empty batch as a plan/apply batch.
             return Ok(AsyncBuilderOnceReport {
                 flushed: 0,
-                plan_mode: Some(HnswBatchPlanMode::Serial),
+                plan_mode: None,
+                plan_apply: false,
             });
         }
         // 只处理 fresh 批次；upsert 走原路径（需要先摘旧节点）。
@@ -1292,41 +1989,93 @@ impl HotBufferIndex {
             g.set_ef_search(ef_search);
             g.draw_random_levels(count)
         };
-        let arcs: Vec<(VectorId, Arc<Vec<f32>>)> =
-            built.into_iter().map(|(id, v)| (id, Arc::new(v))).collect();
-        // 按既有并行分组（chunk×group_chunks）滚动：每组先读锁并行规划，
-        // 再短写锁提交，组间保持「后组能看到前组」的可见性（与旧并行路径
-        // 的图质量口径一致）。规划阶段检索可并发读图。
-        // EN: Roll in the existing parallel grouping (chunk × group_chunks):
-        // each group plans in parallel under the read lock, then commits under a
-        // short write lock. Later groups see earlier ones (same visibility as the
-        // old parallel path); searches read the graph concurrently while planning.
+        // 分组迭代按 count 切批、再用 zip 配对层级；两者长度一旦分叉，zip 会
+        // 静默截断多余行（旧实现按下标切片则会 panic）。此处显式钉死不变量。
+        // EN: Groups are sized by count and zipped with levels; if the lengths
+        // diverge, zip silently truncates the extra rows (the old index-based
+        // slicing panicked instead). Pin the invariant explicitly here.
+        debug_assert_eq!(levels.len(), count, "level draw must match batch size");
+        // 度量、dtype 与量化在构造后不可变；一次取值供全批使用。
+        // EN: Metric, dtype, and quantization are immutable after construction;
+        // read them once per batch.
+        let (metric, dtype, quantization) = {
+            let g = hnsw_read_guard(hnsw);
+            (g.metric(), g.dtype(), g.quantization())
+        };
+        // 分组滚动：每组先读锁并行规划，再短写锁提交。注意可见性边界——后组
+        // 能看到前组，但**组内兄弟互不可见**（都只对组前快照规划）。固定大组
+        // 在成簇数据上会把同批兄弟剪成入口点不可达的孤岛，因此组宽按图规模
+        // 自适应收敛（`effective_plan_group_size`）：小图用小组保质量，大图仍
+        // 用配置上限保吞吐。规划阶段检索可并发读图。
+        // EN: Roll groups forward: each group plans in parallel under the read
+        // lock, then commits under a short write lock. Visibility boundary: later
+        // groups see earlier ones, but **siblings inside a group do not see each
+        // other** (all plan against the pre-group snapshot). A fixed large group
+        // prunes clustered siblings into islands unreachable from the entry point,
+        // so the width adapts to graph size (`effective_plan_group_size`): small
+        // graphs keep quality with small groups, large ones keep the configured
+        // cap for throughput. Searches read the graph concurrently while planning.
+        let mut built_iter = built.into_iter();
+        let mut level_iter = levels.into_iter();
         let mut kept_total = 0usize;
+        let mut repair_links: u64 = 0;
         let mut cursor = 0usize;
         let mut plan_us: u128 = 0;
         let mut apply_us: u128 = 0;
+        let mut group_count = 0usize;
         while cursor < count {
-            let take = plan_group_size.min(count - cursor).max(1);
-            let group = &arcs[cursor..cursor + take];
-            let group_levels = &levels[cursor..cursor + take];
+            group_count += 1;
+            // 组宽按组前图规模收敛；读锁只取长度，随即释放，规划阶段另取读锁。
+            // EN: Width converges on the pre-group graph size; the read lock here
+            // only reads the length, planning takes its own read lock below.
+            let graph_len_before = hnsw_read_guard(hnsw).len();
+            let take = effective_plan_group_size(
+                plan_group_size,
+                graph_len_before,
+                plan_group_min,
+                plan_group_graph_divisor,
+            )
+            .min(count - cursor)
+            .max(1);
+            // 按组取走所有权：量化只发生一次，非余弦主表/图共享同一 `Arc`，
+            // 余弦主表保留原始向量、图侧持归一化向量（与回退/upsert 路径同口径）。
+            // EN: Take ownership per group so quantization happens once: non-cosine
+            // shares one `Arc` between the main map and the graph; cosine keeps the
+            // raw vector in the main map and the normalized one in the graph (the
+            // same contract as the fallback/upsert paths).
+            let group: Vec<(VectorId, Vec<f32>)> = built_iter.by_ref().take(take).collect();
+            let group_levels: Vec<usize> = level_iter.by_ref().take(take).collect();
             let plan_t0 = std::time::Instant::now();
-            let plans: Vec<_> = {
+            let plans: Vec<(hnsw_graph::InsertPlan, Arc<StoredVector>)> = {
                 let g = hnsw_read_guard(hnsw);
+                let make_plan = |(id, vector): (VectorId, Vec<f32>), level: usize| {
+                    let hnsw_graph::PreparedInsert {
+                        main: stored,
+                        graph,
+                        graph_query,
+                    } = hnsw_graph::prepare_insert_stored(metric, dtype, quantization, vector);
+                    (
+                        g.plan_insert_with_level_unchecked_prepared(
+                            id,
+                            graph,
+                            graph_query.as_ref(),
+                            level,
+                            None,
+                        ),
+                        stored,
+                    )
+                };
                 if parallel_plan {
                     group
-                        .par_iter()
-                        .zip(group_levels.par_iter().copied())
-                        .map(|((id, v), level)| {
-                            g.plan_insert_with_level_unchecked(*id, Arc::clone(v), level, None)
-                        })
+                        .into_par_iter()
+                        .zip(group_levels.into_par_iter())
+                        .map(|(row, level)| make_plan(row, level))
                         .collect()
                 } else {
                     group
-                        .iter()
-                        .zip(group_levels.iter().copied())
-                        .map(|((id, v), level)| {
-                            g.plan_insert_with_level_unchecked(*id, Arc::clone(v), level, None)
-                        })
+                        .into_iter()
+                        .zip(group_levels)
+                        .map(|(row, level)| make_plan(row, level))
                         .collect()
                 }
             };
@@ -1347,22 +2096,43 @@ impl HotBufferIndex {
             // gate → ts → main → hnsw (same as remove()).
             let gate = commit_gate.blocking_read();
             let ts = tombstones.blocking_read();
-            let mut kept: Vec<_> = plans.into_iter().filter(|p| !ts.contains(&p.id)).collect();
+            let kept: Vec<(hnsw_graph::InsertPlan, Arc<StoredVector>)> = plans
+                .into_iter()
+                .filter(|(plan, _)| !ts.contains(&plan.id))
+                .collect();
             drop(ts);
             if !kept.is_empty() {
                 kept_total += kept.len();
-                // 向量入 main 用短写锁；图链路提交同样短写锁。
-                // EN: Brief write locks for the main map and link commit.
+                // 向量入 main 用短写锁；图链路提交同样短写锁。主表写入的是
+                // `stored`（余弦为原始向量、其余与图共享同一 `Arc`），不是
+                // 规划内的图侧向量。
+                // EN: Brief write locks for the main map and link commit. The main
+                // map receives `stored` (raw for cosine; otherwise the same `Arc`
+                // as the graph), never the plan's graph-side vector.
                 {
                     let mut main = main_index.blocking_write();
-                    for plan in &kept {
-                        main.insert(plan.id, Arc::clone(&plan.vector));
+                    for (plan, stored) in &kept {
+                        main.insert(plan.id, Arc::clone(stored));
                     }
                 }
                 {
                     let mut g = hnsw_write_guard(hnsw);
-                    g.retain_live_plan_neighbors(&mut kept);
-                    g.apply_insert_plans(kept);
+                    let mut plan_batch: Vec<hnsw_graph::InsertPlan> =
+                        kept.into_iter().map(|(plan, _)| plan).collect();
+                    let applied_ids: Vec<u64> = plan_batch.iter().map(|p| p.id).collect();
+                    g.retain_live_plan_neighbors(&mut plan_batch);
+                    g.apply_insert_plans(plan_batch);
+                    // 提交后孤点补救（缺省开启，见 `group_repair_params`）。
+                    // EN: Post-apply orphan repair (on by default, see
+                    // `group_repair_params`).
+                    if let Some((min_degree, window)) = group_repair_params() {
+                        repair_links = repair_links.saturating_add(g.repair_group_links(
+                            &applied_ids,
+                            min_degree,
+                            window,
+                        )
+                            as u64);
+                    }
                 }
             }
             drop(gate);
@@ -1374,7 +2144,8 @@ impl HotBufferIndex {
                 batch = count,
                 flushed = kept_total,
                 graph = graph_len,
-                groups = count.div_ceil(plan_group_size),
+                groups = group_count,
+                repair_links,
                 plan_us,
                 apply_us,
                 "[plan-apply]"
@@ -1399,6 +2170,10 @@ impl HotBufferIndex {
             } else {
                 HnswBatchPlanMode::Serial
             }),
+            // 本分支持有读锁规划 + 短写锁提交，成功返回即证明路径生效。
+            // EN: This function holds the read-lock plan + short write-lock
+            // apply; a successful return proves the path ran.
+            plan_apply: true,
         })
     }
 
@@ -1444,6 +2219,9 @@ impl HotBufferIndex {
     /// 「行不会丢失」的保证：构建器的 drain→merge 跨越队列写锁与主表写锁，
     /// 读锁之间仍有窗口。真正的保证来自调用方——先 `drain_pending_builder`
     /// 等在途合并结束，再由集合写锁阻止新入队（见 HTTP 导出处理器）。
+    ///
+    /// dtype 口径：返回行保持**索引存储 dtype**（f16 索引返回量化后的 f16
+    /// 值）；需要 f32 线格式的调用方在边界用 `to_f32_cow` 提升（HTTP 导出即如此）。
     /// EN: Shared-pointer export — built vectors clone only the `Arc`; the small
     /// hot/queue tail is copied. Used by streaming logical backup so a 10M-vector
     /// table is not duplicated in memory. The nested read guards mirror
@@ -1452,20 +2230,28 @@ impl HotBufferIndex {
     /// window between our read guards. The guarantee comes from the caller —
     /// drain the builder first, then hold the collection write lock so nothing
     /// new is enqueued (see the HTTP export handler).
-    pub async fn export_vectors_shared(&self) -> Result<Vec<(VectorId, Arc<Vec<f32>>)>, String> {
+    /// dtype: rows keep the index storage dtype (an f16 index returns quantized
+    /// f16 values); callers needing an f32 wire format lift them at the
+    /// boundary with `to_f32_cow` (as the HTTP export does).
+    pub async fn export_vectors_shared(
+        &self,
+    ) -> Result<Vec<(VectorId, Arc<StoredVector>)>, String> {
         let main = self.main_index.read().await;
         let hot = self.hot_buffer.read().await;
         let queue = self.builder_queue.read().await;
-        let mut map: AHashMap<VectorId, Arc<Vec<f32>>> =
+        let mut map: AHashMap<VectorId, Arc<StoredVector>> =
             AHashMap::with_capacity(main.len() + hot.len() + queue.len());
         for (id, v) in main.iter() {
             map.insert(*id, Arc::clone(v));
         }
+        // hot/queue 尚未量化：按索引 dtype 一次性下转，保持与已合并行同一口径。
+        // EN: hot/queue rows are not quantized yet; convert them once to the index
+        // dtype so they match already-merged rows.
         for (id, v) in hot.iter() {
-            map.insert(*id, Arc::new(v.clone()));
+            map.insert(*id, Arc::new(StoredVector::from_f32(v.clone(), self.dtype)));
         }
         for (id, v) in queue.iter() {
-            map.insert(*id, Arc::new(v.clone()));
+            map.insert(*id, Arc::new(StoredVector::from_f32(v.clone(), self.dtype)));
         }
         drop(main);
         drop(hot);
@@ -1474,22 +2260,34 @@ impl HotBufferIndex {
         out.extend(map);
         out.sort_by_key(|(id, _)| *id);
         for (id, v) in &out {
-            if v.len() != self.dims {
-                return Err(format!("export: id={id} dim {} != {}", v.len(), self.dims));
+            if v.dims() != self.dims {
+                return Err(format!("export: id={id} dim {} != {}", v.dims(), self.dims));
             }
         }
         Ok(out)
     }
 
     /// 导出磁盘快照：main ∪ hot ∪ builder_queue，同 id 以后写为准（queue > hot > main）。
-    /// Export for disk snapshot: last-wins per id (queue over hot over main).
+    /// 快照线格式**恒为 f32**（f16 行在边界提升；恢复时按快照头记录的 dtype
+    /// 再量化）。这与 [`export_vectors_shared`](Self::export_vectors_shared)
+    /// 的「保持索引 dtype」口径不同：逻辑导出贴近存储原样，快照导出一律 f32
+    /// 以便任意 dtype 的恢复端统一读入。
+    /// EN: Export for disk snapshot: last-wins per id (queue over hot over main).
+    /// The snapshot wire format is **always f32** (f16 rows are lifted at this
+    /// boundary and re-quantized at restore using the dtype recorded in the
+    /// snapshot header). This differs from `export_vectors_shared` (which keeps
+    /// the index dtype): logical export mirrors storage, while snapshot export
+    /// is uniformly f32 so recovery can ingest it regardless of dtype.
     pub async fn export_snapshot_vectors(&self) -> Result<Vec<(VectorId, Vec<f32>)>, String> {
         let mut map: AHashMap<VectorId, Vec<f32>> = AHashMap::new();
         let main = self.main_index.read().await;
         let hot = self.hot_buffer.read().await;
         let queue = self.builder_queue.read().await;
         for (id, v) in main.iter() {
-            map.insert(*id, (**v).clone());
+            // 快照线格式始终是 f32；f16 行在边界提升回 f32（f16 值可精确表示）。
+            // EN: The snapshot wire format is always f32; f16 rows are lifted at
+            // this boundary (every f16 value is exactly representable in f32).
+            map.insert(*id, v.to_f32_vec());
         }
         for (id, v) in hot.iter() {
             map.insert(*id, v.clone());
@@ -1531,7 +2329,10 @@ impl HotBufferIndex {
             let main = self.main_index.read().await;
             for id in ids {
                 if let Some(v) = main.get(id) {
-                    found.insert(*id, (**v).clone());
+                    // 过滤路径的连续缓存固定 f32；f16 行在此提升。
+                    // EN: The filtered path's contiguous cache is f32-only; f16
+                    // rows are lifted here.
+                    found.insert(*id, v.to_f32_vec());
                 }
             }
         }
@@ -1641,7 +2442,21 @@ impl HotBufferIndex {
         }
         {
             let mut guard = hnsw_write_guard(&self.hnsw);
-            removed |= guard.remove_node(id);
+            // 删除同样只清理被害节点的回边：旧邻居可能失去最后一条边。
+            // 补救仅作用于仍存活的旧邻居，被删 id 不会复活。
+            // EN: Deletion likewise strips only the victim's reciprocal edges;
+            // its old neighbors may lose their last edge. Repair touches only
+            // surviving old neighbors — the deleted id never resurrects.
+            let mut old_neighbors: AHashSet<VectorId> = AHashSet::new();
+            old_neighbors.extend(guard.neighbors_layer0(id));
+            let removed_node = guard.remove_node(id);
+            if removed_node {
+                // 补救内部只对「确有孤儿但无可行伙伴」记 debug 诊断。
+                // EN: The helper itself emits the debug diagnostic only when an
+                // orphan exists but has no feasible partner.
+                repair_after_node_updates(&mut guard, &[], &old_neighbors);
+            }
+            removed |= removed_node;
         }
         if removed {
             self.bump_write_generation();
@@ -1669,6 +2484,16 @@ impl HotBufferIndex {
         hnsw_read_guard(&self.hnsw).neighbors_at_layer(node, 1)
     }
 
+    /// 诊断用：读取节点在任意层的出边（节点缺该层时返回空）。图健康检查与
+    /// 分层连通性门禁需要逐层 BFS，而检索/监控 API 不暴露图内部结构。
+    /// EN: Diagnostic accessor for a node's outgoing links at any layer (empty
+    /// when the node lacks that layer). Layered connectivity checks need a
+    /// per-layer BFS, while the search/metrics APIs do not expose graph internals.
+    #[doc(hidden)]
+    pub fn neighbors_at_layer_of(&self, node: VectorId, layer: usize) -> Vec<VectorId> {
+        hnsw_read_guard(&self.hnsw).neighbors_at_layer(node, layer)
+    }
+
     pub fn entry_point(&self) -> Option<VectorId> {
         hnsw_read_guard(&self.hnsw).entry_point()
     }
@@ -1680,12 +2505,12 @@ impl HotBufferIndex {
     fn vector_by_id_ref<'a>(
         id: VectorId,
         hot: &'a [(VectorId, Vec<f32>)],
-        main: &'a AHashMap<VectorId, Arc<Vec<f32>>>,
-    ) -> Option<&'a [f32]> {
+        main: &'a AHashMap<VectorId, Arc<StoredVector>>,
+    ) -> Option<VectorRef<'a>> {
         hot.iter()
             .find(|(x, _)| *x == id)
-            .map(|(_, v)| v.as_slice())
-            .or_else(|| main.get(&id).map(|v| v.as_slice()))
+            .map(|(_, v)| VectorRef::F32(v.as_slice()))
+            .or_else(|| main.get(&id).map(|v| v.as_view()))
     }
 
     /// `k` = 查询 top-k；`ef_override` = 单次查询覆盖 `ef_search`（与 VectorDBBench 一致）。
@@ -1704,14 +2529,22 @@ impl HotBufferIndex {
     fn bounded_candidate_ids(
         &self,
         hot: &[(VectorId, Vec<f32>)],
-        main: &AHashMap<VectorId, Arc<Vec<f32>>>,
+        main: &AHashMap<VectorId, Arc<StoredVector>>,
         query: &[f32],
         k: usize,
         ef_override: Option<usize>,
         filter_set: Option<&std::collections::HashSet<u64>>,
     ) -> Vec<VectorId> {
         let ef_cfg = ef_override.unwrap_or_else(|| self.hnsw_ef_search());
-        let ann_k = k.max(ef_cfg).max(1);
+        let base_k = k.max(ef_cfg).max(1);
+        let ann_k = match self.quantization {
+            // 量化距离近似：扩宽图候选束宽，精确 rescore 只在主表上重排。
+            // EN: Quantized distances are approximate — widen the graph beam;
+            // exact rescoring still reranks only on the main store.
+            Quantization::None => base_k,
+            Quantization::Int8 => base_k.saturating_mul(INT8_ANN_K_MULTIPLIER),
+            Quantization::RaBitQ => base_k.saturating_mul(RABITQ_ANN_K_MULTIPLIER),
+        };
         if self.force_flat_search {
             return hot
                 .iter()
@@ -1769,9 +2602,21 @@ impl HotBufferIndex {
 
         let handle = tokio::spawn(async move {
             let mut ticker = time::interval(Duration::from_millis(tick_ms));
+            // 构建突发结束后（本 tick pending 为 0）强制扫一次尾批：累计行数
+            // 未达阈值的最后一段（如 200 行）同样需要连通兜底。
+            // EN: After a build burst ends (pending is 0 on this tick), force one
+            // final sweep: the last sub-threshold segment (e.g. 200 rows) needs
+            // the connectivity backstop too.
+            let mut idle_ticks: u32 = 0;
             loop {
                 ticker.tick().await;
                 if stop_flag.load(Ordering::Relaxed) {
+                    // 关停前若仍有未扫的行，补一次兜底，避免尾批永久悬空。
+                    // EN: Before stopping, sweep once if rows remain unswept so a
+                    // tail batch cannot stay dangling forever.
+                    if index.unswept_rows_since_connectivity_sweep() > 0 {
+                        let _ = index.ensure_connectivity().await;
+                    }
                     break;
                 }
 
@@ -1779,6 +2624,33 @@ impl HotBufferIndex {
                 metrics
                     .max_pending_queue
                     .fetch_max(pending, Ordering::Relaxed);
+                // 空闲判定只看「队列为空且确有未扫行」：外部 drain（optimize、
+                // WAL 排空、恢复）不会经过本 worker 的 flush 分支，不能靠
+                // sweep_due 触发；构建在途期间计数可能暂时为 0，等其完成后
+                // 计数出现，下一轮空闲窗口自然会覆盖。
+                // EN: The idle predicate only requires "queue empty and unswept
+                // rows exist": external drains (optimize, WAL pump, recovery)
+                // never pass through this worker's flush arm, so sweep_due cannot
+                // be the trigger; a build in flight may briefly show a zero
+                // count, and the next idle window covers it once it appears.
+                let unswept = index.unswept_rows_since_connectivity_sweep();
+                if pending > 0 || unswept == 0 {
+                    idle_ticks = 0;
+                } else {
+                    // 极小尾批在长窗口前不会被扫：饱和递增防止计数器溢出
+                    // （debug panic / release 静默回绕）。
+                    // EN: Tiny tails stay unswept until the long window; use a
+                    // saturating increment so the counter cannot overflow
+                    // (debug panic / silent release wrap).
+                    idle_ticks = idle_ticks.saturating_add(1);
+                    if should_run_idle_connectivity_sweep(idle_ticks, unswept) {
+                        idle_ticks = 0;
+                        let added = index.ensure_connectivity().await;
+                        if added > 0 {
+                            tracing::debug!(added, "[connectivity-sweep-idle]");
+                        }
+                    }
+                }
 
                 let should_flush = match flush_policy {
                     FlushPolicy::ThresholdOnly => pending >= batch_threshold,
@@ -2077,14 +2949,14 @@ impl HotBufferIndex {
         // measured 645 vs 729 QPS (ef128); parallel random lookups hurt locality
         // and add rayon overhead.
         let mut scored: Vec<(VectorId, f32)> = if is_small_mask {
-            let mask_vecs: Vec<(VectorId, &[f32])> = source_ids
+            let mask_vecs: Vec<(VectorId, VectorRef<'_>)> = source_ids
                 .iter()
                 .filter_map(|id| Self::vector_by_id_ref(*id, &hot, &main).map(|v| (*id, v)))
                 .collect();
             use rayon::prelude::*;
             mask_vecs
                 .par_iter()
-                .map(|(id, v)| (*id, self.distance(_query, v)))
+                .map(|(id, v)| (*id, self.distance_ref(_query, *v)))
                 .collect()
         } else if source_ids.len() >= 512 {
             // 邻居扩展后候选可达数千：与 small-mask 同套路，先串行取引用，
@@ -2092,19 +2964,20 @@ impl HotBufferIndex {
             // EN: After neighbor expansion the candidate set can reach thousands;
             // extract refs serially, then par_iter distances. Without expansion the
             // set is usually <512 and stays on the serial path.
-            let refs: Vec<(VectorId, &[f32])> = source_ids
+            let refs: Vec<(VectorId, VectorRef<'_>)> = source_ids
                 .iter()
                 .filter_map(|id| Self::vector_by_id_ref(*id, &hot, &main).map(|v| (*id, v)))
                 .collect();
             use rayon::prelude::*;
             refs.par_iter()
-                .map(|(id, v)| (*id, self.distance(_query, v)))
+                .map(|(id, v)| (*id, self.distance_ref(_query, *v)))
                 .collect()
         } else {
             source_ids
                 .into_iter()
                 .filter_map(|id| {
-                    Self::vector_by_id_ref(id, &hot, &main).map(|v| (id, self.distance(_query, v)))
+                    Self::vector_by_id_ref(id, &hot, &main)
+                        .map(|v| (id, self.distance_ref(_query, v)))
                 })
                 .collect()
         };
@@ -2134,11 +3007,14 @@ impl HotBufferIndex {
 #[cfg(test)]
 mod tests {
     use super::{
-        l2_distance, search_flat_contiguous, DistanceMetric, FlushPolicy, HotBufferIndex,
-        LockFreeNeighborStore, NeighborStore, VectorIndex,
+        group_repair_params, hnsw_read_guard, l2_distance, parse_group_repair,
+        search_flat_contiguous, DistanceMetric, FlushPolicy, HotBufferIndex, LockFreeNeighborStore,
+        NeighborStore, StoredVector, VectorDtype, VectorIndex,
     };
     use crate::distance;
-    use houyi_core::config::BuildConfig;
+    use crate::hnsw_graph::GraphVector;
+    use crate::Quantization;
+    use houyi_core::config::{BuildConfig, HnswConfig, VectorConfig};
     use std::collections::HashSet;
     use std::sync::Arc;
     use tokio::time::{sleep, Duration};
@@ -2147,6 +3023,63 @@ mod tests {
         while index.pending_build_count().await > 0 {
             let _ = index.run_async_builder_once().await;
         }
+    }
+
+    /// 孤点补救环境解析：缺省开启、显式 off/0/空关闭、非法值回落缺省而非
+    /// 静默关闭（`4,0` 也必须保留默认窗口继续补救）。
+    /// EN: Orphan-repair env parsing: on by default, explicit off/0/empty
+    /// disables, invalid values fall back to the default instead of silently
+    /// disabling (`4,0` must also keep the default window and stay enabled).
+    #[test]
+    fn group_repair_env_parsing() {
+        assert_eq!(parse_group_repair(None), Some((4, 16)));
+        assert_eq!(parse_group_repair(Some("")), None);
+        assert_eq!(parse_group_repair(Some("0")), None);
+        assert_eq!(parse_group_repair(Some("off")), None);
+        assert_eq!(parse_group_repair(Some("OFF")), None);
+        assert_eq!(parse_group_repair(Some("8,32")), Some((8, 32)));
+        assert_eq!(parse_group_repair(Some(" 8 , 32 ")), Some((8, 32)));
+        assert_eq!(parse_group_repair(Some("4")), Some((4, 16)));
+        assert_eq!(parse_group_repair(Some("4,")), Some((4, 16)));
+        // 手误不得静默关闭安全网：一律回落缺省。
+        // EN: Typos must not silently disable the safety net: fall back to default.
+        assert_eq!(parse_group_repair(Some("abc")), Some((4, 16)));
+        assert_eq!(parse_group_repair(Some("4 x")), Some((4, 16)));
+        assert_eq!(parse_group_repair(Some("0,16")), Some((4, 16)));
+        assert_eq!(parse_group_repair(Some("4,0")), Some((4, 16)));
+        // 提供了窗口令牌但没法解析 / 尾部多余字段：同样整体回落缺省。
+        // EN: A provided-but-unparsable window token / extra trailing fields:
+        // fall back to the whole default as well.
+        assert_eq!(parse_group_repair(Some("4,abc")), Some((4, 16)));
+        assert_eq!(parse_group_repair(Some("4,16,32")), Some((4, 16)));
+    }
+
+    /// 空闲兜底判定：下限、去抖窗口与强制窗口三重条件。
+    /// EN: Idle-sweep predicate: floor, debounce window, and forced window.
+    #[test]
+    fn idle_connectivity_sweep_predicate() {
+        use super::should_run_idle_connectivity_sweep as should;
+        // 无未扫行：永不触发。
+        // EN: No unswept rows: never triggers.
+        assert!(!should(0, 0));
+        assert!(!should(1_000, 0));
+        // ≥64 行也需过去抖窗口。
+        // EN: >=64 rows also have to pass the debounce window.
+        assert!(!should(super::IDLE_CONNECTIVITY_SWEEP_TICKS - 1, 64));
+        assert!(should(super::IDLE_CONNECTIVITY_SWEEP_TICKS, 64));
+        // 16..63 行：去抖窗口内不触发，强制窗口后触发一次。
+        // EN: 16..63 rows: no trigger inside the debounce window; once after the forced window.
+        assert!(!should(super::IDLE_CONNECTIVITY_SWEEP_TICKS, 16));
+        assert!(!should(super::IDLE_CONNECTIVITY_FORCE_SWEEP_TICKS - 1, 16));
+        assert!(should(super::IDLE_CONNECTIVITY_FORCE_SWEEP_TICKS, 16));
+        // 1..15 行极小尾批：短窗口与强制窗口都不触发，只在长窗口后扫一次。
+        // EN: 1..15 rows (tiny tail): neither the short nor the forced window triggers; scan once after the long window.
+        assert!(!should(super::IDLE_CONNECTIVITY_FORCE_SWEEP_TICKS, 1));
+        assert!(!should(
+            super::IDLE_CONNECTIVITY_TINY_TAIL_SWEEP_TICKS - 1,
+            1
+        ));
+        assert!(should(super::IDLE_CONNECTIVITY_TINY_TAIL_SWEEP_TICKS, 1));
     }
 
     /// 度量枚举的配置/快照字节契约：别名解析、字符串回写与快照字节往返一致。
@@ -2465,6 +3398,265 @@ mod tests {
         assert!(err.contains("dims mismatch"));
     }
 
+    /// plan/apply（默认生产路径）必须与回退/upsert 路径遵守同一准备口径：
+    /// 主表存「写入时一次量化」的原始向量（余弦保留原始分量），非余弦主表与
+    /// 图共享同一 `Arc`，余弦图侧持归一化向量。回归：此前该路径把归一化向量
+    /// 写进主表，与 upsert/回退路径的原始向量混存。
+    /// EN: The plan/apply default production path must follow the same preparation
+    /// contract as the fallback/upsert paths: the main map keeps the once-quantized
+    /// raw row (cosine keeps raw components), non-cosine shares one `Arc` with the
+    /// graph, and cosine keeps the normalized vector on the graph side. Regression:
+    /// this path used to write normalized vectors into the main map, mixing them
+    /// with the raw rows produced by the upsert/fallback paths.
+    #[tokio::test]
+    async fn plan_apply_fresh_keeps_raw_in_main_and_shares_arc_for_non_cosine() {
+        fn row(id: u64, dims: usize) -> Vec<f32> {
+            (0..dims)
+                .map(|j| (((id as usize * 7 + j * 3) % 17) as f32) / 7.0 + 0.5)
+                .collect()
+        }
+
+        let dims = 8usize;
+        // 串行/并行规划两条分支都要锁定同一准备口径（OCR 1975098 #3）。
+        // EN: Both the serial and parallel planning branches must lock the same
+        // preparation contract (OCR 1975098 #3).
+        for parallel_plan in [false, true] {
+            for metric in [DistanceMetric::Cosine, DistanceMetric::L2] {
+                for dtype in [VectorDtype::F32, VectorDtype::F16] {
+                    let index = HotBufferIndex::new_with_metric_and_config_and_dtype(
+                        dims,
+                        metric,
+                        dtype,
+                        &VectorConfig::default(),
+                        &HnswConfig::default(),
+                    );
+                    // 先播种图，满足 plan/apply 的入口点前置条件。
+                    // EN: Seed the graph first to satisfy the plan/apply entry-point
+                    // precondition.
+                    index.insert_batch(vec![(0, row(0, dims))]).await.unwrap();
+                    drain_builder_queue(&index).await;
+
+                    let expected: Vec<(u64, Vec<f32>)> =
+                        vec![(10, row(10, dims)), (11, row(11, dims))];
+                    // plan/apply 生产上跑在 spawn_blocking 里；测试同样搬到阻塞线程，
+                    // 否则 `blocking_read` 会在异步执行上下文里 panic。
+                    // EN: plan/apply runs inside spawn_blocking in production; the test
+                    // does the same because `blocking_read` panics inside an async
+                    // execution context.
+                    let built = expected.clone();
+                    let report = tokio::task::spawn_blocking({
+                        let main_index = Arc::clone(&index.main_index);
+                        let hnsw = Arc::clone(&index.hnsw);
+                        let metrics = Arc::clone(&index.metrics);
+                        let tombstones = Arc::clone(&index.tombstones);
+                        let commit_gate = Arc::clone(&index.commit_gate);
+                        move || {
+                            HotBufferIndex::plan_apply_fresh(
+                                &main_index,
+                                &hnsw,
+                                &metrics,
+                                &tombstones,
+                                &commit_gate,
+                                built,
+                                // 参数顺序：m / ef_construction / ef_search / seed_serial_points /
+                                // plan_group_size / plan_group_min / plan_group_graph_divisor /
+                                // parallel_plan（16/256 取默认，组宽被下限收敛到 16 后仍取
+                                // 配置的 2）。
+                                // EN: parameter order: m / ef_construction / ef_search /
+                                // seed_serial_points / plan_group_size / plan_group_min /
+                                // plan_group_graph_divisor / parallel_plan (16/256 are the
+                                // defaults; the floor raises the cap to 16, so the configured
+                                // width of 2 still wins).
+                                16,
+                                32,
+                                32,
+                                1,
+                                2,
+                                16,
+                                256,
+                                parallel_plan,
+                            )
+                        }
+                    })
+                    .await
+                    .expect("plan/apply task must not panic")
+                    .expect("seeded graph must satisfy plan/apply preconditions");
+                    assert_eq!(
+                        report.flushed,
+                        expected.len(),
+                        "metric={metric:?} dtype={dtype:?} parallel={parallel_plan}"
+                    );
+
+                    for (id, raw) in &expected {
+                        let expect_stored = StoredVector::from_f32(raw.clone(), dtype).to_f32_vec();
+                        let main_arc = {
+                            let main = index.main_index.read().await;
+                            Arc::clone(main.get(id).expect("row must reach the main map"))
+                        };
+                        assert_eq!(
+                            main_arc.to_f32_vec(),
+                            expect_stored,
+                            "main must keep the once-quantized raw row \
+                         (metric={metric:?} dtype={dtype:?} parallel={parallel_plan})"
+                        );
+                        let (graph_arc, graph_side_vec) = {
+                            let g = hnsw_read_guard(&index.hnsw);
+                            let gv = g.graph_vector(*id).expect("row must reach the graph");
+                            let side = match gv {
+                                GraphVector::Full(v) => v.to_f32_vec(),
+                                GraphVector::Int8 { codes, .. } => codes.to_f32_vec(),
+                                // RaBitQ 码不是 f32 侧向量；该测试只覆盖 None/Int8 量化。
+                                // EN: RaBitQ codes are not an f32 graph-side vector;
+                                // this test only covers None/Int8 quantization.
+                                GraphVector::RabitQ { .. } => {
+                                    panic!("rabitq does not expose a dequantized graph vector")
+                                }
+                            };
+                            (gv.source_arc(), side)
+                        };
+                        if metric == DistanceMetric::Cosine {
+                            assert!(
+                                !Arc::ptr_eq(&main_arc, &graph_arc),
+                                "cosine must split raw main / normalized graph allocations \
+                             (parallel={parallel_plan})"
+                            );
+                            // 图侧归一化副本独立于 source（source 为原始主表值）。
+                            // EN: The graph-side normalized copy is separate from the
+                            // source, which holds the raw main-store values.
+                            let norm: f32 =
+                                graph_side_vec.iter().map(|x| x * x).sum::<f32>().sqrt();
+                            let tol = if dtype == VectorDtype::F16 {
+                                0.02
+                            } else {
+                                1e-5
+                            };
+                            assert!(
+                                (norm - 1.0).abs() <= tol,
+                                "graph side must be normalized: norm={norm} (dtype={dtype:?})"
+                            );
+                        } else {
+                            assert!(
+                                Arc::ptr_eq(&main_arc, &graph_arc),
+                                "non-cosine must share one Arc between main and graph \
+                             (parallel={parallel_plan})"
+                            );
+                        }
+                    }
+                    assert!(!index.search(&row(10, dims), 2, None).await.is_empty());
+                }
+            }
+        }
+    }
+
+    /// plan/apply int8 路径（串行/并行 × L2/余弦）：主表保留原始写入值，图侧存
+    /// int8、`source` 与主表共享同一 `Arc`、codes 独立；余弦反量化向量保持近似
+    /// 单位范数，非余弦量化误差 ≤ scale/2。
+    /// EN: plan/apply int8 path (serial/parallel × L2/cosine): the main store keeps
+    /// raw written values; the graph side stores int8 with `source` Arc-shared
+    /// from main and independent codes; cosine dequantized vectors stay
+    /// approximately unit-norm and non-cosine error stays within scale/2.
+    #[tokio::test]
+    async fn plan_apply_fresh_int8_keeps_raw_main_and_quantizes_graph_side() {
+        fn row(id: u64, dims: usize) -> Vec<f32> {
+            (0..dims)
+                .map(|j| (((id as usize * 7 + j * 3) % 17) as f32) / 7.0 + 0.5)
+                .collect()
+        }
+
+        let dims = 8usize;
+        for parallel_plan in [false, true] {
+            for metric in [DistanceMetric::Cosine, DistanceMetric::L2] {
+                let index = HotBufferIndex::new_with_metric_and_config_and_dtype_and_quantization(
+                    dims,
+                    metric,
+                    VectorDtype::F32,
+                    Quantization::Int8,
+                    &VectorConfig::default(),
+                    &HnswConfig::default(),
+                );
+                assert_eq!(index.vector_quantization(), Quantization::Int8);
+                // 先播种图，满足 plan/apply 的入口点前置条件。
+                // EN: Seed the graph first to satisfy the plan/apply entry-point precondition.
+                index.insert_batch(vec![(0, row(0, dims))]).await.unwrap();
+                drain_builder_queue(&index).await;
+
+                let expected: Vec<(u64, Vec<f32>)> = vec![(10, row(10, dims)), (11, row(11, dims))];
+                let built = expected.clone();
+                let report = tokio::task::spawn_blocking({
+                    let main_index = Arc::clone(&index.main_index);
+                    let hnsw = Arc::clone(&index.hnsw);
+                    let metrics = Arc::clone(&index.metrics);
+                    let tombstones = Arc::clone(&index.tombstones);
+                    let commit_gate = Arc::clone(&index.commit_gate);
+                    move || {
+                        HotBufferIndex::plan_apply_fresh(
+                            &main_index,
+                            &hnsw,
+                            &metrics,
+                            &tombstones,
+                            &commit_gate,
+                            built,
+                            16,
+                            32,
+                            32,
+                            1,
+                            2,
+                            16,
+                            256,
+                            parallel_plan,
+                        )
+                    }
+                })
+                .await
+                .expect("plan/apply task must not panic")
+                .expect("seeded graph must satisfy plan/apply preconditions");
+                assert_eq!(
+                    report.flushed,
+                    expected.len(),
+                    "metric={metric:?} parallel={parallel_plan}"
+                );
+
+                for (id, raw) in &expected {
+                    let main_arc = {
+                        let main = index.main_index.read().await;
+                        Arc::clone(main.get(id).expect("row must reach the main map"))
+                    };
+                    assert_eq!(
+                        main_arc.to_f32_vec(),
+                        *raw,
+                        "main must keep raw values (metric={metric:?} parallel={parallel_plan})"
+                    );
+                    let g = hnsw_read_guard(&index.hnsw);
+                    let gv = g.graph_vector(*id).expect("row must reach the graph");
+                    let GraphVector::Int8 { codes, source } = gv else {
+                        panic!("int8 index must store GraphVector::Int8");
+                    };
+                    assert!(
+                        Arc::ptr_eq(&main_arc, source),
+                        "graph source must share the main-store Arc"
+                    );
+                    assert_eq!(codes.dims(), dims);
+                    let deq = codes.to_f32_vec();
+                    if metric == DistanceMetric::Cosine {
+                        let norm: f32 = deq.iter().map(|x| x * x).sum::<f32>().sqrt();
+                        assert!(
+                            (norm - 1.0).abs() <= 0.05,
+                            "quantized cosine vector must stay near unit norm: {norm}"
+                        );
+                    } else {
+                        for (a, b) in deq.iter().zip(raw.iter()) {
+                            assert!(
+                                (a - b).abs() <= codes.scale / 2.0 + 1e-6,
+                                "quantization error must stay within scale/2"
+                            );
+                        }
+                    }
+                }
+                assert!(!index.search(&row(10, dims), 2, None).await.is_empty());
+            }
+        }
+    }
+
     #[tokio::test]
     async fn insert_batch_last_wins_same_id_within_batch() {
         let index = HotBufferIndex::new_with_metric(4, DistanceMetric::L2);
@@ -2480,6 +3672,205 @@ mod tests {
         let found = index.search(&q, 1, None).await;
         assert_eq!(found, vec![1]);
         assert_eq!(index.indexed_count().await, 1);
+    }
+
+    /// 失败现场的固定语料：两批 upsert（第二批重写节点 1/4）在修复前会把节点 8
+    /// 孤立成 L0 度 0。字面值逐位取自模型差分门禁的失败输出，截断会改变图拓扑。
+    /// EN: Fixed corpus from the failing scene: two upsert batches (the second
+    /// rewrites ids 1/4) orphan node 8 at L0 degree 0 before the fix. Literals
+    /// are copied bit-for-bit from the model gate's failing output; truncating
+    /// them changes graph topology.
+    #[allow(clippy::excessive_precision, clippy::type_complexity)]
+    fn island_scene_batches() -> (Vec<(u64, Vec<f32>)>, Vec<(u64, Vec<f32>)>) {
+        let seed_batch = vec![
+            (
+                8,
+                vec![
+                    -0.00555, 1.001888, 1.103370, -0.002364, 0.497788, -0.009578, 0.007888,
+                    -0.007658,
+                ],
+            ),
+            (
+                4,
+                vec![
+                    0.005216, -0.002636, 1.001270, 1.200872, -0.005084, 0.505270, -0.009086,
+                    0.009432,
+                ],
+            ),
+            (
+                1,
+                vec![
+                    0.495756, -0.001024, -0.009304, -0.008520, 0.006394, 1.004590, 1.506694,
+                    0.000786,
+                ],
+            ),
+        ];
+        let rewrite_batch = vec![
+            (
+                1,
+                vec![
+                    0.495756, -0.001024, -0.009304, -0.008520, 0.006394, 1.004590, 1.506694,
+                    0.000786,
+                ],
+            ),
+            (
+                17,
+                vec![
+                    0.005560, -0.006566, -0.007348, -0.004728, 1.005130, 1.393552, 0.006652,
+                    0.490568,
+                ],
+            ),
+            (
+                6,
+                vec![
+                    -0.006100, -0.008536, 0.003802, 1.003986, 1.298182, -0.007962, 0.498804,
+                    -0.006616,
+                ],
+            ),
+            (
+                4,
+                vec![
+                    0.005216, -0.002636, 1.001270, 1.200872, -0.005084, 0.505270, -0.009086,
+                    0.009432,
+                ],
+            ),
+        ];
+        (seed_batch, rewrite_batch)
+    }
+
+    /// 回归：重写（upsert）图中已有节点时，`remove_node` 只清理被删节点的
+    /// 回边，第三方节点可能因此失去最后一条边而跌到 L0 度 0——查询从入口点
+    /// 永远到不了它（服务端后端模型差分门禁在 5 节点序列上实证：节点 8 在
+    /// 重写邻居 1/4 后被完全孤立）。修复后替换/删除路径对「本批 id + 受影响
+    /// 旧邻居」执行局部孤点补救，这里钉住该序列：节点 8 必须有边且可检索。
+    /// EN: Regression: upserting nodes already in the graph makes `remove_node`
+    /// strip only the victim's reciprocal edges, so a third-party node can lose
+    /// its last edge and drop to L0 degree 0 — unreachable from the entry point
+    /// forever (the server backend model gate proved this on a 5-node sequence:
+    /// node 8 was fully isolated after rewriting neighbors 1/4). The fix runs a
+    /// local orphan repair over "batch ids + affected old neighbors" on the
+    /// replace/delete paths; this pins that exact sequence.
+    #[tokio::test]
+    #[allow(clippy::excessive_precision)]
+    async fn upsert_replacing_neighbors_does_not_orphan_third_party_nodes() {
+        // 补救被 A/B 开关显式关闭时本行为有意不存在：跳过而不是报假红。
+        // EN: The behavior is intentionally absent when the A/B knob disables
+        // repair; skip instead of reporting a false red.
+        if group_repair_params().is_none() {
+            eprintln!("skipped: HOUYI_HNSW_GROUP_REPAIR disabled");
+            return;
+        }
+        let (seed_batch, rewrite_batch) = island_scene_batches();
+        let index = HotBufferIndex::new_with_metric(8, DistanceMetric::Cosine);
+        index.insert_batch(seed_batch).await.unwrap();
+        drain_builder_queue(&index).await;
+        index.insert_batch(rewrite_batch).await.unwrap();
+        drain_builder_queue(&index).await;
+
+        // 节点 8 不能被重写邻居的清理连带孤立。
+        // EN: Rewriting its neighbors must not isolate node 8.
+        assert!(
+            !index.neighbors_of(8).is_empty(),
+            "node 8 lost every L0 edge after its neighbors were rewritten"
+        );
+        // 入口点 BFS 必须覆盖全部 5 个存活节点。
+        // EN: BFS from the entry point must cover all 5 live nodes.
+        let ep = index.entry_point().expect("graph must have an entry point");
+        let mut seen = std::collections::HashSet::new();
+        let mut queue = std::collections::VecDeque::from([ep]);
+        seen.insert(ep);
+        while let Some(cur) = queue.pop_front() {
+            for n in index.neighbors_of(cur) {
+                if seen.insert(n) {
+                    queue.push_back(n);
+                }
+            }
+        }
+        for id in [1, 4, 6, 8, 17] {
+            assert!(seen.contains(&id), "id {id} unreachable from entry {ep}");
+        }
+        // 用节点 8 自身向量检索：孤岛状态下它不会出现在任何 top-k。
+        // EN: Search with node 8's own vector: an island never appears in top-k.
+        let q = vec![
+            -0.00555, 1.001888, 1.103370, -0.002364, 0.497788, -0.009578, 0.007888, -0.007658,
+        ];
+        let hits = index.search(&q, 3, None).await;
+        assert!(
+            hits.contains(&8),
+            "orphaned-then-repaired node 8 not searchable: {hits:?}"
+        );
+    }
+
+    /// 删除路径的局部补救：删除一个节点后，其旧邻居必须仍可达且非零度，
+    /// 且被删 id 绝不能残留在图里。候选集合形态与 upsert 路径不同
+    /// （`batch_ids` 为空，单候选时以**尚有余量**的入口点/存活节点为锚点），
+    /// 因此单独钉住。
+    /// EN: Local repair on the delete path: after deleting a node, its old
+    /// neighbors must stay reachable and non-zero-degree, and the deleted id
+    /// must not remain in the graph. The candidate shape differs from the
+    /// upsert arms (`batch_ids` is empty, with a spare-capacity entry point or
+    /// live node as the anchor in the single-candidate case), so it gets its
+    /// own pin.
+    #[tokio::test]
+    #[allow(clippy::excessive_precision)]
+    async fn delete_repairs_surviving_neighbors_and_never_resurrects_id() {
+        if group_repair_params().is_none() {
+            eprintln!("skipped: HOUYI_HNSW_GROUP_REPAIR disabled");
+            return;
+        }
+        let (seed_batch, rewrite_batch) = island_scene_batches();
+        let index = HotBufferIndex::new_with_metric(8, DistanceMetric::Cosine);
+        index.insert_batch(seed_batch).await.unwrap();
+        drain_builder_queue(&index).await;
+        index.insert_batch(rewrite_batch).await.unwrap();
+        drain_builder_queue(&index).await;
+        assert!(index.remove(1).await, "id 1 must exist");
+        assert_eq!(index.indexed_count().await, 4, "one row removed");
+        assert_eq!(
+            index.graph_node_count().await,
+            4,
+            "graph must drop the deleted node"
+        );
+
+        let survivors = [4u64, 6, 8, 17];
+        for id in survivors {
+            assert!(
+                !index.neighbors_of(id).contains(&1),
+                "survivor {id} still links to deleted id 1"
+            );
+        }
+        // 被删 id 不得被补救复活（查询其自身向量）。
+        // EN: The repair must not resurrect the deleted id (query its own vector).
+        let gone_q = vec![
+            0.495756, -0.001024, -0.009304, -0.008520, 0.006394, 1.004590, 1.506694, 0.000786,
+        ];
+        let hits = index.search(&gone_q, 5, None).await;
+        assert!(
+            !hits.contains(&1),
+            "deleted id 1 resurrected by repair: {hits:?}"
+        );
+
+        // 存活节点不得出现 0 度孤岛，且入口 BFS 必须覆盖全部存活节点。
+        // EN: No live node may be left at degree 0, and entry-point BFS must
+        // cover every survivor.
+        let ep = index.entry_point().expect("graph must have an entry point");
+        let mut seen = std::collections::HashSet::new();
+        let mut queue = std::collections::VecDeque::from([ep]);
+        seen.insert(ep);
+        while let Some(cur) = queue.pop_front() {
+            for n in index.neighbors_of(cur) {
+                if survivors.contains(&n) && seen.insert(n) {
+                    queue.push_back(n);
+                }
+            }
+        }
+        for id in survivors {
+            assert!(
+                !index.neighbors_of(id).is_empty(),
+                "survivor {id} left at L0 degree 0 after delete"
+            );
+            assert!(seen.contains(&id), "survivor {id} unreachable from {ep}");
+        }
     }
 
     #[tokio::test]

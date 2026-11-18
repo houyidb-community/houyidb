@@ -1045,6 +1045,16 @@ mod tests {
             http_action(&Method::POST, "/v1/collections/docs/search"),
             Action::Read
         );
+        // 融合检索是纯读（P4）：/fusion/search 同样落在后缀规则内。
+        // EN: Fusion search is read-only (P4): /fusion/search satisfies the suffix rule.
+        assert_eq!(
+            http_action(&Method::POST, "/v1/collections/docs/fusion/search"),
+            Action::Read
+        );
+        assert_eq!(
+            http_collection("/v1/collections/docs/fusion/search"),
+            Some("docs")
+        );
         assert_eq!(
             http_action(&Method::POST, "/v1/collections/docs/upsert"),
             Action::Write

@@ -154,6 +154,18 @@ public sealed class HouyiClient
         {
             body["index_type"] = options.IndexType;
         }
+        if (options?.VectorDtype is not null)
+        {
+            body["vector_dtype"] = options.VectorDtype;
+        }
+        if (options?.Quantization is not null)
+        {
+            body["quantization"] = options.Quantization;
+        }
+        if (options?.Sparse is not null)
+        {
+            body["sparse"] = options.Sparse;
+        }
         if (options?.Hnsw is { } hnsw)
         {
             body["hnsw_m"] = hnsw.M;
@@ -276,6 +288,53 @@ public sealed class HouyiClient
         public Task<SearchResult> HybridSearchAsync(
             float[] vector, int k, SearchOptions? options = null, CancellationToken ct = default) =>
             PostSearchAsync($"{_base}/hybrid/search", vector, k, options, includeFilters: true, ct);
+
+        /// <summary>
+        /// dense + sparse 融合检索（RRF 或加权；集合须为 sparse=bm25）。
+        ///
+        /// 融合分只表达排序（不是任何度量口径）；每命中的 DenseScore 按集合度量
+        /// 换算、SparseScore 为 BM25 原始分，某一路未命中时为 null。
+        /// EN: Dense + sparse fusion search (RRF or weighted; the collection must
+        /// be sparse=bm25). The fused score expresses ranking only (no metric
+        /// semantics); each hit's DenseScore follows the collection metric and
+        /// SparseScore is the raw BM25 score, null when that modality missed.
+        /// </summary>
+        public async Task<FusionResult> FusionSearchAsync(
+            float[] vector, IReadOnlyList<SparseTerm> sparse, int k,
+            FusionOptions? options = null, CancellationToken ct = default)
+        {
+            var body = new Dictionary<string, object> { ["vector"] = vector, ["sparse"] = sparse, ["k"] = k };
+            if (options?.Filters.Count > 0)
+            {
+                body["filters"] = options.Filters;
+            }
+            if (options?.EfSearch is int ef)
+            {
+                body["ef_search"] = ef;
+            }
+            if (options?.IncludePayload == true)
+            {
+                body["include_payload"] = true;
+            }
+            if (options?.Fusion is not null)
+            {
+                body["fusion"] = options.Fusion;
+            }
+            if (options?.RrfK is int rrfK)
+            {
+                body["rrf_k"] = rrfK;
+            }
+            if (options?.Alpha is float alpha)
+            {
+                body["alpha"] = alpha;
+            }
+            using var resp = await _http.PostAsJsonAsync($"{_base}/fusion/search", body, ct)
+                .ConfigureAwait(false);
+            using var doc = await ReadJsonAsync(resp, ct).ConfigureAwait(false);
+            var wire = doc.RootElement.Deserialize<FusionResult.Wire>()
+                ?? new FusionResult.Wire();
+            return FusionResult.FromWire(wire);
+        }
 
         private async Task<SearchResult> PostSearchAsync(
             string url, float[] vector, int k, SearchOptions? options, bool includeFilters, CancellationToken ct)

@@ -204,6 +204,13 @@ impl CxlRegion {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // 进程级 `env` 读写与 crate 内其它测试共享同一把锁，并统一用 `EnvRestore`
+    // 在测试结束时（含 panic）恢复快照——否则一个用例改写/删除的变量会泄漏到
+    // 并行执行的其它用例。
+    // EN: Process-env reads/writes share one lock with the rest of the crate's
+    // tests and restore via `EnvRestore` on exit (including on panic); otherwise
+    // a variable set/removed by one case leaks into other parallel cases.
+    use crate::config::{env_test_lock, EnvRestore};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn temp_cxl_dir() -> PathBuf {
@@ -216,6 +223,15 @@ mod tests {
 
     #[test]
     fn cxl_snapshot_write_read_roundtrip() {
+        let _guard = env_test_lock();
+        let _sim_dir = EnvRestore::new("HOUYI_CXL_SIM_DIR");
+        // `open()` 优先读取 DAX 路径；若宿主机导出了该变量，本测试会写真实
+        // CXL 区域而不是临时模拟目录，必须先清空并由 `EnvRestore` 还原。
+        // EN: `open()` checks the DAX path first; if the host exports it this
+        // test would write the real CXL region instead of the temp sim dir,
+        // so clear it first and let `EnvRestore` put it back.
+        let _region_path = EnvRestore::new("HOUYI_CXL_REGION_PATH");
+        std::env::remove_var("HOUYI_CXL_REGION_PATH");
         let dir = temp_cxl_dir();
         let _ = fs::create_dir_all(&dir);
         // 通过环境变量启用模拟模式
@@ -248,15 +264,21 @@ mod tests {
         assert_eq!(restored_meta.metric, "cosine");
         assert_eq!(restored_payload, payload);
 
-        // 清理
-        // EN: Clean up.
+        // 清理（环境变量由 `EnvRestore` 在 drop 时恢复）。
+        // EN: Clean up (env vars are restored by `EnvRestore` on drop).
         region.clear_snapshot().unwrap();
         let _ = fs::remove_dir_all(&dir);
-        std::env::remove_var("HOUYI_CXL_SIM_DIR");
     }
 
     #[test]
     fn cxl_empty_snapshot_returns_none() {
+        let _guard = env_test_lock();
+        let _sim_dir = EnvRestore::new("HOUYI_CXL_SIM_DIR");
+        // 同 roundtrip：`open()` 优先走真实 DAX 路径，先清空再还原。
+        // EN: Same as roundtrip: `open()` prefers the real DAX path; clear it
+        // first and restore it afterwards.
+        let _region_path = EnvRestore::new("HOUYI_CXL_REGION_PATH");
+        std::env::remove_var("HOUYI_CXL_REGION_PATH");
         let dir = temp_cxl_dir();
         let _ = fs::create_dir_all(&dir);
         std::env::set_var("HOUYI_CXL_SIM_DIR", dir.to_string_lossy().as_ref());
@@ -267,11 +289,13 @@ mod tests {
 
         region.clear_snapshot().unwrap();
         let _ = fs::remove_dir_all(&dir);
-        std::env::remove_var("HOUYI_CXL_SIM_DIR");
     }
 
     #[test]
     fn cxl_no_config_returns_none() {
+        let _guard = env_test_lock();
+        let _region_path = EnvRestore::new("HOUYI_CXL_REGION_PATH");
+        let _sim_dir = EnvRestore::new("HOUYI_CXL_SIM_DIR");
         std::env::remove_var("HOUYI_CXL_REGION_PATH");
         std::env::remove_var("HOUYI_CXL_SIM_DIR");
         let result = CxlRegion::open().unwrap();

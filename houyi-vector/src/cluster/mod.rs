@@ -10,7 +10,7 @@ pub mod kmeans;
 pub mod pq_flat;
 pub mod router;
 
-pub use flat_clustered::FlatClustered;
+pub use flat_clustered::{FlatClustered, FlatStorageDtype, DEFAULT_SEARCH_TARGET_PER_K};
 pub use pq_flat::PqFlatClustered;
 
 use crate::hnsw_graph::HnswGraph;
@@ -206,7 +206,7 @@ impl ClusteredHnsw {
         let adaptive_nprobe = {
             let total = self.total_vectors();
             let cluster_sz = (total / self.num_clusters).max(1);
-            let target = k.saturating_mul(2500);
+            let target = k.saturating_mul(DEFAULT_SEARCH_TARGET_PER_K);
             self.nprobe.min((target / cluster_sz).max(4))
         };
         let top_clusters = router::route_query(
@@ -341,6 +341,30 @@ impl ClusteredHnsw {
         self.total_indexed.load(Ordering::Relaxed)
     }
 
+    /// 导出全部去重后的原始向量（供 collection 快照使用）。
+    /// 边界复制会让同一 id 出现在多个子图中；快照只需一份，按 id 去重。
+    /// EN: Exports all unique raw vectors for collection snapshots. Boundary
+    /// replication puts the same id in several sub-graphs; the snapshot needs
+    /// one copy, so ids are deduplicated.
+    pub fn export_vectors(&self) -> Vec<(VectorId, Vec<f32>)> {
+        // 锁内只克隆 Arc，锁外再转 f32：逐条转换会长时间阻塞该簇的写入。
+        // EN: Clone only Arcs under the lock and convert outside; per-row
+        // conversion would block writes to that cluster for the whole export.
+        let mut shared = Vec::new();
+        for cluster in &self.clusters {
+            let guard = cluster.read();
+            shared.extend(guard.graph.export_vectors());
+        }
+        let mut seen = ahash::AHashSet::with_capacity(shared.len());
+        let mut out = Vec::with_capacity(shared.len());
+        for (id, stored) in shared {
+            if seen.insert(id) {
+                out.push((id, stored.to_f32_vec()));
+            }
+        }
+        out
+    }
+
     /// 边界复制开销比例（仅构建时计算，非实时）。
     /// EN: Boundary replication overhead ratio (computed at build time only, not live).
     pub fn replication_overhead(&self) -> f64 {
@@ -370,6 +394,31 @@ mod tests {
             }
         }
         (data, ids)
+    }
+
+    /// 导出全部去重后的原始向量（边界复制副本只保留一份）。
+    /// EN: Exports all unique raw vectors (boundary copies are deduplicated).
+    #[test]
+    fn test_export_vectors_dedupes_boundary_copies() {
+        let dims = 4;
+        let n = 100;
+        let (vectors, ids) = generate_random_vectors(n, dims, 777);
+        let mut config = ClusterConfig::infer(n, dims);
+        config.boundary_alpha = 100.0; // 强制几乎所有点复制到次聚类
+        let ch = ClusteredHnsw::build(&vectors, &ids, dims, DistanceMetric::L2, &config);
+        assert!(
+            ch.total_vectors() > n,
+            "alpha=100 must replicate: total={}",
+            ch.total_vectors()
+        );
+
+        let mut exported = ch.export_vectors();
+        assert_eq!(exported.len(), n, "export must dedupe boundary copies");
+        exported.sort_by_key(|(id, _)| *id);
+        for (i, (id, v)) in exported.iter().enumerate() {
+            assert_eq!(*id, ids[i]);
+            assert_eq!(v.as_slice(), &vectors[i * dims..(i + 1) * dims]);
+        }
     }
 
     #[test]

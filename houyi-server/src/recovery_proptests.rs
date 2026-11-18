@@ -23,11 +23,13 @@ use crate::scalar_json::build_collection_scalar_row;
 use crate::types::{WalHandle, WalWriteMode};
 use houyi_core::ScalarValue;
 use houyi_persistence::collection_wal::{
-    encode_collection_create, encode_collection_delete, encode_collection_set_ha_level,
-    encode_collection_upsert_batch, CollectionWalItem,
+    encode_collection_create_with_options, encode_collection_delete,
+    encode_collection_set_ha_level, encode_collection_upsert_batch, CollectionCreateOptions,
+    CollectionWalItem,
 };
 use houyi_persistence::ha_level::HaLevel;
 use houyi_persistence::FileWal;
+use houyi_vector::sparse::{normalize_terms, SparseMode, MAX_SPARSE_TERMS_PER_DOC};
 use proptest::prelude::*;
 use proptest_state_machine::{prop_state_machine, ReferenceStateMachine, StateMachineTest};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -99,6 +101,15 @@ fn arb_payload() -> impl Strategy<Value = Vec<(String, ScalarJson)>> {
     })
 }
 
+/// 稀疏词项对：term ∈ [1, 8)、权重正有限；重复 term 与空列表（`Some(vec![])`
+/// 覆盖「清空」语义）都在域内。
+/// EN: Sparse term pairs: term in [1, 8) with positive finite weights; duplicate
+/// terms and empty lists (the clear semantics via `Some(vec![])`) are both in
+/// the domain.
+fn arb_sparse() -> impl Strategy<Value = Option<Vec<(u32, f32)>>> {
+    prop::option::of(prop::collection::vec((1u32..8, 0.25f32..2.0), 0..4))
+}
+
 /// 向量分量：有限且量级有界。上界不是随意取——图路径 `normalize_for_cosine`
 /// 用 **f32** 累加 norm²，|x| ≳ 1e19 时 norm² 上溢为 inf、`inv = inf.sqrt().recip()`
 /// 归零，图内向量被静默归零（hnsw_graph.rs 记录的「图路径 f32 累加」已知延后项
@@ -148,6 +159,10 @@ enum Transition {
         values: [f32; DIMS],
         label: Option<String>,
         payload: Vec<(String, ScalarJson)>,
+        /// None = 稀疏侧不变；`Some(terms)`（含空列表）= 整文档替换。
+        /// EN: None = sparse side unchanged; `Some(terms)` (including an empty
+        /// EN: list) replaces the whole document.
+        sparse: Option<Vec<(u32, f32)>>,
     },
     Delete {
         name_ix: usize,
@@ -198,6 +213,10 @@ struct RefRow {
     /// 最后一次非空标量行（label + payload 原始值），payload 回读的期望值。
     /// EN: Latest non-empty scalar row (label + raw payload), the expected payload read-back.
     last_scalar: ScalarSnapshot,
+    /// 稀疏词项（整文档替换后的规范形式）；None = 无稀疏状态或已被空列表清空。
+    /// EN: Sparse terms (canonical form after whole-document replacement);
+    /// EN: None = no sparse state or cleared by an empty list.
+    sparse_terms: Option<Vec<(u32, f32)>>,
 }
 
 impl RefRow {
@@ -227,14 +246,18 @@ impl ReferenceStateMachine for RecoveryRef {
                 arb_values(),
                 prop::option::of("[a-z]{1,8}"),
                 arb_payload(),
+                arb_sparse(),
             )
-                .prop_map(|(name_ix, id, values, label, payload)| Transition::Upsert {
-                    name_ix,
-                    id,
-                    values,
-                    label,
-                    payload,
-                }),
+                .prop_map(
+                    |(name_ix, id, values, label, payload, sparse)| Transition::Upsert {
+                        name_ix,
+                        id,
+                        values,
+                        label,
+                        payload,
+                        sparse,
+                    },
+                ),
             3 => (0..NAMES.len(), 0..ID_SPACE)
                 .prop_map(|(name_ix, id)| Transition::Delete { name_ix, id }),
             1 => (0..NAMES.len(), arb_ha_level())
@@ -255,6 +278,7 @@ impl ReferenceStateMachine for RecoveryRef {
                 values,
                 label,
                 payload,
+                sparse,
             } => {
                 let name = NAMES[*name_ix].to_string();
                 let col = state.collections.entry(name).or_insert(RefCollection {
@@ -277,6 +301,20 @@ impl ReferenceStateMachine for RecoveryRef {
                     row.scalar_tombstoned = false;
                     row.last_scalar = Some((label.clone(), payload.clone()));
                 }
+                // 稀疏：整文档替换（None = 不改；空列表 = 清空）。规范化走内核
+                // 同一函数，模型与重放侧的求和/排序口径不可能分叉。
+                // EN: Sparse: whole-document replacement (None = unchanged; empty
+                // list = cleared). Normalization uses the kernel's own function so
+                // the model and the replay path cannot drift on summing/ordering.
+                if let Some(terms) = sparse {
+                    let normalized = normalize_terms(terms, MAX_SPARSE_TERMS_PER_DOC)
+                        .expect("generated sparse terms must be valid");
+                    row.sparse_terms = if normalized.is_empty() {
+                        None
+                    } else {
+                        Some(normalized)
+                    };
+                }
             }
             Transition::Delete { name_ix, id } => {
                 // 目标 collection 缺失 = 历史截断场景：重放告警跳过，模型同步 no-op。
@@ -289,6 +327,11 @@ impl ReferenceStateMachine for RecoveryRef {
                         .or_insert_with(|| RefRow::new([0.0; DIMS]));
                     row.vec_present = false;
                     row.scalar_tombstoned = true;
+                    // 删除同时移除稀疏文档（幂等；向量/稀疏随 upsert 复活，
+                    // 与生产写入路径一致）。
+                    // EN: Delete also removes the sparse document (idempotent; vectors/
+                    // sparse resurrect on upsert, matching the production write path).
+                    row.sparse_terms = None;
                 }
             }
             Transition::SetHaLevel { name_ix, level } => {
@@ -390,11 +433,26 @@ impl StateMachineTest for RecoveryStateMachineTest {
                 values,
                 label,
                 payload,
+                sparse,
             } => {
                 let name = NAMES[name_ix];
                 if state.created.insert(name.to_string()) {
+                    // create 恒显式 bm25：任一 collection 都可能收到稀疏词项，
+                    // none 集合上的稀疏增量会被重放侧判为腐坏。
+                    // EN: Creates are always explicit bm25: any collection may
+                    // receive sparse terms, and sparse data on a none collection
+                    // is classified as corruption by replay.
                     state.append(
-                        encode_collection_create(name, DIMS, "hnsw").expect("encode create"),
+                        encode_collection_create_with_options(
+                            name,
+                            DIMS,
+                            "hnsw",
+                            &CollectionCreateOptions {
+                                sparse: Some("bm25".to_string()),
+                                ..Default::default()
+                            },
+                        )
+                        .expect("encode create"),
                     );
                 }
                 let item = CollectionWalItem {
@@ -402,6 +460,7 @@ impl StateMachineTest for RecoveryStateMachineTest {
                     values: values.to_vec(),
                     label,
                     payload: payload_to_json(&payload),
+                    sparse,
                 };
                 state.append(
                     encode_collection_upsert_batch(name, DIMS, &[item]).expect("encode upsert"),
@@ -541,6 +600,37 @@ fn assert_manager_matches_model(
             "ha_level diverged for '{name}'"
         );
 
+        // 稀疏侧：create 记录恒 bm25；逐 id 比对规范化词项，doc_count 兜底
+        // 检测「应删未删」的残留文档。
+        // EN: Sparse side: creates are always bm25; compare normalized terms per
+        // id, with doc_count catching stale documents that should have been removed.
+        assert_eq!(
+            col.sparse_mode(),
+            SparseMode::Bm25,
+            "sparse mode diverged for '{name}'"
+        );
+        let sparse_lock = col
+            .sparse_index()
+            .expect("bm25 collection must expose a sparse index");
+        let sparse = sparse_lock.read().expect("sparse read lock");
+        let mut expected_sparse_docs = 0u64;
+        for (id, row) in &refcol.rows {
+            if row.sparse_terms.is_some() {
+                expected_sparse_docs += 1;
+            }
+            assert_eq!(
+                sparse.doc_terms(*id),
+                row.sparse_terms,
+                "sparse terms diverged for '{name}' id={id}"
+            );
+        }
+        assert_eq!(
+            sparse.stats().doc_count,
+            expected_sparse_docs,
+            "sparse doc count diverged for '{name}'"
+        );
+        drop(sparse);
+
         // 向量侧：导出集 = 模型中 vec_present 的行（id → values 精确相等）。
         // EN: Vector side: exported set = rows with vec_present in the model (id -> values
         // EN: exactly equal).
@@ -659,6 +749,7 @@ enum CollOp {
         values: [f32; DIMS],
         label: Option<String>,
         payload: Vec<(String, ScalarJson)>,
+        sparse: Option<Vec<(u32, f32)>>,
     },
     Delete {
         id: u64,
@@ -681,12 +772,14 @@ fn arb_coll_op() -> impl Strategy<Value = CollOp> {
             arb_values(),
             prop::option::of("[a-z]{1,8}"),
             arb_payload(),
+            arb_sparse(),
         )
-            .prop_map(|(id, values, label, payload)| CollOp::Upsert {
+            .prop_map(|(id, values, label, payload, sparse)| CollOp::Upsert {
                 id,
                 values,
                 label,
                 payload,
+                sparse,
             }),
         2 => (0..ID_SPACE).prop_map(|id| CollOp::Delete { id }),
         1 => arb_ha_level().prop_map(|level| CollOp::SetHaLevel { level }),
@@ -700,12 +793,14 @@ fn encode_coll_op(op: &CollOp) -> Vec<u8> {
             values,
             label,
             payload,
+            sparse,
         } => {
             let item = CollectionWalItem {
                 id: *id,
                 values: values.to_vec(),
                 label: label.clone(),
                 payload: payload_to_json(payload),
+                sparse: sparse.clone(),
             };
             encode_collection_upsert_batch("c", DIMS, &[item]).expect("encode upsert")
         }
@@ -805,7 +900,49 @@ fn assert_managers_equivalent(
             .expect("export b");
         assert_vectors_equivalent(&va, &vb, &name);
 
+        // 稀疏侧：两路都必须重建出 bm25；逐 id 比对规范化词项 + doc_count。
+        // 不比对 term_count/posting_count——它们是含死行的派生态，压缩时机随
+        // 路径不同（快照只序列化 live），不属语义不变量。
+        // EN: Sparse side: both paths must rebuild bm25; compare normalized terms
+        // per id plus doc_count. term_count/posting_count are dead-row-derived and
+        // compaction timing differs between paths (snapshots serialize live rows
+        // only), so they are not semantic invariants.
+        assert_eq!(
+            ca.sparse_mode(),
+            SparseMode::Bm25,
+            "sparse mode diverged for '{name}' (a)"
+        );
+        assert_eq!(
+            cb.sparse_mode(),
+            SparseMode::Bm25,
+            "sparse mode diverged for '{name}' (b)"
+        );
         let all_ids: Vec<u64> = va.iter().map(|(id, _)| *id).collect();
+        let sparse_a = ca
+            .sparse_index()
+            .expect("a must expose a sparse index")
+            .read()
+            .expect("sparse read a");
+        let sparse_b = cb
+            .sparse_index()
+            .expect("b must expose a sparse index")
+            .read()
+            .expect("sparse read b");
+        assert_eq!(
+            sparse_a.stats().doc_count,
+            sparse_b.stats().doc_count,
+            "sparse doc count diverged for '{name}'"
+        );
+        for id in &all_ids {
+            assert_eq!(
+                sparse_a.doc_terms(*id),
+                sparse_b.doc_terms(*id),
+                "sparse terms diverged for '{name}' id={id}"
+            );
+        }
+        drop(sparse_a);
+        drop(sparse_b);
+
         let sa = ca.scalars.lock().expect("scalars a");
         let sb = cb.scalars.lock().expect("scalars b");
         assert_eq!(
@@ -851,7 +988,19 @@ proptest! {
 
         // 全部记录落 WAL（create + ops）。
         // EN: All records are written to the WAL (create + ops).
-        let mut records = vec![encode_collection_create("c", DIMS, "hnsw").expect("encode create")];
+        // create 恒 bm25（Op 可能携带稀疏词项），见状态机 create 的同一说明。
+        // EN: Create is always bm25 (ops may carry sparse terms) — same rationale
+        // as the state-machine create.
+        let mut records = vec![encode_collection_create_with_options(
+            "c",
+            DIMS,
+            "hnsw",
+            &CollectionCreateOptions {
+                sparse: Some("bm25".to_string()),
+                ..Default::default()
+            },
+        )
+        .expect("encode create")];
         records.extend(ops.iter().map(encode_coll_op));
         {
             let (mut wal, _) = FileWal::open(&wal_path).expect("open wal");
@@ -937,7 +1086,19 @@ proptest! {
         let _dir_guard = TempDirGuard(dir.clone());
         let wal_path = dir.join("houyidb.collections.wal");
 
-        let mut records = vec![encode_collection_create("c", DIMS, "hnsw").expect("encode create")];
+        // create 恒 bm25（Op 可能携带稀疏词项），见状态机 create 的同一说明。
+        // EN: Create is always bm25 (ops may carry sparse terms) — same rationale
+        // as the state-machine create.
+        let mut records = vec![encode_collection_create_with_options(
+            "c",
+            DIMS,
+            "hnsw",
+            &CollectionCreateOptions {
+                sparse: Some("bm25".to_string()),
+                ..Default::default()
+            },
+        )
+        .expect("encode create")];
         records.extend(ops.iter().map(encode_coll_op));
         {
             let (mut wal, _) = FileWal::open(&wal_path).expect("open wal");

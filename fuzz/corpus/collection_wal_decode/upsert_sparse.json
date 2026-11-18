@@ -1,0 +1,1 @@
+{"v":1,"op":"collection_upsert_batch","name":"sparse_docs","dims":4,"items":[{"id":1,"values":[1.0,0.0,0.0,0.0],"label":"a","sparse":[[7,1.0],[8,0.5]]},{"id":2,"values":[0.0,1.0,0.0,0.0],"sparse":[]},{"id":3,"values":[0.0,0.0,1.0,0.0]}]}

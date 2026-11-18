@@ -1,6 +1,6 @@
-//! 语料种子生成（P4.5.1）：用**真实编码器**为 4 个 fuzz target 产出起始语料。
+//! 语料种子生成（P4.5.1）：用**真实编码器**为 6 个 fuzz target 产出起始语料。
 //! EN: Corpus seed generation (P4.5.1): real encoders produce the starting
-//! EN: corpora for the 4 fuzz targets.
+//! EN: corpora for the 6 fuzz targets.
 //!
 //! 为什么需要 / Why: 解析器的输入受 CRC32 / 长度前缀 / 自洽长度门保护，纯随机
 //! 字节几乎必然在第一个门就被拒——fuzzer 的预算会耗在「猜结构」上。语料种子从
@@ -21,6 +21,11 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
+
+// int8 图种子经 `HotBufferIndex` 的异步写入入口建图，异步方法来自该 trait。
+// EN: int8 graph seeds build their graph through the async write entry of
+// EN: `HotBufferIndex`, whose methods come from this trait.
+use houyi_vector::VectorIndex;
 
 /// 语料根目录（编译期锚定，避免依赖 cwd）。
 /// EN: Corpus root directory (anchored at compile time, no cwd dependency).
@@ -54,6 +59,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     seed_pgwire()?;
     seed_graph()?;
     seed_collection_snapshot()?;
+    seed_collection_wal()?;
     println!(
         "语料种子已写入 {}",
         Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -129,12 +135,14 @@ fn seed_wal() -> Result<(), Box<dyn std::error::Error>> {
                     .expect("json object")
                     .clone(),
             ),
+            sparse: None,
         },
         CollectionWalItem {
             id: 2,
             values: vec![0.3, 0.4],
             label: None,
             payload: None,
+            sparse: None,
         },
     ];
     write_seed(
@@ -334,7 +342,106 @@ fn seed_graph() -> Result<(), Box<dyn std::error::Error>> {
         "envelope_tombstones",
         &encode_graph_snapshot_file(42, &with_tombstones),
     )?;
+
+    // int8 图快照（v3：codes + source）：只有真实 int8 构建器能产出 flags=0x04
+    // 的 v3 payload。解码器先比对 flags 派生的 quantization、再解析向量段，因此
+    // 「按量化版本选择解码布局」分支只在**期望 int8** 的恢复目标上才可达；
+    // fuzz target 同时以未量化与 int8 两种目标恢复同一语料。
+    // EN: int8 graph snapshot (v3: codes + source): only a real int8 builder
+    // emits a v3 payload with flags=0x04. The decoder compares flags-derived
+    // quantization before parsing the vector records, so the "pick the decode
+    // layout by quantization version" branch is reachable only on an *int8-
+    // expecting* restore target — the fuzz target restores this corpus into
+    // both an unquantized and an int8 graph.
+    let int8_payload = build_graph_snapshot(
+        &rt,
+        4,
+        vec![
+            (1, vec![1.0, 0.0, 0.0, 0.0]),
+            (2, vec![0.0, 1.0, 0.0, 0.0]),
+            (3, vec![0.0, 0.0, 1.0, 0.0]),
+        ],
+        houyi_vector::Quantization::Int8,
+    );
+    let mut seed = 42u64.to_le_bytes().to_vec();
+    seed.extend_from_slice(&int8_payload);
+    write_seed(&dir, "lsn_plus_payload_int8", &seed)?;
+    write_seed(
+        &dir,
+        "envelope_int8",
+        &encode_graph_snapshot_file(42, &int8_payload),
+    )?;
+
+    // rabitq 图快照（v4：norm/alpha/packed codes/source，flags bit3=0x08）：
+    // 同样只有真实 rabitq 构建器能产出；fuzzer 需要「期望 rabitq」的恢复
+    // 目标才能深入 v4 向量段与位打包校验。
+    // EN: rabitq graph snapshot (v4: norm/alpha/packed codes/source, flags
+    // bit3=0x08): likewise only a real rabitq builder emits it; the fuzzer
+    // needs a *rabitq-expecting* restore target to reach the v4 vector records
+    // and packed-bits validation.
+    let rabitq_payload = build_graph_snapshot(
+        &rt,
+        4,
+        vec![
+            (1, vec![1.0, 0.0, 0.0, 0.0]),
+            (2, vec![0.0, 1.0, 0.0, 0.0]),
+            (3, vec![0.0, 0.0, 1.0, 0.0]),
+        ],
+        houyi_vector::Quantization::RaBitQ,
+    );
+    let mut seed = 42u64.to_le_bytes().to_vec();
+    seed.extend_from_slice(&rabitq_payload);
+    write_seed(&dir, "lsn_plus_payload_rabitq", &seed)?;
+    write_seed(
+        &dir,
+        "envelope_rabitq",
+        &encode_graph_snapshot_file(42, &rabitq_payload),
+    )?;
     Ok(())
+}
+
+/// 构建并排空一个真实量化图，返回对应版本的快照 payload（int8 → v3，
+/// rabitq → v4）。
+/// 图节点数断言：`indexed_count` 只反映主表，无法发现被图插入拒绝的行；节点
+/// 少于期望会静默产出退化但仍可解码的种子。
+/// 字节可复现性：节点/向量段按 AHashMap 迭代序写出，故重跑生成的内容等价、
+/// 字节不同；入库样本只是任一有效快照，不承诺逐字节重现。
+/// EN: Build and drain a real quantized graph, returning the matching snapshot
+/// payload (int8 → v3, rabitq → v4).
+/// The graph-node assertion matters: `indexed_count` only tracks the main map, so
+/// rows rejected by graph insertion would not fail it — a short graph would
+/// silently ship a degraded but still decodable seed.
+/// Byte reproducibility: nodes/vectors are written in AHashMap iteration order,
+/// so regenerating yields equivalent content with different bytes; the checked-in
+/// sample is any one valid snapshot, not a byte-reproducible one.
+fn build_graph_snapshot(
+    rt: &tokio::runtime::Runtime,
+    dims: usize,
+    rows: Vec<(u64, Vec<f32>)>,
+    quantization: houyi_vector::Quantization,
+) -> Vec<u8> {
+    let expected = rows.len();
+    let index = houyi_vector::HotBufferIndex::new_with_metric_and_dtype_and_quantization(
+        dims,
+        houyi_vector::DistanceMetric::L2,
+        houyi_vector::VectorDtype::F32,
+        quantization,
+    );
+    rt.block_on(async {
+        index
+            .insert_batch(rows)
+            .await
+            .expect("seed rows must enter the builder queue");
+        while index.pending_build_count().await > 0 {
+            index.run_async_builder_once().await;
+        }
+    });
+    assert_eq!(
+        rt.block_on(index.graph_node_count()),
+        expected,
+        "seed graph must link every inserted row"
+    );
+    rt.block_on(index.encode_graph_snapshot())
 }
 
 /// 目标 5：真实 collections 快照 payload + manifest 各一份（P5.0.5）。
@@ -342,8 +449,8 @@ fn seed_graph() -> Result<(), Box<dyn std::error::Error>> {
 fn seed_collection_snapshot() -> Result<(), Box<dyn std::error::Error>> {
     use houyi_persistence::collection_snapshot_file::{
         encode_collection_manifest, encode_collection_snapshot_payload, CollectionManifest,
-        CollectionManifestEntry, CollectionSnapshotPayload, SnapshotScalar, SnapshotScalarRow,
-        SnapshotVectorKind,
+        CollectionManifestEntry, CollectionSnapshotPayload, SnapshotQuantization, SnapshotScalar,
+        SnapshotScalarRow, SnapshotVectorDtype, SnapshotVectorKind,
     };
 
     let dir = corpus_dir("collection_snapshot_decode");
@@ -354,11 +461,17 @@ fn seed_collection_snapshot() -> Result<(), Box<dyn std::error::Error>> {
         index_type: "hnsw".to_string(),
         ha_level: 1,
         metric: Some(1),
-        hnsw: Some(houyi_persistence::collection_snapshot_file::SnapshotHnswParams {
-            m: 24,
-            ef_construction: 400,
-            ef_search: 256,
-        }),
+        hnsw: Some(
+            houyi_persistence::collection_snapshot_file::SnapshotHnswParams {
+                m: 24,
+                ef_construction: 400,
+                ef_search: 256,
+            },
+        ),
+        vector_dtype: Some(SnapshotVectorDtype::F32),
+        quantization: None,
+        // 未量化：保持 v1 manifest 兼容样本。
+        // EN: unquantized: keeps the v1-manifest compatibility sample.
         vector_kind: SnapshotVectorKind::Empty,
         vector_count: 0,
         vector_bytes: Vec::new(),
@@ -368,8 +481,14 @@ fn seed_collection_snapshot() -> Result<(), Box<dyn std::error::Error>> {
                 columns: vec![
                     ("flag".to_string(), SnapshotScalar::Bool(true)),
                     ("g".to_string(), SnapshotScalar::I64(2)),
-                    ("label".to_string(), SnapshotScalar::Text("label_1p".to_string())),
-                    ("payload".to_string(), SnapshotScalar::JsonText("{\"g\":2}".to_string())),
+                    (
+                        "label".to_string(),
+                        SnapshotScalar::Text("label_1p".to_string()),
+                    ),
+                    (
+                        "payload".to_string(),
+                        SnapshotScalar::JsonText("{\"g\":2}".to_string()),
+                    ),
                     ("score".to_string(), SnapshotScalar::F64(0.5)),
                     ("ts".to_string(), SnapshotScalar::Timestamp(1_700_000_000)),
                 ],
@@ -380,8 +499,13 @@ fn seed_collection_snapshot() -> Result<(), Box<dyn std::error::Error>> {
             },
         ],
         tombstones: vec![3, 9],
+        sparse: None,
     };
-    write_seed(&dir, "payload.bin", &encode_collection_snapshot_payload(&payload)?)?;
+    write_seed(
+        &dir,
+        "payload.bin",
+        &encode_collection_snapshot_payload(&payload)?,
+    )?;
 
     let manifest = CollectionManifest {
         format_version: 1,
@@ -396,6 +520,11 @@ fn seed_collection_snapshot() -> Result<(), Box<dyn std::error::Error>> {
             index_type: "hnsw".to_string(),
             ha_level: 1,
             metric: Some(1),
+            vector_dtype: Some(0),
+            quantization: None,
+            sparse: None,
+            // 仅 int8 写 Some(1)；此处保持未量化。
+            // EN: only int8 writes Some(1); this sample stays unquantized.
             vector_kind: SnapshotVectorKind::Empty as u8,
             file: "docs.collection_snapshot.7.1.0.bin".to_string(),
             file_len: 128,
@@ -404,6 +533,311 @@ fn seed_collection_snapshot() -> Result<(), Box<dyn std::error::Error>> {
             scalar_rows: 2,
         }],
     };
-    write_seed(&dir, "manifest.bin", &encode_collection_manifest(&manifest)?)?;
+    write_seed(
+        &dir,
+        "manifest.bin",
+        &encode_collection_manifest(&manifest)?,
+    )?;
+
+    // int8 变体：真实 v3 图 payload 装进 HNSW_GRAPH 形态的 collection payload，
+    // 以及 format_version=2 的 manifest（entry quantization=Some(1)）。让解码器
+    // 从语料就能到达 int8 校验分支（flags bit1 / manifest v2），而不是靠变异猜
+    // 位置；同时保留上面的未量化样本作为 v1 兼容对照。
+    // EN: int8 variant: a real v3 graph payload inside an HNSW_GRAPH-shaped
+    // collection payload, plus a format_version=2 manifest (entry
+    // quantization=Some(1)). The decoder reaches the int8 validation branches
+    // (payload flags bit1 / manifest v2) straight from the corpus instead of
+    // mutation guessing positions; the unquantized sample above stays as the
+    // v1-compatibility counterpart.
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+    let int8_graph = build_graph_snapshot(
+        &rt,
+        4,
+        vec![
+            (1, vec![1.0, 0.0, 0.0, 0.0]),
+            (2, vec![0.0, 1.0, 0.0, 0.0]),
+            (3, vec![0.0, 0.0, 1.0, 0.0]),
+        ],
+        houyi_vector::Quantization::Int8,
+    );
+    let int8_graph_len = int8_graph.len() as u64;
+    let int8_payload = CollectionSnapshotPayload {
+        checkpoint_lsn: 7,
+        name: "int8docs".to_string(),
+        dims: 4,
+        index_type: "hnsw".to_string(),
+        ha_level: 1,
+        metric: Some(0),
+        hnsw: Some(
+            houyi_persistence::collection_snapshot_file::SnapshotHnswParams {
+                m: 24,
+                ef_construction: 400,
+                ef_search: 256,
+            },
+        ),
+        vector_dtype: Some(SnapshotVectorDtype::F32),
+        quantization: Some(SnapshotQuantization::Int8),
+        vector_kind: SnapshotVectorKind::HnswGraph,
+        vector_count: 3,
+        vector_bytes: int8_graph,
+        scalars: Vec::new(),
+        tombstones: Vec::new(),
+        sparse: None,
+    };
+    write_seed(
+        &dir,
+        "payload_int8.bin",
+        &encode_collection_snapshot_payload(&int8_payload)?,
+    )?;
+
+    let int8_manifest = CollectionManifest {
+        format_version: 2,
+        manifest_seq: 2,
+        created_at_unix: 1_700_000_000,
+        global_barrier_lsn: 9,
+        safe_checkpoint_lsn: 7,
+        collections: vec![CollectionManifestEntry {
+            name: "int8docs".to_string(),
+            checkpoint_lsn: 7,
+            dims: 4,
+            index_type: "hnsw".to_string(),
+            ha_level: 1,
+            metric: Some(0),
+            vector_dtype: Some(0),
+            quantization: Some(SnapshotQuantization::Int8.as_u8()),
+            sparse: None,
+            vector_kind: SnapshotVectorKind::HnswGraph as u8,
+            file: "int8docs.collection_snapshot.7.2.0.bin".to_string(),
+            file_len: int8_graph_len,
+            payload_crc32: 0,
+            vector_count: 3,
+            scalar_rows: 0,
+        }],
+    };
+    write_seed(
+        &dir,
+        "manifest_int8.bin",
+        &encode_collection_manifest(&int8_manifest)?,
+    )?;
+
+    // rabitq 变体（P3）：payload flags bit2=0x04，manifest format_version=3、
+    // entry quantization=Some(2)。三个版本号（payload flag / 图快照 v4 /
+    // manifest format 3）必须同源一致，种子让解码器从语料直达这些校验分支。
+    // EN: rabitq variant (P3): payload flags bit2=0x04, manifest
+    // format_version=3 and entry quantization=Some(2). The three version marks
+    // (payload flag / graph snapshot v4 / manifest format 3) must agree; the
+    // seed lands the decoder directly on those validation branches.
+    let rabitq_graph = build_graph_snapshot(
+        &rt,
+        4,
+        vec![
+            (1, vec![1.0, 0.0, 0.0, 0.0]),
+            (2, vec![0.0, 1.0, 0.0, 0.0]),
+            (3, vec![0.0, 0.0, 1.0, 0.0]),
+        ],
+        houyi_vector::Quantization::RaBitQ,
+    );
+    let rabitq_graph_len = rabitq_graph.len() as u64;
+    let rabitq_payload = CollectionSnapshotPayload {
+        checkpoint_lsn: 7,
+        name: "rabitqdocs".to_string(),
+        dims: 4,
+        index_type: "hnsw".to_string(),
+        ha_level: 1,
+        metric: Some(0),
+        hnsw: Some(
+            houyi_persistence::collection_snapshot_file::SnapshotHnswParams {
+                m: 24,
+                ef_construction: 400,
+                ef_search: 256,
+            },
+        ),
+        vector_dtype: Some(SnapshotVectorDtype::F32),
+        quantization: Some(SnapshotQuantization::RaBitQ),
+        vector_kind: SnapshotVectorKind::HnswGraph,
+        vector_count: 3,
+        vector_bytes: rabitq_graph,
+        scalars: Vec::new(),
+        tombstones: Vec::new(),
+        sparse: None,
+    };
+    write_seed(
+        &dir,
+        "payload_rabitq.bin",
+        &encode_collection_snapshot_payload(&rabitq_payload)?,
+    )?;
+
+    let rabitq_manifest = CollectionManifest {
+        format_version: 3,
+        manifest_seq: 3,
+        created_at_unix: 1_700_000_000,
+        global_barrier_lsn: 9,
+        safe_checkpoint_lsn: 7,
+        collections: vec![CollectionManifestEntry {
+            name: "rabitqdocs".to_string(),
+            checkpoint_lsn: 7,
+            dims: 4,
+            index_type: "hnsw".to_string(),
+            ha_level: 1,
+            metric: Some(0),
+            vector_dtype: Some(0),
+            quantization: Some(SnapshotQuantization::RaBitQ.as_u8()),
+            sparse: None,
+            vector_kind: SnapshotVectorKind::HnswGraph as u8,
+            file: "rabitqdocs.collection_snapshot.7.3.0.bin".to_string(),
+            file_len: rabitq_graph_len,
+            payload_crc32: 0,
+            vector_count: 3,
+            scalar_rows: 0,
+        }],
+    };
+    write_seed(
+        &dir,
+        "manifest_rabitq.bin",
+        &encode_collection_manifest(&rabitq_manifest)?,
+    )?;
+
+    // 稀疏变体（P4）：payload flags bit3=0x08，倒排段内联在 tombstones 之后
+    // （v3）；manifest format_version=4、条目 sparse=Some(1)。语料让解码器直达
+    // term/posting 升序、tf 有限正数与墓碑交叉校验分支。
+    // EN: sparse variant (P4): payload flags bit3=0x08 with the inverted-index
+    // section appended after tombstones (v3); manifest format_version=4 and entry
+    // sparse=Some(1). The seed lands the decoder directly on the term/posting
+    // ascending order, finite-positive tf, and tombstone cross-check branches.
+    let sparse_payload = CollectionSnapshotPayload {
+        checkpoint_lsn: 7,
+        name: "sparse_docs".to_string(),
+        dims: 4,
+        index_type: "flat".to_string(),
+        ha_level: 1,
+        metric: Some(0),
+        hnsw: None,
+        vector_dtype: None,
+        quantization: None,
+        vector_kind: SnapshotVectorKind::Empty,
+        vector_count: 0,
+        vector_bytes: Vec::new(),
+        scalars: vec![SnapshotScalarRow {
+            id: 1,
+            columns: vec![("g".to_string(), SnapshotScalar::I64(2))],
+        }],
+        tombstones: vec![9],
+        sparse: Some(
+            houyi_persistence::collection_snapshot_file::SnapshotSparseIndex {
+                doc_count: 2,
+                // 文档 1（term 7: 1.0 + term 8: 0.5）与文档 2（term 7: 2.0）。
+                // EN: doc 1 (term 7: 1.0 + term 8: 0.5) and doc 2 (term 7: 2.0).
+                total_len: 3.5,
+                terms: vec![(7, vec![(1, 1.0), (2, 2.0)]), (8, vec![(1, 0.5)])],
+            },
+        ),
+    };
+    write_seed(
+        &dir,
+        "payload_sparse.bin",
+        &encode_collection_snapshot_payload(&sparse_payload)?,
+    )?;
+
+    let sparse_manifest = CollectionManifest {
+        format_version: 4,
+        manifest_seq: 4,
+        created_at_unix: 1_700_000_000,
+        global_barrier_lsn: 9,
+        safe_checkpoint_lsn: 7,
+        collections: vec![CollectionManifestEntry {
+            name: "sparse_docs".to_string(),
+            checkpoint_lsn: 7,
+            dims: 4,
+            index_type: "flat".to_string(),
+            ha_level: 1,
+            metric: Some(0),
+            vector_dtype: None,
+            quantization: None,
+            sparse: Some(1),
+            vector_kind: SnapshotVectorKind::Empty as u8,
+            file: "sparse_docs.collection_snapshot.7.4.0.bin".to_string(),
+            file_len: 128,
+            payload_crc32: 0x1234_5678,
+            vector_count: 0,
+            scalar_rows: 1,
+        }],
+    };
+    write_seed(
+        &dir,
+        "manifest_sparse.bin",
+        &encode_collection_manifest(&sparse_manifest)?,
+    )?;
+    Ok(())
+}
+
+/// 目标 6：真实 collections WAL payload（create 含 `sparse=bm25`、upsert 含
+/// 稀疏词项 / 空列表 / 缺省、delete、drop、set_ha_level）。
+/// EN: Target 6: real collections WAL payloads (create with `sparse=bm25`,
+/// upsert with sparse terms / an empty list / an absent field, delete, drop,
+/// set_ha_level).
+fn seed_collection_wal() -> Result<(), Box<dyn std::error::Error>> {
+    use houyi_persistence::collection_wal::{
+        encode_collection_create_with_options, encode_collection_delete, encode_collection_drop,
+        encode_collection_set_ha_level, encode_collection_upsert_batch, CollectionCreateOptions,
+        CollectionWalItem,
+    };
+
+    let dir = corpus_dir("collection_wal_decode");
+    let mut options = CollectionCreateOptions::default();
+    options.metric = Some("l2".to_string());
+    options.sparse = Some("bm25".to_string());
+    write_seed(
+        &dir,
+        "create_bm25.json",
+        &encode_collection_create_with_options("sparse_docs", 4, "hnsw", &options)?,
+    )?;
+
+    let items = vec![
+        CollectionWalItem {
+            id: 1,
+            values: vec![1.0, 0.0, 0.0, 0.0],
+            label: Some("a".to_string()),
+            payload: None,
+            sparse: Some(vec![(7, 1.0), (8, 0.5)]),
+        },
+        CollectionWalItem {
+            id: 2,
+            values: vec![0.0, 1.0, 0.0, 0.0],
+            label: None,
+            payload: None,
+            // 空列表 = 清空该文档稀疏（区别于缺省 = 不改）。
+            // EN: an empty list clears the document's sparse terms (distinct from
+            // absence, which leaves them unchanged).
+            sparse: Some(Vec::new()),
+        },
+        CollectionWalItem {
+            id: 3,
+            values: vec![0.0, 0.0, 1.0, 0.0],
+            label: None,
+            payload: None,
+            sparse: None,
+        },
+    ];
+    write_seed(
+        &dir,
+        "upsert_sparse.json",
+        &encode_collection_upsert_batch("sparse_docs", 4, &items)?,
+    )?;
+    write_seed(
+        &dir,
+        "delete.json",
+        &encode_collection_delete("sparse_docs", &[1, 3])?,
+    )?;
+    write_seed(&dir, "drop.json", &encode_collection_drop("sparse_docs")?)?;
+    write_seed(
+        &dir,
+        "set_ha_level.json",
+        &encode_collection_set_ha_level(
+            "sparse_docs",
+            houyi_persistence::ha_level::HaLevel::FullSync,
+        )?,
+    )?;
     Ok(())
 }

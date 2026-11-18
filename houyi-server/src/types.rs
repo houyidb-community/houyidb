@@ -1513,6 +1513,24 @@ pub struct UpsertVector {
     /// crate-private `json_value_to_scalar` conversion (module `scalar_json`).
     #[serde(default)]
     pub payload: Option<serde_json::Map<String, serde_json::Value>>,
+    /// 稀疏词项数组 `[[term_id, weight], …]`（P4，仅 `sparse=bm25` 集合有效）。
+    /// 语义：键缺省或 `null` = **不修改**该文档的稀疏数据；`[]` = 清空；
+    /// 非空数组 = 整文档替换（重复 term 求和、按 term 升序落库）。term 范围
+    /// `1..=2^24-1`，权重必须有限且 > 0，单文档最多 1024 个对。在 `sparse=none`
+    /// 集合上携带本键（含 `[]`）一律 400，绝不静默丢弃。
+    ///
+    /// 为什么用原始 JSON 值而不是 `Option<Vec<(u32, f32)>>`：元组反序列化失败
+    /// 会走 axum 的 Json 提取器拒绝（422），而本接口契约要求形状错误映射 400；
+    /// 处理器边界统一解析可给出带 id/下标的错误信息。
+    /// EN: Sparse term pairs `[[term_id, weight], …]` (P4; bm25 collections only).
+    /// Absent or `null` = no change; `[]` = clear; a non-empty array replaces the
+    /// whole document (duplicates summed, stored term-ascending). Terms are
+    /// `1..=2^24-1`, weights finite and > 0, at most 1024 pairs per document.
+    /// Any sparse key (including `[]`) on a sparse=none collection is a 400 —
+    /// never silently dropped. The raw JSON value is kept so shape violations
+    /// map to 400 at the handler boundary instead of serde's 422 rejection.
+    #[serde(default)]
+    pub sparse: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Serialize)]
@@ -1633,6 +1651,35 @@ pub struct CreateCollectionRequest {
     pub hnsw_ef_construction: Option<usize>,
     #[serde(default)]
     pub hnsw_ef_search: Option<usize>,
+    /// 向量存储编码：`f32` / `f16`（大小写不敏感；别名 float32/fp32/float16/fp16/half）。
+    /// 缺省 f32；仅 `index_type=hnsw` 可指定非 f32，且创建后不可变。
+    /// EN: Vector storage encoding: `f32` / `f16` (case-insensitive; aliases
+    /// float32/fp32/float16/fp16/half). Defaults to f32; non-f32 values require
+    /// `index_type=hnsw` and are immutable after creation.
+    #[serde(default)]
+    pub vector_dtype: Option<String>,
+    /// 图侧量化：`none` / `int8` / `rabitq`（大小写不敏感）。缺省 none；仅
+    /// `index_type=hnsw` 可指定非 none，且创建后不可变。`rabitq`（1 bit/dim
+    /// 二值量化）仅支持 `metric=l2|cosine`。主表始终保留原始向量，量化只压缩
+    /// 图内副本，最终 top-k 在原始向量上精确重排。
+    /// EN: Graph-side quantization: `none` / `int8` / `rabitq` (case-insensitive).
+    /// Defaults to none; non-none values require `index_type=hnsw` and are
+    /// immutable after creation. `rabitq` (1 bit/dim binary quantization)
+    /// supports only `metric=l2|cosine`. The main store always keeps raw vectors;
+    /// quantization only shrinks the in-graph copy, and the final top-k is
+    /// reranked exactly on raw vectors.
+    #[serde(default)]
+    pub quantization: Option<String>,
+    /// 稀疏索引模式：`none` / `bm25`（大小写不敏感，未知值 400）；缺省 none。
+    /// `bm25` 仅允许 `index_type=hnsw|flat`，创建后不可变；同名集合以不同
+    /// sparse 重建 → 409。隐式创建（upsert 首批写入）恒为 none。
+    ///
+    /// EN: Sparse index mode: `none` / `bm25` (case-insensitive; unknown -> 400).
+    /// Defaults to none. `bm25` requires `index_type=hnsw|flat`, is immutable
+    /// after creation, and recreating the same name with a different value is a
+    /// 409. Implicit creation (first upsert) is always none.
+    #[serde(default)]
+    pub sparse: Option<String>,
 }
 
 /// 建集合时生效的 HNSW 参数（响应与状态端点共用）。
@@ -1658,10 +1705,141 @@ pub struct CreateCollectionResponse {
     /// EN: Canonical metric string matching the actual scoring metric.
     pub metric: String,
     pub index_type: String,
+    /// 实际生效的存储编码（`f32` | `f16`）；缺省请求即回显 `f32`。
+    /// EN: Effective storage encoding (`f32` | `f16`); echoes `f32` when defaulted.
+    pub vector_dtype: String,
+    /// 实际生效的图侧量化（`none` | `int8` | `rabitq`）；缺省请求即回显 `none`。
+    /// EN: Effective graph-side quantization (`none` | `int8` | `rabitq`);
+    /// echoes `none` when defaulted.
+    pub quantization: String,
     /// 仅 `index_type=hnsw` 时存在；其他后端不序列化此字段。
     /// EN: Present only for `index_type=hnsw`; omitted for other backends.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub hnsw: Option<HnswParamsResponse>,
+    /// 实际生效的稀疏模式（`none` | `bm25`）；缺省请求即回显 `none`。
+    /// EN: Effective sparse mode (`none` | `bm25`); echoes `none` when defaulted.
+    pub sparse: String,
+}
+
+/// 融合模式（P4）：RRF（默认）或加权。解析大小写不敏感，未知值由边缘 400。
+/// EN: Fusion mode (P4): RRF (default) or weighted; parsing is case-insensitive
+/// and edges map unknown values to 400.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FusionMode {
+    Rrf,
+    Weighted,
+}
+
+impl FusionMode {
+    /// 稳定线格式串（请求/响应回显共用）。
+    /// EN: Stable wire string shared by requests and response echoes.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            FusionMode::Rrf => "rrf",
+            FusionMode::Weighted => "weighted",
+        }
+    }
+
+    /// 解析融合模式；未知值返回 `None`。
+    /// EN: Parse a fusion mode; unknown values return `None`.
+    pub fn parse_str(value: &str) -> Option<Self> {
+        match value.to_ascii_lowercase().as_str() {
+            "rrf" => Some(FusionMode::Rrf),
+            "weighted" => Some(FusionMode::Weighted),
+            _ => None,
+        }
+    }
+}
+
+/// RRF 的 `rrf_k` 缺省值与合法区间（1..=1000）。
+/// EN: Default RRF constant and its legal range (1..=1000).
+pub const DEFAULT_RRF_K: u32 = 60;
+pub const MAX_RRF_K: u32 = 1000;
+/// 加权融合 alpha 缺省值（合法区间 0..=1）。
+/// EN: Default weighted-fusion alpha (legal range 0..=1).
+pub const DEFAULT_FUSION_ALPHA: f32 = 0.5;
+
+/// 融合检索请求（`POST /v1/collections/{name}/fusion/search`）。
+/// EN: Fusion-search request (`POST /v1/collections/{name}/fusion/search`).
+#[derive(Debug, Deserialize)]
+pub struct FusionSearchRequest {
+    /// dense 查询向量，长度必须等于 Collection 维度且分量有限。
+    /// EN: Dense query vector; length must match the collection dims and all
+    /// components must be finite.
+    pub vector: Vec<f32>,
+    /// 稀疏查询词项 `[[term_id, weight], …]`，必填非空、≤64 个 term。
+    /// 与 upsert 的 `sparse` 同为原始 JSON 值（形状错误统一映射 400）。
+    /// EN: Sparse query terms; required, non-empty, at most 64 terms. Raw JSON
+    /// for the same 400-on-shape reason as the upsert field.
+    #[serde(default)]
+    pub sparse: Option<serde_json::Value>,
+    /// 返回上限 top-k。
+    /// EN: Top-k limit.
+    pub k: usize,
+    /// 结构化过滤（AND）；集合为 bm25 时后端必为 hnsw/flat，过滤天然可用。
+    /// EN: Structured filters (AND); bm25 collections are hnsw/flat, so filters
+    /// are always supported.
+    #[serde(default)]
+    pub filters: Vec<HybridSearchFilter>,
+    /// 是否携带每命中 payload。
+    /// EN: Whether to include per-hit payloads.
+    #[serde(default)]
+    pub include_payload: bool,
+    /// 可选 HNSW ef 覆盖。
+    /// EN: Optional HNSW ef override.
+    #[serde(default)]
+    pub ef_search: Option<usize>,
+    /// `rrf` | `weighted`，缺省 rrf。
+    /// EN: `rrf` | `weighted`; defaults to rrf.
+    #[serde(default)]
+    pub fusion: Option<String>,
+    /// RRF 常数，缺省 60，合法 1..=1000（仅 rrf 模式参与计算）。
+    /// EN: RRF constant, default 60, legal 1..=1000 (only rrf scoring uses it).
+    #[serde(default)]
+    pub rrf_k: Option<u32>,
+    /// 加权系数，缺省 0.5，合法 0..=1（仅 weighted 模式参与计算）。
+    /// EN: Weighted coefficient, default 0.5, legal 0..=1 (only weighted scoring uses it).
+    #[serde(default)]
+    pub alpha: Option<f32>,
+}
+
+/// 融合参数回显：生效模式 + 该模式的参数（另一参数为 null）。
+/// EN: Echo of the effective fusion parameters; the inactive parameter is null.
+#[derive(Debug, Serialize)]
+pub struct FusionParamsResponse {
+    pub mode: String,
+    pub rrf_k: Option<u32>,
+    pub alpha: Option<f32>,
+}
+
+/// 融合检索响应（P4）。
+///
+/// `scores` 只表达**融合排序**（RRF 分或加权融合分），不属于任何距离度量
+/// 口径；`dense_scores` 才按集合 metric 换算（与 `/search` 的 `scores` 同口径），
+/// `sparse_scores` 是 BM25 原始分。两个按模态的数组与 `ids` 等长对齐，仅在
+/// 对应模态命中时该位置为数值，否则为 `null`。
+///
+/// EN: `scores` expresses **fusion ranking only** (RRF or weighted score) and
+/// belongs to no distance metric; `dense_scores` follows the collection metric
+/// (same conversion as `/search`), while `sparse_scores` are raw BM25 scores.
+/// Both per-modality arrays align with `ids`; positions are numeric only when
+/// the document came from that modality, otherwise `null`.
+#[derive(Debug, Serialize)]
+pub struct FusionSearchResponse {
+    pub ids: Vec<u64>,
+    pub scores: Vec<f32>,
+    pub dense_scores: Vec<Option<f32>>,
+    pub sparse_scores: Vec<Option<f32>>,
+    /// 集合度量（仅用于解释 `dense_scores`）。
+    /// EN: Collection metric (explains `dense_scores` only).
+    pub metric: String,
+    pub fusion: FusionParamsResponse,
+    /// 与 `SearchResponse::payloads` 同语义；仅在请求 include_payload 且命中
+    /// 有标量行时存在。
+    /// EN: Same semantics as `SearchResponse::payloads`; present only when
+    /// requested and hits carry scalar rows.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub payloads: Option<std::collections::HashMap<String, serde_json::Value>>,
 }
 
 /// 设置 Collection HA 级别请求（P4.4.2）/ Set a collection's HA level.

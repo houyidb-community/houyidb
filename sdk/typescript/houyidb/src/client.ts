@@ -7,8 +7,10 @@
 import { stringify } from "./json.js";
 import {
   Filter,
+  FusionResult,
   HouyiError,
   SearchResult,
+  SparseTerm,
   toVectorId,
   Vector,
   VectorIdInput,
@@ -58,6 +60,25 @@ export interface HybridSearchOptions extends SearchOptions {
 }
 
 /**
+ * 融合检索可选参数：两路各过取 4×k 后融合。
+ *
+ * fusion 缺省 rrf（rrfK 缺省 60）；weighted 在过滤后候选上各路 min-max
+ * 归一后按 alpha*dense + (1-alpha)*sparse 相加（alpha 缺省 0.5）。显式给出的
+ * 旋钮一律由服务端严格校验（越界 400，即使当前模式不参与计算）。
+ * EN: Optional fusion-search parameters; each path over-fetches 4x k before
+ * fusing. fusion defaults to rrf (rrfK defaults to 60); weighted min-max
+ * normalizes each modality over the filtered candidates and sums
+ * alpha*dense + (1-alpha)*sparse (alpha defaults to 0.5). Explicitly given
+ * knobs are strictly validated by the server (400 when out of range, even
+ * under the inactive mode).
+ */
+export interface FusionSearchOptions extends HybridSearchOptions {
+  fusion?: "rrf" | "weighted";
+  rrfK?: number;
+  alpha?: number;
+}
+
+/**
  * 删除参数：ids 与 filters 至少给其一（两者取并集）。
  * EN: Delete parameters: at least one of ids or filters (the two are unioned).
  */
@@ -98,6 +119,36 @@ export interface CreateCollectionOptions {
    */
   indexType?: string;
   hnsw?: HnswParams;
+  /**
+   * 向量存储编码：f32（缺省）或 f16（仅 hnsw，省一半向量内存）。
+   * 创建后不可变；非 f32 与非 hnsw 组合由服务端拒绝（400）。
+   * EN: Vector storage encoding: f32 (default) or f16 (hnsw only, halves
+   * vector memory). Immutable after creation; non-f32 with a non-hnsw backend
+   * is rejected by the server (400).
+   */
+  vectorDtype?: string;
+  /**
+   * 图侧量化：none（缺省）、int8 或 rabitq（仅 hnsw，压缩图内距离工作集；
+   * 主表保留原始向量并在检索时精确重排）。rabitq 为 1 bit/dim，仅支持
+   * metric l2|cosine（ip/l1 返回 400）。创建后不可变；非 none 与非 hnsw
+   * 组合由服务端拒绝（400）。
+   * EN: Graph-side quantization: none (default), int8, or rabitq (hnsw only,
+   * shrinks the in-graph distance working set; the main store keeps raw
+   * vectors and reranks exactly at search time). rabitq packs 1 bit/dim and
+   * supports metric l2|cosine only (ip/l1 return 400). Immutable after
+   * creation; non-none with a non-hnsw backend is rejected by the server
+   * (400).
+   */
+  quantization?: string;
+  /**
+   * 稀疏索引模式：none（缺省）或 bm25（仅 hnsw/flat 后端）。开启后集合获得
+   * 倒排稀疏索引并支持 fusionSearch；创建后不可变，隐式创建恒为 none。
+   * EN: Sparse index mode: none (default) or bm25 (hnsw/flat backends only).
+   * When enabled the collection gains an inverted sparse index and supports
+   * fusionSearch; it is immutable after creation, and implicit creation is
+   * always none.
+   */
+  sparse?: string;
 }
 
 /**
@@ -116,6 +167,22 @@ export interface CreateCollectionResult {
   dims: number;
   metric: string;
   indexType: string;
+  /**
+   * 实际生效的存储编码（f32 | f16）；旧服务端不返回时为 undefined。
+   * EN: Effective storage encoding (f32 | f16); undefined from older servers.
+   */
+  vectorDtype?: string;
+  /**
+   * 实际生效的图侧量化（none | int8 | rabitq）；旧服务端不返回时为 undefined。
+   * EN: Effective graph-side quantization (none | int8 | rabitq); undefined
+   * from older servers.
+   */
+  quantization?: string;
+  /**
+   * 实际生效的稀疏模式（none | bm25）；旧服务端不返回时为 undefined。
+   * EN: Effective sparse mode (none | bm25); undefined from older servers.
+   */
+  sparse?: string;
   hnsw?: HnswParams;
 }
 
@@ -129,6 +196,9 @@ interface RawCreateCollectionResult {
   dims: number;
   metric: string;
   index_type: string;
+  vector_dtype?: string;
+  quantization?: string;
+  sparse?: string;
   hnsw?: { m: number; ef_construction: number; ef_search: number };
 }
 
@@ -201,6 +271,38 @@ export class Collection {
     if (opts.includePayload) req.include_payload = true;
     return this.#client.postSearch(
       `/v1/collections/${this.#quoted}/hybrid/search`,
+      req,
+    );
+  }
+
+  /**
+   * 稠密 + 稀疏融合检索（仅 ``sparse: "bm25"`` 的集合；两路均需非空）。
+   *
+   * 稀疏查询每项为 ``[termId, weight]``，最多 64 个原始对；filters 取交集，
+   * 仅 hnsw/flat 后端支持。响应 ``scores`` 只表达融合排序，``denseScore``
+   * 才按集合度量换算、``sparseScore`` 为 BM25 原始分。
+   * EN: Dense + sparse fusion search (only for ``sparse: "bm25"`` collections;
+   * both modalities must be non-empty). Sparse query items are
+   * ``[termId, weight]`` with at most 64 raw pairs; filters intersect and are
+   * supported on hnsw/flat backends only. Response ``scores`` only express
+   * fused ranking; only ``denseScore`` is converted under the collection
+   * metric, and ``sparseScore`` is the raw BM25 score.
+   */
+  async fusionSearch(
+    vector: number[],
+    sparse: SparseTerm[],
+    k: number,
+    opts: FusionSearchOptions = {},
+  ): Promise<FusionResult> {
+    const req: Record<string, unknown> = { vector, sparse, k };
+    if (opts.filters && opts.filters.length > 0) req.filters = opts.filters;
+    if (opts.efSearch !== undefined) req.ef_search = opts.efSearch;
+    if (opts.includePayload) req.include_payload = true;
+    if (opts.fusion !== undefined) req.fusion = opts.fusion;
+    if (opts.rrfK !== undefined) req.rrf_k = opts.rrfK;
+    if (opts.alpha !== undefined) req.alpha = opts.alpha;
+    return this.#client.postFusion(
+      `/v1/collections/${this.#quoted}/fusion/search`,
       req,
     );
   }
@@ -283,6 +385,11 @@ export class HouyiClient {
     const payload: Record<string, unknown> = { dims };
     if (opts.metric !== undefined) payload.metric = opts.metric;
     if (opts.indexType !== undefined) payload.index_type = opts.indexType;
+    if (opts.vectorDtype !== undefined) payload.vector_dtype = opts.vectorDtype;
+    if (opts.quantization !== undefined) {
+      payload.quantization = opts.quantization;
+    }
+    if (opts.sparse !== undefined) payload.sparse = opts.sparse;
     if (opts.hnsw) {
       payload.hnsw_m = opts.hnsw.m;
       payload.hnsw_ef_construction = opts.hnsw.efConstruction;
@@ -305,6 +412,26 @@ export class HouyiClient {
       dims: raw.dims,
       metric: raw.metric,
       indexType: raw.index_type,
+      // 旧服务端不返回 vector_dtype 时保持未设置（不伪造 f32）。与 hnsw 同理，
+      // 显式 `vectorDtype: undefined` 仍会创建自有属性，`Object.hasOwn` 会误判
+      // 为存在，因此只在有值时展开。
+      // EN: keep vector_dtype unset when an older server omits it (never fake
+      // f32). As with hnsw, an explicit `vectorDtype: undefined` still creates
+      // an own property that `Object.hasOwn` reports as present, so spread it
+      // only when present.
+      ...(raw.vector_dtype !== undefined
+        ? { vectorDtype: raw.vector_dtype }
+        : {}),
+      // 与 vector_dtype 同纪律：旧服务端缺席 quantization 时不创建自有键。
+      // EN: same discipline as vector_dtype: do not create an own key when an
+      // older server omits quantization.
+      ...(raw.quantization !== undefined
+        ? { quantization: raw.quantization }
+        : {}),
+      // sparse 回显同理：旧服务端（P4 之前）没有该字段，不得伪造 none。
+      // EN: same for the sparse echo: pre-P4 servers have no such field, so
+      // never fake "none".
+      ...(raw.sparse !== undefined ? { sparse: raw.sparse } : {}),
       ...(raw.hnsw
         ? {
             hnsw: {
@@ -422,12 +549,14 @@ export class HouyiClient {
   }
 
   /**
-   * 检索专用 POST：响应走 SearchResult.fromRawJson（ids 防 2^53 精度腐蚀）。
+   * 检索类原始 POST：统一超时、错误体透出与文本读取；解析交给调用方的
+   * fromRawJson（ids 防 2^53 精度腐蚀）。
    * @internal
-   * EN: Search-specific POST: responses go through SearchResult.fromRawJson
-   * (ids are protected against 2^53 precision corruption).
+   * EN: Raw POST for search endpoints: one timeout, error-body passthrough and
+   * text read shared by callers; parsing is left to their fromRawJson (ids
+   * protected against 2^53 precision corruption).
    */
-  async postSearch(path: string, payload: unknown): Promise<SearchResult> {
+  async postRaw(path: string, payload: unknown): Promise<string> {
     const resp = await this.#fetch(`${this.#baseUrl}${path}`, {
       method: "POST",
       headers: { "content-type": "application/json" },
@@ -437,7 +566,25 @@ export class HouyiClient {
     if (resp.status >= 400) {
       throw new HouyiError(resp.status, (await resp.text()).trim() || resp.statusText);
     }
-    return SearchResult.fromRawJson(await resp.text());
+    return resp.text();
+  }
+
+  /**
+   * 向量检索专用 POST：响应走 SearchResult.fromRawJson。
+   * @internal
+   * EN: Vector-search POST: responses go through SearchResult.fromRawJson.
+   */
+  async postSearch(path: string, payload: unknown): Promise<SearchResult> {
+    return SearchResult.fromRawJson(await this.postRaw(path, payload));
+  }
+
+  /**
+   * 融合检索专用 POST：响应走 FusionResult.fromRawJson。
+   * @internal
+   * EN: Fusion-specific POST: responses go through FusionResult.fromRawJson.
+   */
+  async postFusion(path: string, payload: unknown): Promise<FusionResult> {
+    return FusionResult.fromRawJson(await this.postRaw(path, payload));
   }
 
   private static async checked<T>(resp: Response): Promise<T> {

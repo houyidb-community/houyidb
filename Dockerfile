@@ -19,7 +19,14 @@ COPY . .
 
 # 默认 portable 路径：无 SIMD 编译期特化，运行时跨 CPU 通用（amd64/arm64 均可）。
 # 如需 AVX2 构建：docker build --build-arg CARGO_FEATURES=simd-avx2 .
+#
+# 构建上下文排除了 `.git`（.dockerignore），build.rs 的 git 探测必然失败；
+# CI/本地要嵌入提交标识必须显式传入（镜像 `/v1/version` 的 build_sha 来源）。
+# EN: The build context excludes `.git` (.dockerignore), so build.rs cannot
+# probe git. Pass the commit identity explicitly to embed it as `/version`'s
+# build_sha.
 ARG CARGO_FEATURES=""
+ARG HOUYIDB_GIT_SHA=""
 RUN if [ -n "$CARGO_FEATURES" ]; then \
         cargo build --release -p houyi-server --features "$CARGO_FEATURES"; \
     else \

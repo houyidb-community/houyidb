@@ -2,7 +2,7 @@
 
 > [中文](README.md)
 
-A thin wrapper around the HouyiDB collections HTTP API: transport + types, with no framework semantics.
+A thin wrapper around the HouyiDB collections HTTP API: transport + types, with no framework semantics. Requires Python ≥ 3.10.
 
 ```python
 from houyidb import HouyiClient, Vector, Filter

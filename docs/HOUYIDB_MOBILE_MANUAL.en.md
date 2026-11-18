@@ -49,7 +49,7 @@ void* houyi_mobile_create(uint32_t dims, const char* index_type);
 | Type | Memory | Latency | Recall | Use case |
 |------|------|------|--------|------|
 | `flat` | No compression | O(N) | 1.0 (exact) | N < 5K, offline evaluation |
-| `flat-clustered` | No compression | < 1ms | > 0.95 | **Recommended mobile default** |
+| `flat-clustered` | f16 (~half of f32) / i8 (~half of f16 plus scale) | ~0.5–1ms | > 0.95 | **Recommended default: f16; use i8 under memory pressure** |
 | `clustered-hnsw` | Graph structure | ~1ms | > 0.99 | N > 50K, high recall |
 
 ### 2.2 Inserting vectors
@@ -64,9 +64,15 @@ int32_t houyi_mobile_insert(void* handle, uint64_t id, const float* vector, uint
 | `id` | Unique vector identifier |
 | `vector` | Pointer to the float array |
 | `len` | Array length (must equal dims) |
-| Return | 0 on success, -1 on failure |
+| Return | 0 on success; -1 for argument/dimension/missing collection; -2 for semantic rejection (e.g. overwriting an existing id after a clustered-hnsw build; rebuild first) |
 
 Supports idempotent overwrite: inserting the same `id` again overwrites the old value.
+
+> After a build:
+> - `flat-clustered`: incremental inserts are assigned to the nearest centroid and are **searchable immediately**; overwriting an existing id updates in place or moves it across clusters without changing the count.
+> - `clustered-hnsw`: post-build inserts of **new ids** are accepted (immediately searchable); overwriting an existing id returns -2, so recreate the index before a batch upsert to avoid stale copies.
+> - `flat`: always scans the store directly; no build step is needed.
+> - Calling `build` again reclusters from the current index (including incremental rows) and does not depend on the released write buffer.
 
 ### 2.3 Building the index
 
@@ -109,9 +115,106 @@ uint32_t houyi_mobile_count(void* handle);
 void houyi_mobile_destroy(void* handle);
 ```
 
+### 2.7 ABI v2: batch writes / u64 results / explicit config
+
+```c
+void* houyi_mobile_create_v2(uint32_t dims, const char* index_type,
+                             uint8_t metric, uint8_t dtype); // NULL on invalid
+int32_t houyi_mobile_insert_batch(void* handle, const uint64_t* ids,
+                                  const float* vectors, uint32_t count, uint32_t dims);
+typedef struct { uint64_t id; float score; } HouyiMobileResult; // sizeof=16
+uint32_t houyi_mobile_search_u64(void* handle, const float* query, uint32_t dims,
+                                 uint32_t k, HouyiMobileResult* results, uint32_t max_results);
+int32_t houyi_mobile_db_collection_v2(void* db, const char* name, uint32_t dims,
+                                      const char* index_type, uint8_t metric, uint8_t dtype);
+int32_t houyi_mobile_db_insert_batch(void* db, const char* name, const uint64_t* ids,
+                                     const float* vectors, uint32_t count, uint32_t dims);
+uint32_t houyi_mobile_db_search_u64(void* db, const char* name, const float* query,
+                                    uint32_t dims, uint32_t k,
+                                    HouyiMobileResult* results, uint32_t max_results);
+```
+
+- `metric`: 0=L2, 1=Cosine, 2=IP, 3=L1; `dtype`: 0=f32, 1=f16, 2=i8
+  (f16/i8 are flat-clustered only; i8 uses 1 B per dimension plus a 4-byte
+  per-vector scale). Legacy `create`/`db_collection` keep their
+  historical defaults (flat=L2/f32, flat-clustered=Cosine/f16,
+  clustered-hnsw=Cosine/f32).
+- The old search writes `float` ids and loses precision above 2^24; **use the
+  `*_u64` variants for all new code**.
+- Batch writes take one lock and apply in order; they return 0/-1/-2 and do
+  not roll back rows written before a failure.
+- Reusing a collection name with a different configuration makes
+  `db_collection_v2` return -1 (no silent reuse).
+
+### 2.8 Saving / loading a database
+
+```c
+int32_t houyi_mobile_db_save(void* db, const char* path);  // 0 success, -1 failure
+void*   houyi_mobile_db_load(const char* path);            // NULL on failure
+```
+
+- Saves the whole `MobileDB` (collections + scalar pages) by writing a sibling temp
+  file, fsyncing, then renaming over the target. The file carries magic, version,
+  body length, and CRC32; corrupt, truncated, or wrong-version files are rejected.
+- `flat-clustered` persists its **f16 built state** (centroids + per-cluster ids/
+  vectors) and loads **without rebuilding**; `flat` persists raw rows;
+  `clustered-hnsw` persists raw rows and rebuilds on load.
+- No WAL: the caller owns the save point. Save at batch boundaries, off the UI thread.
+- Measured on host (100k×192 f16): file 37.6 MB, save 0.10 s, load 0.064 s;
+  real 7.3k×512: 7.3 MB, 0.023 s, 0.012 s. Verify on device.
+
+### 2.9 Search-budget tuning (flat-clustered cosine)
+
+```c
+int32_t houyi_mobile_set_search_target(void* handle, uint32_t per_k);
+int32_t houyi_mobile_db_set_search_target(void* db, const char* name, uint32_t per_k);
+```
+
+- `per_k` is the candidate budget per requested k: roughly `k * per_k` candidates
+  are scanned. The default is **2500** (about 25k candidates at k=10) to protect
+  recall.
+- It only affects `flat-clustered` + Cosine; other backends return 0 without
+  changing behavior. Kotlin: `HouyiDB.setSearchBudget(handle, name, perK)`.
+- Real-face host benchmark (7.3k×512): `per_k=500` gives p50 ≈ 0.30 ms and
+  recall@10 = 0.994; the 2500 default gives p50 ≈ 0.43 ms and recall = 1.000.
+  Choose latency-first or recall-first accordingly; this budget is runtime state
+  and is not persisted in snapshots.
+- The f16/i8 cosine paths precompute candidate/centroid norms (+4 B per vector,
+  about 0.4 MB at 100k) so the hot loop does one dot product; the server's
+  default f32 path does not enable this cache.
+- Device benchmark (Huawei CLS-AL00, k=10, median):
+
+| Data / configuration | Default per_k=2500 | per_k=500 | recall@10 (500) |
+|---|---:|---:|---:|
+| Real 7.3k×512 f16 | 1.448 ms / 1.000 | 1.127 ms | 0.994 |
+| Real 7.3k×512 i8 | 1.293 ms / 0.996 | 0.974 ms | 0.991 |
+| Synthetic 100k×192 f16 | 2.125 ms / 0.955 | — | — |
+
+  Device noise is higher than on host; treat these as order-of-magnitude numbers
+  for this phone. The default budget favors recall; 500 suits first-screen or
+  interactive queries.
+
 ---
 
 ## 3. Platform Examples
+
+### 3.0 Android AAR
+
+The repo now ships a `houyi-mobile/android` Gradle library project plus a JNI
+bridge:
+
+```bash
+./scripts/build_mobile_android_aar.sh
+# output: houyi-mobile/android/build/outputs/aar/houyi-mobile-android-release.aar (~404 KB)
+./scripts/mobile_jni_smoke.sh   # host-JVM smoke test, no device required
+```
+
+Kotlin `cc.houyidb.mobile.HouyiDB` exposes `open/close/createCollection/
+createCollection(metric,dtype)/insert/insertBatch/build/count/search/save/load/
+insertScalarsWithId/searchHybrid/setSearchBudget/lastError`; `search` returns `SearchHit(id: Long, score: Float)`, eliminating
+the f32-id precision limit. The AAR currently contains arm64-v8a only. Build
+requirements: SDK 34, NDK >= 26, Gradle 8.9 (wrapper included), Java 17.
+
 
 ### 3.1 Swift (iOS)
 
@@ -257,12 +360,19 @@ houyi_mobile_db_collection(db, "photos", 512, "flat-clustered")
 
 // Insert vector + scalar labels
 houyi_mobile_db_insert(db, "photos", 1, vector, 512)
-houyi_mobile_db_insert_scalars(db, "photos", 
+// Preferred: write with an explicit vector id; hybrid search associates by id.
+houyi_mobile_db_insert_scalars_v2(db, "photos", 1,
     "[{\"col\":\"tag\",\"val\":\"text:beach\"},{\"col\":\"date\",\"val\":\"ts:1717200000\"}]")
+// The legacy houyi_mobile_db_insert_scalars keeps row-index compatibility;
+// once explicit ids exist the legacy index may advance to a free slot, so use
+// the v2 explicit-id API for mixed workloads.
 
 // Hybrid search: tag=beach AND date>2024-06-01
 // filters_json: [{"col":"tag","op":"eq","val":"text:beach"},{"col":"date","op":"gt","val":"ts:1717200000"}]
-houyi_mobile_db_search_hybrid(db, "photos", query, 512, 10, filters_json, results, 10)
+// New code uses u64 results; filters are pushed into the candidate scan for
+// flat-clustered.
+HouyiMobileResult results[10];
+houyi_mobile_db_search_hybrid_u64(db, "photos", query, 512, 10, filters_json, results, 10)
 ```
 
 ### 7.2 Scalar Value Formats

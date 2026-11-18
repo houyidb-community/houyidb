@@ -784,6 +784,10 @@
                     "version": {
                       "type": "string"
                     },
+                    "build_sha": {
+                      "type": "string",
+                      "description": "Short git SHA embedded at build time (unknown for source tarballs)"
+                    },
                     "api": {
                       "type": "string"
                     },
@@ -1383,6 +1387,48 @@
           }
         }
       }
+    },
+    "/v1/collections/{name}/fusion/search": {
+      "post": {
+        "operationId": "fusionSearch",
+        "summary": "dense+sparse 融合检索（RRF 或加权；仅 sparse=bm25 集合，只读）",
+        "tags": [
+          "collections"
+        ],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/CollectionName"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/FusionSearchRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "融合排序命中；scores 仅表达排序，dense_scores/sparse_scores 为按模态口径",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/FusionSearchResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          }
+        }
+      }
     }
   },
   "components": {
@@ -1485,6 +1531,23 @@
             ],
             "description": "创建时定型的距离度量（不可变）"
           },
+          "vector_dtype": {
+            "type": "string",
+            "enum": [
+              "f32",
+              "f16"
+            ],
+            "description": "创建时定型的向量存储编码（不可变）"
+          },
+          "quantization": {
+            "type": "string",
+            "enum": [
+              "none",
+              "int8",
+              "rabitq"
+            ],
+            "description": "创建时定型的图侧量化（不可变）。缺省 none；non-none 仅 hnsw 后端支持，只压缩图内距离计算的工作集，主表/hot buffer 保留原始向量并在检索时精确重排。rabitq（1 bit/dim）仅支持 metric l2|cosine"
+          },
           "hnsw": {
             "type": "object",
             "description": "仅 hnsw 后端返回的创建时参数（不可变）；其余后端省略",
@@ -1556,6 +1619,23 @@
             ],
             "description": "创建时定型的距离度量（不可变）"
           },
+          "vector_dtype": {
+            "type": "string",
+            "enum": [
+              "f32",
+              "f16"
+            ],
+            "description": "创建时定型的向量存储编码（不可变）"
+          },
+          "quantization": {
+            "type": "string",
+            "enum": [
+              "none",
+              "int8",
+              "rabitq"
+            ],
+            "description": "创建时定型的图侧量化（不可变）。缺省 none；non-none 仅 hnsw 后端支持，只压缩图内距离计算的工作集，主表/hot buffer 保留原始向量并在检索时精确重排。rabitq（1 bit/dim）仅支持 metric l2|cosine"
+          },
           "hnsw": {
             "type": "object",
             "description": "仅 hnsw 后端返回的创建时参数（不可变）；其余后端省略",
@@ -1619,6 +1699,54 @@
               "full_sync"
             ],
             "description": "只读展示的复制级别；变更走 POST /v1/collections/{name}/ha_level (WAL-first)"
+          },
+          "sparse": {
+            "type": "object",
+            "description": "稀疏旁路索引状态；none 模式只回显 mode（不给误导性的 0 统计）",
+            "properties": {
+              "mode": {
+                "type": "string",
+                "enum": [
+                  "none",
+                  "bm25"
+                ]
+              },
+              "doc_count": {
+                "type": "integer"
+              },
+              "term_count": {
+                "type": "integer"
+              },
+              "posting_count": {
+                "type": "integer"
+              },
+              "dead_postings": {
+                "type": "integer"
+              }
+            },
+            "required": [
+              "mode"
+            ]
+          },
+          "lazy_build": {
+            "type": "object",
+            "description": "仅一次性构图后端（clustered/flat-clustered/pq-flat）返回的惰性构图状态；其余后端省略。built=true 后新增写入只进缓冲区、不再入图，rebuild_required=true 时需重建集合才能检索到新数据；构图进行中 built 返回 false（状态端点不阻塞等待构图锁）",
+            "properties": {
+              "built": {
+                "type": "boolean"
+              },
+              "buffered": {
+                "type": "integer"
+              },
+              "rebuild_required": {
+                "type": "boolean"
+              }
+            },
+            "required": [
+              "built",
+              "buffered",
+              "rebuild_required"
+            ]
           }
         },
         "required": [
@@ -1680,6 +1808,34 @@
             "minimum": 1,
             "maximum": 65536,
             "description": "HNSW 检索候选队列长度"
+          },
+          "vector_dtype": {
+            "type": "string",
+            "enum": [
+              "f32",
+              "f16"
+            ],
+            "default": "f32",
+            "description": "向量存储编码（创建后不可变）。缺省 f32；f16 仅 hnsw 后端支持，可节省一半向量内存，检索时按 f32 查询做非对称距离计算。接受别名 float32/fp32/float16/fp16/half"
+          },
+          "quantization": {
+            "type": "string",
+            "enum": [
+              "none",
+              "int8",
+              "rabitq"
+            ],
+            "default": "none",
+            "description": "图侧量化（创建后不可变）。缺省 none；non-none 仅 hnsw 后端支持，只压缩图内距离计算的工作集（int8 4→1 B/dim，rabitq 1 bit/dim），主表/hot buffer 保留原始向量并在检索时按原始向量精确重排。rabitq 仅支持 metric l2|cosine（ip/l1 返回 400）。余弦路径（归一化后量化）总内存有真实下降，非余弦因主表保留原始向量而总内存略增"
+          },
+          "sparse": {
+            "type": "string",
+            "enum": [
+              "none",
+              "bm25"
+            ],
+            "default": "none",
+            "description": "稀疏旁路索引（术语由客户端提供，服务端不内置分词器；创建后不可变）。缺省 none；bm25 仅 hnsw/flat 后端支持，开启后 upsert 可携带 sparse 词项并支持 /fusion/search。隐式创建（首次 upsert 猜集合）恒为 none"
           }
         },
         "required": [
@@ -1693,7 +1849,10 @@
           "collection",
           "dims",
           "metric",
-          "index_type"
+          "index_type",
+          "vector_dtype",
+          "quantization",
+          "sparse"
         ],
         "properties": {
           "created": {
@@ -1720,6 +1879,23 @@
           "index_type": {
             "type": "string"
           },
+          "vector_dtype": {
+            "type": "string",
+            "enum": [
+              "f32",
+              "f16"
+            ],
+            "description": "实际生效的存储编码（缺省请求回显 f32）"
+          },
+          "quantization": {
+            "type": "string",
+            "enum": [
+              "none",
+              "int8",
+              "rabitq"
+            ],
+            "description": "实际生效的图侧量化（缺省请求回显 none）"
+          },
           "hnsw": {
             "type": [
               "object",
@@ -1742,6 +1918,14 @@
               "ef_construction",
               "ef_search"
             ]
+          },
+          "sparse": {
+            "type": "string",
+            "enum": [
+              "none",
+              "bm25"
+            ],
+            "description": "实际生效的稀疏索引模式（缺省请求回显 none）"
           }
         }
       },
@@ -1798,6 +1982,27 @@
             "type": "object",
             "additionalProperties": true,
             "description": "自由 JSON 标量字段，供混合检索过滤；键 label 保留，占用 400"
+          },
+          "sparse": {
+            "type": "array",
+            "description": "稀疏词项 [[term_id, weight], …]（仅 sparse=bm25 集合接受）。键缺省或 null = 不修改；[] = 清空；非空数组 = 整文档替换（重复 term 求和、按 term 升序落库）。term_id ∈ [1, 2^24-1]，weight 必须有限且 > 0，单文档最多 1024 个对；在 sparse=none 集合上携带本键（含 []）一律 400",
+            "items": {
+              "type": "array",
+              "prefixItems": [
+                {
+                  "type": "integer",
+                  "minimum": 1,
+                  "maximum": 16777215
+                },
+                {
+                  "type": "number",
+                  "format": "float",
+                  "exclusiveMinimum": 0
+                }
+              ],
+              "minItems": 2,
+              "maxItems": 2
+            }
           }
         },
         "required": [
@@ -2139,6 +2344,191 @@
             "type": "boolean"
           }
         }
+      },
+      "FusionSearchRequest": {
+        "type": "object",
+        "properties": {
+          "vector": {
+            "type": "array",
+            "items": {
+              "type": "number",
+              "format": "float"
+            },
+            "description": "dense 查询向量；长度必须等于 collection 维度且分量有限"
+          },
+          "sparse": {
+            "type": "array",
+            "description": "稀疏查询词项 [[term_id, weight], …]，必填非空、≤64 个 term（重复 term 求和）",
+            "items": {
+              "type": "array",
+              "prefixItems": [
+                {
+                  "type": "integer",
+                  "minimum": 1,
+                  "maximum": 16777215
+                },
+                {
+                  "type": "number",
+                  "format": "float",
+                  "exclusiveMinimum": 0
+                }
+              ],
+              "minItems": 2,
+              "maxItems": 2
+            }
+          },
+          "k": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 10000
+          },
+          "filters": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/Filter"
+            },
+            "description": "多条取交集（AND）；融合检索要求集合为 hnsw/flat（bm25 仅存在于其后端）"
+          },
+          "include_payload": {
+            "type": "boolean",
+            "default": false
+          },
+          "ef_search": {
+            "type": "integer",
+            "maximum": 10000
+          },
+          "fusion": {
+            "type": "string",
+            "enum": [
+              "rrf",
+              "weighted"
+            ],
+            "default": "rrf"
+          },
+          "rrf_k": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 1000,
+            "default": 60,
+            "description": "仅 rrf 模式参与计算；显式提供时即使模式为 weighted 也会校验区间"
+          },
+          "alpha": {
+            "type": "number",
+            "format": "float",
+            "minimum": 0,
+            "maximum": 1,
+            "default": 0.5,
+            "description": "仅 weighted 模式参与计算；显式提供时即使模式为 rrf 也会校验区间"
+          }
+        },
+        "required": [
+          "vector",
+          "sparse",
+          "k"
+        ]
+      },
+      "FusionParams": {
+        "type": "object",
+        "properties": {
+          "mode": {
+            "type": "string",
+            "enum": [
+              "rrf",
+              "weighted"
+            ]
+          },
+          "rrf_k": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "description": "仅 rrf 模式回显；weighted 为 null"
+          },
+          "alpha": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "description": "仅 weighted 模式回显；rrf 为 null"
+          }
+        },
+        "required": [
+          "mode",
+          "rrf_k",
+          "alpha"
+        ]
+      },
+      "FusionSearchResponse": {
+        "type": "object",
+        "properties": {
+          "ids": {
+            "type": "array",
+            "items": {
+              "type": "integer",
+              "format": "uint64"
+            },
+            "description": "与 scores 按下标对齐，按融合分从高到低（同分 id 升序）"
+          },
+          "scores": {
+            "type": "array",
+            "items": {
+              "type": "number",
+              "format": "float"
+            },
+            "description": "融合排序分（RRF 或加权融合分），只表达排序，不属于任何距离度量口径"
+          },
+          "dense_scores": {
+            "type": "array",
+            "items": {
+              "type": [
+                "number",
+                "null"
+              ],
+              "format": "float"
+            },
+            "description": "与 ids 对齐；按 collection 度量换算的相似度（与 /search 的 scores 同口径），仅 dense 命中时为数值，否则 null"
+          },
+          "sparse_scores": {
+            "type": "array",
+            "items": {
+              "type": [
+                "number",
+                "null"
+              ],
+              "format": "float"
+            },
+            "description": "与 ids 对齐；BM25 原始分，仅 sparse 命中时为数值，否则 null"
+          },
+          "metric": {
+            "type": "string",
+            "enum": [
+              "l2",
+              "cosine",
+              "ip",
+              "l1"
+            ],
+            "description": "仅用于解释 dense_scores"
+          },
+          "fusion": {
+            "$ref": "#/components/schemas/FusionParams"
+          },
+          "payloads": {
+            "type": "object",
+            "additionalProperties": {
+              "type": "object",
+              "additionalProperties": true
+            },
+            "description": "键为 id 的十进制字符串；仅 include_payload=true 且命中存在标量行时出现"
+          }
+        },
+        "required": [
+          "ids",
+          "scores",
+          "dense_scores",
+          "sparse_scores",
+          "metric",
+          "fusion"
+        ]
       }
     }
   },

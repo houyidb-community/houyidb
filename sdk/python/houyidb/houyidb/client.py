@@ -11,7 +11,11 @@
   改参数只能删除重建；
 - ``include_payload=True`` 时响应携带每命中的 label+payload（键为 id 字符串）；
 - delete 按 id 幂等删除，返回真实删除数；
-- collection 的标量页 v1 易失（进程重启后 payload/过滤失效，向量索引不受影响）。
+- collection 的标量页 v1 易失（进程重启后 payload/过滤失效，向量索引不受影响）；
+- 稀疏词项由客户端给定（无分词器）；``sparse="bm25"`` 必须显式建集合，且仅
+  ``hnsw``/``flat`` 后端可用；写入时缺省 ``sparse`` 键表示不改、``[]`` 表示清空；
+- 融合检索 ``scores`` 只表达融合排序（RRF 或加权），``dense_scores`` 才按集合
+  度量换算，``sparse_scores`` 为 BM25 原始分。
 
 EN: HouyiDB collections HTTP API client. The design constraints mirror the
 server contract one-to-one:
@@ -29,7 +33,13 @@ server contract one-to-one:
   string);
 - delete is idempotent by id and returns the number actually deleted;
 - the collection scalar page in v1 is volatile (payload/filters are lost after
-  a restart; the vector index is unaffected).
+  a restart; the vector index is unaffected);
+- sparse terms are client-supplied (no tokenizer); ``sparse="bm25"`` requires
+  explicit creation and is available on the ``hnsw``/``flat`` backends only; in
+  writes an absent ``sparse`` key means unchanged and ``[]`` clears it;
+- fusion ``scores`` only expresses fused ranking (RRF or weighted); only
+  ``dense_scores`` are converted under the collection metric, and
+  ``sparse_scores`` are raw BM25 scores.
 """
 
 from __future__ import annotations
@@ -37,8 +47,10 @@ from __future__ import annotations
 from urllib.parse import quote
 
 import hashlib
+import math
+import operator
 from dataclasses import dataclass, field
-from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 import requests
 
@@ -46,6 +58,79 @@ import requests
 #: EN: Leave the upper half of the u64 key space unused (aligned with the
 #: server's u64 ids to avoid sign-bit ambiguity).
 _U64_MASK = (1 << 63) - 1
+
+#: 稀疏词项 term_id 上界（与服务端 MAX_SPARSE_TERM_ID 一致）。
+#: EN: Upper bound of a sparse term id (matches the server's
+#: MAX_SPARSE_TERM_ID).
+_MAX_SPARSE_TERM_ID = (1 << 24) - 1
+
+#: 写入/查询的原始词项对上限（重复 term 在服务端求和前计数）。
+#: EN: Raw pair limits for writes/queries (counted before server-side
+#: duplicate-term summation).
+_MAX_SPARSE_TERMS_PER_DOC = 1024
+_MAX_SPARSE_QUERY_TERMS = 64
+
+
+def _sparse_terms_to_wire(
+    terms: Sequence[Tuple[int, float]], max_pairs: int
+) -> List[List[Any]]:
+    """把 ``(term_id, weight)`` 序列编码为线格式 ``[[term, weight], …]``。
+
+    客户端先做形状校验而不是依赖服务端：``int(t)`` 对 ``1.9``/``True`` 会静默
+    截断成另一个 term，写进 WAL 后无法察觉（服务端只会看到合法 term）。这里
+    用 ``operator.index`` 拒绝非整数（含 bool），并校验区间与有限正权重，与
+    文档承诺一致；重复 term 的求和仍归服务端。
+
+    EN: Encode a ``(term_id, weight)`` sequence into the wire form
+    ``[[term, weight], …]``. Shape validation happens client-side rather than
+    relying on the server: ``int(t)`` silently truncates ``1.9``/``True`` into a
+    *different* term, which once in the WAL is invisible (the server only sees a
+    valid term). ``operator.index`` rejects non-integers (including bool), and
+    the bounds/finite-positive-weight checks match the documented contract;
+    duplicate-term summation remains server-side.
+    """
+    if len(terms) > max_pairs:
+        raise ValueError(
+            f"sparse terms exceed the limit of {max_pairs} raw pairs per request "
+            f"(got {len(terms)})"
+        )
+    out: List[List[Any]] = []
+    for item in terms:
+        try:
+            term, weight = item
+        except (TypeError, ValueError):
+            raise ValueError(
+                f"sparse term must be a (term_id, weight) pair, got {item!r}"
+            ) from None
+        if isinstance(term, bool):
+            raise ValueError(f"sparse term id must be an integer, got bool ({term!r})")
+        try:
+            term_id = operator.index(term)
+        except TypeError:
+            raise ValueError(
+                f"sparse term id must be an integer, got {type(term).__name__} ({term!r})"
+            ) from None
+        if not 1 <= term_id <= _MAX_SPARSE_TERM_ID:
+            raise ValueError(
+                f"sparse term id {term_id} out of range 1..{_MAX_SPARSE_TERM_ID}"
+            )
+        if isinstance(weight, bool):
+            raise ValueError(
+                f"sparse weight must be a number, got bool ({weight!r})"
+            )
+        try:
+            weight_value = float(weight)
+        except (TypeError, ValueError, OverflowError):
+            raise ValueError(
+                "sparse weight must be a finite number > 0, got "
+                f"{type(weight).__name__} ({weight!r})"
+            ) from None
+        if not math.isfinite(weight_value) or weight_value <= 0:
+            raise ValueError(
+                f"sparse weight must be finite and > 0, got {weight_value!r}"
+            )
+        out.append([term_id, weight_value])
+    return out
 
 
 def stable_id(text: str) -> int:
@@ -76,15 +161,25 @@ class HouyiError(Exception):
 
 @dataclass
 class Vector:
-    """一条待写入向量：id + 分量 + 可选 label/payload。
+    """一条待写入向量：id + 分量 + 可选 label/payload/sparse 词项。
 
-    EN: A vector to write: id + components + optional label/payload.
+    ``sparse`` 仅对 ``sparse="bm25"`` 的集合有效：``None``（缺省）表示不改该
+    文档的稀疏词项，``[]`` 表示清空；每项为 ``(term_id, weight)``，term_id
+    取值 ``[1, 2^24-1]``、weight 有限且为正，重复 term 由服务端求和。
+
+    EN: A vector to write: id + components + optional label/payload/sparse
+    terms. ``sparse`` only applies to ``sparse="bm25"`` collections: ``None``
+    (default) leaves the document's sparse terms unchanged, while ``[]``
+    clears them; each item is ``(term_id, weight)`` with term_id in
+    ``[1, 2^24-1]`` and a finite positive weight; duplicate terms are summed by
+    the server.
     """
 
     id: int
     values: Sequence[float]
     label: Optional[str] = None
     payload: Optional[Mapping[str, Any]] = None
+    sparse: Optional[Sequence[Tuple[int, float]]] = None
 
     def to_json(self) -> Dict[str, Any]:
         doc: Dict[str, Any] = {"id": self.id, "values": list(self.values)}
@@ -92,6 +187,8 @@ class Vector:
             doc["label"] = self.label
         if self.payload:
             doc["payload"] = dict(self.payload)
+        if self.sparse is not None:
+            doc["sparse"] = _sparse_terms_to_wire(self.sparse, _MAX_SPARSE_TERMS_PER_DOC)
         return doc
 
 
@@ -173,6 +270,105 @@ class SearchResult:
         return cls(hits=hits)
 
 
+@dataclass
+class FusionHit:
+    """单条融合命中：id + 融合分 + 两路原始分 + 可选 payload。
+
+    融合分只表达排序（RRF 或加权），不属于任何度量口径；``dense_score`` 按
+    集合度量换算、仅稠密一路命中时存在；``sparse_score`` 为 BM25 原始分、
+    仅稀疏一路命中时存在。
+
+    EN: One fusion hit: id + fused score + both raw modality scores + optional
+    payload. The fused score only expresses ranking (RRF or weighted) and
+    belongs to no metric; ``dense_score`` is converted under the collection
+    metric and exists only when the dense path hit; ``sparse_score`` is the
+    raw BM25 score and exists only when the sparse path hit.
+    """
+
+    id: int
+    score: float
+    dense_score: Optional[float] = None
+    sparse_score: Optional[float] = None
+    payload: Optional[Dict[str, Any]] = None
+
+
+@dataclass
+class FusionResult:
+    """融合检索响应：hits 按融合分从高到低排列，附生效参数回显。
+
+    ``metric`` 仅用于解释 ``dense_score``；``fusion_mode`` 为生效模式
+    （``rrf`` | ``weighted``）；``rrf_k`` 仅 rrf 模式回显、``alpha`` 仅
+    weighted 模式回显。
+
+    EN: Fusion response: hits ordered by fused score, highest first, with the
+    effective parameters echoed. ``metric`` explains ``dense_score`` only;
+    ``fusion_mode`` is the effective mode (``rrf`` | ``weighted``);
+    ``rrf_k`` is echoed only under rrf and ``alpha`` only under weighted.
+    """
+
+    hits: List[FusionHit] = field(default_factory=list)
+    metric: str = ""
+    fusion_mode: str = ""
+    rrf_k: Optional[int] = None
+    alpha: Optional[float] = None
+
+    @property
+    def ids(self) -> List[int]:
+        return [h.id for h in self.hits]
+
+    @property
+    def scores(self) -> List[float]:
+        return [h.score for h in self.hits]
+
+    @classmethod
+    def from_json(cls, body: Mapping[str, Any]) -> "FusionResult":
+        ids: Sequence[int] = body.get("ids", [])
+        scores: Sequence[float] = body.get("scores", [])
+        dense_scores: Sequence[Optional[float]] = body.get("dense_scores", [])
+        sparse_scores: Sequence[Optional[float]] = body.get("sparse_scores", [])
+        # 融合分是排序键：宽度错位说明响应被截断/损坏，zip 会静默丢命中或
+        # 错配分数，因此与 Rust/TypeScript SDK 同口径显式失败；模态分数组
+        # 缺席（空）仍容忍，出现时必须等宽。
+        # EN: Fused scores are the ranking key; misaligned widths mean a
+        # truncated/corrupt response where zip would silently drop hits or
+        # mispair scores, so fail explicitly like the Rust/TypeScript SDKs.
+        # Modality arrays absent (empty) stay tolerated but must match when
+        # present.
+        id_count = len(ids)
+        if len(scores) != id_count:
+            raise ValueError(
+                f"fusion response scores has {len(scores)} entries for {id_count} ids"
+            )
+        for name, arr in (("dense_scores", dense_scores), ("sparse_scores", sparse_scores)):
+            if len(arr) not in (0, id_count):
+                raise ValueError(
+                    f"fusion response {name} has {len(arr)} entries for {id_count} ids"
+                )
+        payloads: Optional[Mapping[str, Any]] = body.get("payloads")
+        fusion: Mapping[str, Any] = body.get("fusion") or {}
+        hits = [
+            FusionHit(
+                id=i,
+                score=s,
+                dense_score=(
+                    dense_scores[idx] if idx < len(dense_scores) else None
+                ),
+                sparse_score=(
+                    sparse_scores[idx] if idx < len(sparse_scores) else None
+                ),
+                payload=dict(payloads[str(i)]) if payloads and str(i) in payloads else None,
+            )
+            for idx, (i, s) in enumerate(zip(ids, scores))
+        ]
+        return cls(
+            hits=hits,
+            metric=str(body.get("metric", "")),
+            fusion_mode=str(fusion.get("mode", "")),
+            rrf_k=fusion.get("rrf_k"),
+            alpha=fusion.get("alpha"),
+        )
+
+
 class Collection:
     """一个 named collection 的操作句柄（经 :class:`HouyiClient.collection` 获取）。
 
@@ -245,6 +441,60 @@ class Collection:
             req["include_payload"] = True
         body = self._client._post(f"/v1/collections/{self._quoted}/hybrid/search", req)
         return SearchResult.from_json(body)
+
+    def fusion_search(
+        self,
+        vector: Sequence[float],
+        sparse: Sequence[Tuple[int, float]],
+        k: int,
+        *,
+        filters: Optional[Iterable[Filter | Mapping[str, Any]]] = None,
+        ef_search: Optional[int] = None,
+        include_payload: bool = False,
+        fusion: Optional[str] = None,
+        rrf_k: Optional[int] = None,
+        alpha: Optional[float] = None,
+    ) -> FusionResult:
+        """稠密 + 稀疏融合检索（仅 ``sparse="bm25"`` 的集合；两路均需非空）。
+
+        两路各过取 4×k 后融合：``fusion="rrf"``（缺省，``rrf_k`` 缺省 60）按
+        倒数排名相加；``fusion="weighted"`` 在过滤后候选上各路 min-max 归一后
+        按 ``alpha*dense + (1-alpha)*sparse`` 相加（``alpha`` 缺省 0.5）。稀疏
+        查询每项为 ``(term_id, weight)``，最多 64 个原始对。filters 取交集，
+        仅 hnsw/flat 后端支持。
+
+        EN: Dense + sparse fusion search (only for ``sparse="bm25"``
+        collections; both modalities must be non-empty). Both paths over-fetch
+        4x k, then fuse: ``fusion="rrf"`` (default, ``rrf_k`` defaults to 60)
+        sums reciprocal ranks; ``fusion="weighted"`` min-max normalizes each
+        modality over the filtered candidates and sums
+        ``alpha*dense + (1-alpha)*sparse`` (``alpha`` defaults to 0.5). Sparse
+        query items are ``(term_id, weight)`` with at most 64 raw pairs.
+        Filters intersect and are supported on hnsw/flat backends only.
+        """
+        req: Dict[str, Any] = {
+            "vector": list(vector),
+            "sparse": _sparse_terms_to_wire(sparse, _MAX_SPARSE_QUERY_TERMS),
+            "k": k,
+        }
+        if filters:
+            req["filters"] = [
+                f.to_json() if isinstance(f, Filter) else dict(f) for f in filters
+            ]
+        if ef_search is not None:
+            req["ef_search"] = ef_search
+        if include_payload:
+            req["include_payload"] = True
+        if fusion is not None:
+            req["fusion"] = fusion
+        if rrf_k is not None:
+            req["rrf_k"] = rrf_k
+        if alpha is not None:
+            req["alpha"] = alpha
+        body = self._client._post(
+            f"/v1/collections/{self._quoted}/fusion/search", req
+        )
+        return FusionResult.from_json(body)
 
     def delete(
         self,
@@ -328,8 +578,11 @@ class HouyiClient:
         metric: Optional[str] = None,
         index_type: Optional[str] = None,
         hnsw: Optional[HnswParams] = None,
+        vector_dtype: Optional[str] = None,
+        quantization: Optional[str] = None,
+        sparse: Optional[str] = None,
     ) -> Dict[str, Any]:
-        """显式创建 collection（可指定度量/后端/HNSW 参数；需要写权限）。
+        """显式创建 collection（可指定度量/后端/HNSW 参数/存储编码；需要写权限）。
 
         与隐式创建（首次 upsert）不同，dims、metric、后端与 HNSW 参数在这里
         一次定型并由服务端回显；metric 与后端创建后不可变，改参数只能删除
@@ -343,6 +596,34 @@ class HouyiClient:
         them requires drop-and-recreate. This is the normal write path without
         the admin token; an existing name raises ``HouyiError(409)``, invalid
         parameters 400, and followers/read-only nodes 503.
+
+        ``vector_dtype`` 可选 ``"f32"``（缺省）或 ``"f16"``（仅 hnsw，省一半
+        向量内存）；创建后不可变，非 f32 与非 hnsw 组合由服务端拒绝（400）。
+        EN: ``vector_dtype`` may be ``"f32"`` (default) or ``"f16"`` (hnsw only,
+        halves vector memory); it is immutable after creation, and non-f32
+        with a non-hnsw backend is rejected by the server (400).
+
+        ``quantization`` 可选 ``"none"``（缺省）、``"int8"`` 或 ``"rabitq"``
+        （仅 hnsw，压缩图内距离工作集；主表保留原始向量并在检索时精确重排）。
+        rabitq 为 1 bit/dim，仅支持 metric l2|cosine（ip/l1 返回 400）；创建后
+        不可变，非 none 与非 hnsw 组合由服务端拒绝（400）。
+        EN: ``quantization`` may be ``"none"`` (default), ``"int8"``, or
+        ``"rabitq"`` (hnsw only, shrinks the in-graph distance working set; the
+        main store keeps raw vectors and reranks exactly at search time). rabitq
+        packs 1 bit/dim and supports metric l2|cosine only (ip/l1 return 400);
+        it is immutable after creation, and non-none with a non-hnsw backend is
+        rejected by the server (400).
+
+        ``sparse`` 可选 ``"none"``（缺省）或 ``"bm25"``（仅 hnsw/flat 后端），
+        开启后集合获得倒排稀疏索引并支持 :meth:`Collection.fusion_search`；
+        创建后不可变，隐式创建的集合恒为 none。响应回显生效值；旧服务端响应
+        可能缺少该字段，调用方应按可选字段容忍。
+        EN: ``sparse`` may be ``"none"`` (default) or ``"bm25"`` (hnsw/flat
+        backends only); when enabled the collection gains an inverted sparse
+        index and supports :meth:`Collection.fusion_search`; it is immutable
+        after creation, and implicitly created collections are always none. The
+        response echoes the effective value; older servers may omit the field,
+        so callers should treat it as optional.
         """
         # dims 一旦建集合就不可变（只能删除重建），因此绝不做 int() 截断：
         # 3.9→3、True→1 都会把调用方笔误固化成永久错误的维度。这里与
@@ -358,6 +639,12 @@ class HouyiClient:
             payload["metric"] = metric
         if index_type is not None:
             payload["index_type"] = index_type
+        if vector_dtype is not None:
+            payload["vector_dtype"] = vector_dtype
+        if quantization is not None:
+            payload["quantization"] = quantization
+        if sparse is not None:
+            payload["sparse"] = sparse
         if hnsw is not None:
             payload["hnsw_m"] = hnsw.m
             payload["hnsw_ef_construction"] = hnsw.ef_construction

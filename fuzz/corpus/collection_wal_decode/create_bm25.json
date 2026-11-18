@@ -1,0 +1,1 @@
+{"v":1,"op":"collection_create","name":"sparse_docs","dims":4,"index_type":"hnsw","metric":"l2","sparse":"bm25"}

@@ -129,6 +129,7 @@ mod tests {
             values: vec![0.1, 0.2, 0.3, 0.4],
             label: Some("a".to_string()),
             payload: None,
+            sparse: None,
         }];
         let upsert = encode_collection_upsert_batch("c", 4, &items).unwrap();
         sink.apply(1, &upsert).await.unwrap();

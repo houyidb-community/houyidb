@@ -246,6 +246,9 @@ pub async fn handle_openai_embeddings(
                         .unwrap()
                         .clone(),
                 ),
+                // 嵌入网关不产生稀疏词项（无分词器）。
+                // EN: The embedding gateway produces no sparse terms (no tokenizer).
+                sparse: None,
             })
             .collect();
         // 复用 collection upsert handler 的全部分支（保留键校验/维度定型/标量落页/

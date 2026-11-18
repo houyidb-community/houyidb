@@ -45,6 +45,30 @@ pub struct CollectionCreateOptions {
     pub hnsw_m: Option<usize>,
     pub hnsw_ef_construction: Option<usize>,
     pub hnsw_ef_search: Option<usize>,
+    /// 存储向量编码（`f32` | `f16`）；None = 旧记录（f32）。仅 hnsw 后端可携带：
+    /// 其他后端没有 dtype 存储路径，写入它会让重放语义与创建时静默分叉。
+    /// EN: Stored vector encoding (`f32` | `f16`); None = legacy record (f32).
+    /// Only the hnsw backend may carry it — other backends have no dtype storage
+    /// path, and writing it would silently diverge replay from creation semantics.
+    pub vector_dtype: Option<String>,
+    /// 图侧量化方式（`none` | `int8` | `rabitq`）；None = 旧记录（不量化）。仅 hnsw
+    /// 后端可携带：其他后端没有图侧量化语义，写入它会让重放与创建时静默分叉。
+    /// 新写入的 hnsw 创建记录恒填（含显式 `"none"`），以便重放侧不再靠缺省推断。
+    /// `rabitq` 额外要求显式度量且仅 l2/cosine（1 bit 方向码没有 ip/l1 距离核）。
+    /// EN: Graph-side quantization (`none` | `int8` | `rabitq`); None = legacy
+    /// record (no quantization). Only the hnsw backend may carry it — other
+    /// backends have no graph-side quantization semantics and replay would
+    /// silently diverge from creation. Newly written hnsw creates always fill it
+    /// (including an explicit `"none"`) so replay never has to infer from absence.
+    /// `rabitq` additionally requires an explicit metric limited to l2/cosine
+    /// (the 1-bit direction code has no ip/l1 distance kernel).
+    pub quantization: Option<String>,
+    /// 稀疏索引模式（`none` | `bm25`）；None = 旧记录（不建稀疏索引）。
+    /// 新写入的显式创建恒填（含显式 `"none"`），仅 `hnsw`/`flat` 后端允许 `bm25`。
+    /// EN: Sparse index mode (`none` | `bm25`); None = legacy record (no sparse
+    /// index). New explicit creates always fill it (including an explicit
+    /// `"none"`); `bm25` is allowed only on `hnsw`/`flat` backends.
+    pub sparse: Option<String>,
 }
 
 impl CollectionCreateOptions {
@@ -52,6 +76,18 @@ impl CollectionCreateOptions {
     /// EN: Canonical metrics only — the writer emits these strings and the decoder
     /// fails fast on anything else (corruption / future version).
     pub const CANONICAL_METRICS: [&'static str; 4] = ["l2", "cosine", "ip", "l1"];
+
+    /// 规范存储编码集合（与 `houyi_vector::VectorDtype::as_str` 一致）。
+    /// EN: Canonical storage encodings (mirrors `houyi_vector::VectorDtype::as_str`).
+    pub const CANONICAL_VECTOR_DTYPES: [&'static str; 2] = ["f32", "f16"];
+
+    /// 规范图侧量化集合（与 `houyi_vector::Quantization::as_str` 一致）。
+    /// EN: Canonical graph quantizations (mirrors `houyi_vector::Quantization::as_str`).
+    pub const CANONICAL_QUANTIZATIONS: [&'static str; 3] = ["none", "int8", "rabitq"];
+
+    /// 规范稀疏模式集合（与 `houyi_vector::sparse::SparseMode::as_str` 一致）。
+    /// EN: Canonical sparse modes (mirrors `houyi_vector::sparse::SparseMode::as_str`).
+    pub const CANONICAL_SPARSE_MODES: [&'static str; 2] = ["none", "bm25"];
 }
 
 /// 由主 WAL 路径派生 collections WAL 路径：`/data/houyidb.wal` → `/data/houyidb.collections.wal`。
@@ -120,6 +156,18 @@ impl CollectionWalRecord {
     }
 }
 
+/// ── upsert 条目（向量 + 可选标量 + 可选稀疏词项）。
+/// 稀疏字段采用加法可选语义：**缺省 = 不改动**，`[]` = 清空该文档稀疏数据。
+/// 已知降级风险：旧二进制不认识该字段会静默忽略——若降级时尚无快照，
+/// 稀疏数据会静默丢失；快照 v3 / 清单 format 4 / 复制 v12 均会干净拒绝旧
+/// 二进制，文档必须写明这一限制。
+///
+/// EN: Upsert item (vector plus optional scalars and sparse terms). The sparse
+/// field is additive-optional: **absent = leave unchanged**, `[]` = clear the
+/// document's sparse data. Known downgrade hazard: an old binary ignores the
+/// unknown field — if no snapshot exists yet, sparse data is silently lost.
+/// Snapshot v3 / manifest format 4 / replication v12 all cleanly reject old
+/// binaries; the docs must state this limitation.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct CollectionWalItem {
     pub id: u64,
@@ -128,6 +176,55 @@ pub struct CollectionWalItem {
     pub label: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub payload: Option<serde_json::Map<String, serde_json::Value>>,
+    /// `(term_id, weight)` 对；写入侧归一化（重复 term 求和、term 升序）。
+    /// EN: `(term_id, weight)` pairs; normalized by the writer (duplicates
+    /// summed, ascending by term id).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sparse: Option<Vec<(u32, f32)>>,
+}
+
+/// 稀疏词项的 WAL 侧上限（与 `houyi-vector::sparse` 常量保持一致）。
+/// EN: WAL-side sparse limits (kept in sync with `houyi-vector::sparse`).
+const SPARSE_MAX_TERM_ID: u32 = (1 << 24) - 1;
+const SPARSE_MAX_TERMS_PER_DOC: usize = 1024;
+
+/// WAL 写入/解码共用的稀疏规范化与校验：重复 term 求和、按 term 升序，
+/// 拒绝越界 term、非有限/非正权重与超量输入。
+///
+/// EN: Shared writer/decoder sparse normalization and validation: sums
+/// duplicate terms, sorts ascending by term id, and rejects out-of-range term
+/// ids, non-finite/non-positive weights, and over-limit inputs.
+fn canonical_sparse_terms(input: &[(u32, f32)]) -> Result<Vec<(u32, f32)>, String> {
+    if input.len() > SPARSE_MAX_TERMS_PER_DOC {
+        return Err(format!(
+            "too many sparse terms: {} > {}",
+            input.len(),
+            SPARSE_MAX_TERMS_PER_DOC
+        ));
+    }
+    let mut sorted: Vec<(u32, f32)> = input.to_vec();
+    sorted.sort_unstable_by_key(|(term, _)| *term);
+    let mut out: Vec<(u32, f32)> = Vec::with_capacity(sorted.len());
+    for (term, weight) in sorted {
+        if term == 0 || term > SPARSE_MAX_TERM_ID {
+            return Err(format!("sparse term id {term} out of range"));
+        }
+        if !weight.is_finite() || weight <= 0.0 {
+            return Err(format!(
+                "sparse weight for term {term} must be finite and > 0"
+            ));
+        }
+        match out.last_mut() {
+            Some((last_term, last_weight)) if *last_term == term => {
+                *last_weight += weight;
+                if !last_weight.is_finite() {
+                    return Err(format!("sparse weight for term {term} overflows"));
+                }
+            }
+            _ => out.push((term, weight)),
+        }
+    }
+    Ok(out)
 }
 
 /// 线上信封：单结构体承载全部 op，缺省字段不序列化（与 vector_wal 同风格）。
@@ -162,6 +259,21 @@ struct CollectionWalEnvelope {
     hnsw_ef_construction: Option<usize>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     hnsw_ef_search: Option<usize>,
+    /// 存储编码（f32|f16）：仅显式创建 hnsw 集合时写入，旧记录缺省。
+    /// EN: Storage encoding (f32|f16), written only by explicit hnsw creation;
+    /// absent in legacy records.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    vector_dtype: Option<String>,
+    /// 图侧量化（none|int8）：仅 hnsw 后端写入，旧记录缺省（按不量化处理）。
+    /// EN: Graph quantization (none|int8), written only for the hnsw backend;
+    /// absent in legacy records (treated as unquantized).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    quantization: Option<String>,
+    /// 稀疏索引模式（none|bm25）：显式创建 hnsw/flat 时写入，旧记录缺省。
+    /// EN: Sparse index mode (none|bm25), written by explicit hnsw/flat creates;
+    /// absent in legacy records.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    sparse: Option<String>,
 }
 
 /// 编码 collection 创建记录 / Encode a collection-create record.
@@ -195,6 +307,71 @@ pub fn encode_collection_create_with_options(
         if !CollectionCreateOptions::CANONICAL_METRICS.contains(&metric) {
             return Err(format!(
                 "non-canonical collection metric {metric:?} (expect l2|cosine|ip|l1)"
+            ));
+        }
+    }
+    // 存储编码同纪律：只写规范串；显式 dtype 只属于 hnsw 后端（其他后端的
+    // 恢复路径没有 dtype 形参，静默忽略会让 WAL 声称的编码与实际存储分叉）。
+    // EN: Same policy for the storage encoding: canonical strings only, and an
+    // explicit dtype belongs solely to the hnsw backend — other backends' restore
+    // path has no dtype parameter, and silently ignoring it would make the WAL's
+    // declared encoding diverge from actual storage.
+    if let Some(dtype) = options.vector_dtype.as_deref() {
+        if !CollectionCreateOptions::CANONICAL_VECTOR_DTYPES.contains(&dtype) {
+            return Err(format!(
+                "non-canonical collection vector_dtype {dtype:?} (expect f32|f16)"
+            ));
+        }
+        if index_type != "hnsw" {
+            return Err(format!(
+                "vector_dtype requires index_type 'hnsw' (got {index_type:?})"
+            ));
+        }
+    }
+    // 图侧量化同纪律：只写规范串，且只允许 hnsw 后端；`"none"` 是合法显式值。
+    // EN: Same policy for graph quantization: canonical strings only, hnsw only;
+    // an explicit `"none"` is a legal value.
+    if let Some(quantization) = options.quantization.as_deref() {
+        if !CollectionCreateOptions::CANONICAL_QUANTIZATIONS.contains(&quantization) {
+            return Err(format!(
+                "non-canonical collection quantization {quantization:?} \
+                 (expect none|int8|rabitq)"
+            ));
+        }
+        if index_type != "hnsw" {
+            return Err(format!(
+                "quantization requires index_type 'hnsw' (got {index_type:?})"
+            ));
+        }
+        // RaBitQ 只支持 l2/cosine（1 bit 方向码没有 ip/l1 等价距离核）；写入侧
+        // 必须带显式度量并在此闭合，否则重放会按后端历史语义退回 Cosine。
+        // EN: RaBitQ supports l2/cosine only (the 1-bit direction code has no
+        // equivalent kernel for ip/l1). The writer requires an explicit metric
+        // and closes the rule here, or replay would fall back to cosine.
+        if quantization == "rabitq"
+            && !matches!(options.metric.as_deref(), Some("l2") | Some("cosine"))
+        {
+            return Err(format!(
+                "rabitq quantization requires metric l2|cosine (got {:?})",
+                options.metric
+            ));
+        }
+    }
+    // 稀疏索引同纪律：只写规范串；`bm25` 仅 hnsw/flat 后端（与过滤器删除/
+    // 混合检索的 backend 限制一致），其他后端没有稀疏语义，写入会让重放分叉。
+    // EN: Same policy for sparse indexes: canonical strings only; `bm25` is
+    // hnsw/flat-only (matching the filter/delete and hybrid-search backend
+    // restrictions) because other backends have no sparse semantics and
+    // writing it would diverge replay.
+    if let Some(sparse) = options.sparse.as_deref() {
+        if !CollectionCreateOptions::CANONICAL_SPARSE_MODES.contains(&sparse) {
+            return Err(format!(
+                "non-canonical collection sparse mode {sparse:?} (expect none|bm25)"
+            ));
+        }
+        if sparse == "bm25" && !matches!(index_type, "hnsw" | "flat") {
+            return Err(format!(
+                "bm25 sparse index requires index_type 'hnsw'|'flat' (got {index_type:?})"
             ));
         }
     }
@@ -250,6 +427,9 @@ pub fn encode_collection_create_with_options(
         hnsw_m: options.hnsw_m,
         hnsw_ef_construction: options.hnsw_ef_construction,
         hnsw_ef_search: options.hnsw_ef_search,
+        vector_dtype: options.vector_dtype.clone(),
+        quantization: options.quantization.clone(),
+        sparse: options.sparse.clone(),
     };
     serde_json::to_vec(&env).map_err(|e| e.to_string())
 }
@@ -261,19 +441,37 @@ pub fn encode_collection_upsert_batch(
     dim: usize,
     items: &[CollectionWalItem],
 ) -> Result<Vec<u8>, String> {
+    // 写入侧归一化稀疏词项：重复 term 求和、升序；`None` 保持缺省（不改），
+    // `Some([])` 将持久化为 `[]`（清空），两者语义不可互换。
+    // EN: Normalize sparse terms on the write side: duplicates summed and sorted;
+    // `None` stays absent (no change) while `Some([])` persists as `[]` (clear)
+    // — the two semantics are not interchangeable.
+    let mut normalized_items = Vec::with_capacity(items.len());
+    for item in items {
+        let sparse = match item.sparse.as_deref() {
+            Some(terms) => Some(canonical_sparse_terms(terms)?),
+            None => None,
+        };
+        let mut normalized = item.clone();
+        normalized.sparse = sparse;
+        normalized_items.push(normalized);
+    }
     let env = CollectionWalEnvelope {
         v: COLLECTION_WAL_VERSION,
         op: OP_COLLECTION_UPSERT_BATCH.to_string(),
         name: name.to_string(),
         dims: Some(dim),
         index_type: None,
-        items: Some(items.to_vec()),
+        items: Some(normalized_items),
         ids: None,
         ha_level: None,
         metric: None,
         hnsw_m: None,
         hnsw_ef_construction: None,
         hnsw_ef_search: None,
+        vector_dtype: None,
+        quantization: None,
+        sparse: None,
     };
     serde_json::to_vec(&env).map_err(|e| e.to_string())
 }
@@ -303,6 +501,9 @@ pub fn encode_collection_set_ha_level(
         hnsw_m: None,
         hnsw_ef_construction: None,
         hnsw_ef_search: None,
+        vector_dtype: None,
+        quantization: None,
+        sparse: None,
     };
     serde_json::to_vec(&env).map_err(|e| e.to_string())
 }
@@ -323,6 +524,9 @@ pub fn encode_collection_delete(name: &str, ids: &[u64]) -> Result<Vec<u8>, Stri
         hnsw_m: None,
         hnsw_ef_construction: None,
         hnsw_ef_search: None,
+        vector_dtype: None,
+        quantization: None,
+        sparse: None,
     };
     serde_json::to_vec(&env).map_err(|e| e.to_string())
 }
@@ -343,6 +547,9 @@ pub fn encode_collection_drop(name: &str) -> Result<Vec<u8>, String> {
         hnsw_m: None,
         hnsw_ef_construction: None,
         hnsw_ef_search: None,
+        vector_dtype: None,
+        quantization: None,
+        sparse: None,
     };
     serde_json::to_vec(&env).map_err(|e| e.to_string())
 }
@@ -415,6 +622,78 @@ pub fn decode_collection_wal_payload(
                     ));
                 }
             }
+            // 存储编码与写入侧同规则：未知值 = 写入侧 bug/位衰减/未来版本，
+            // fail-fast；显式 dtype 只允许 hnsw 后端。
+            // EN: Same rules as the writer: an unknown encoding means a writer bug,
+            // bit rot, or a future version — fail fast; an explicit dtype is only
+            // allowed for the hnsw backend.
+            if let Some(dtype) = env.vector_dtype.as_deref() {
+                if !CollectionCreateOptions::CANONICAL_VECTOR_DTYPES.contains(&dtype) {
+                    return Err(format!(
+                        "collection_create (collection '{}') has non-canonical vector_dtype {dtype:?}",
+                        env.name
+                    ));
+                }
+                if index_type != "hnsw" {
+                    return Err(format!(
+                        "collection_create (collection '{}') has vector_dtype for index_type {:?}",
+                        env.name, index_type
+                    ));
+                }
+            }
+            // 图侧量化与写入侧同规则：未知串 fail-fast；显式值只允许 hnsw 后端；
+            // `"none"` 是合法显式值。缺省视作旧记录（不量化）。
+            // EN: Same rules as the writer for graph quantization: unknown strings
+            // fail fast; an explicit value is hnsw-only; `"none"` is legal. Absent
+            // means a legacy record (unquantized).
+            if let Some(quantization) = env.quantization.as_deref() {
+                if !CollectionCreateOptions::CANONICAL_QUANTIZATIONS.contains(&quantization) {
+                    return Err(format!(
+                        "collection_create (collection '{}') has non-canonical quantization \
+                         {quantization:?}",
+                        env.name
+                    ));
+                }
+                if index_type != "hnsw" {
+                    return Err(format!(
+                        "collection_create (collection '{}') has quantization for index_type {:?}",
+                        env.name, index_type
+                    ));
+                }
+                // 与写入侧同规则：rabitq 只支持显式 l2/cosine 度量。
+                // EN: Same rule as the writer: rabitq needs an explicit
+                // l2/cosine metric.
+                if quantization == "rabitq"
+                    && !matches!(env.metric.as_deref(), Some("l2") | Some("cosine"))
+                {
+                    return Err(format!(
+                        "collection_create (collection '{}') has rabitq without an \
+                         l2/cosine metric",
+                        env.name
+                    ));
+                }
+            }
+            // 稀疏模式与写入侧同规则：未知串 fail-fast；`bm25` 仅 hnsw/flat。
+            // 缺省视作旧记录（不建稀疏索引）。
+            // EN: Same rules as the writer for sparse mode: unknown strings fail
+            // fast; `bm25` is hnsw/flat-only. Absent means a legacy record (no
+            // sparse index).
+            if let Some(sparse) = env.sparse.as_deref() {
+                if !CollectionCreateOptions::CANONICAL_SPARSE_MODES.contains(&sparse) {
+                    return Err(format!(
+                        "collection_create (collection '{}') has non-canonical sparse mode \
+                         {sparse:?}",
+                        env.name
+                    ));
+                }
+                if sparse == "bm25" && !matches!(index_type.as_str(), "hnsw" | "flat") {
+                    return Err(format!(
+                        "collection_create (collection '{}') has bm25 sparse index for \
+                         index_type {:?}",
+                        env.name, index_type
+                    ));
+                }
+            }
             // 有 HNSW 参数时必须同时给出度量与非 hnsw 后端校验：缺度量会让重放
             // 退回 Cosine（与创建时度量静默分叉），非 hnsw 后端则意味着写入侧 bug
             // 或被篡改的记录（OCR #05/#24）。m 下限 2 与库层 set_hnsw_m 一致。
@@ -470,6 +749,9 @@ pub fn decode_collection_wal_payload(
                     hnsw_m: hnsw.map(|(m, _, _)| m),
                     hnsw_ef_construction: hnsw.map(|(_, efc, _)| efc),
                     hnsw_ef_search: hnsw.map(|(_, _, efs)| efs),
+                    vector_dtype: env.vector_dtype,
+                    quantization: env.quantization,
+                    sparse: env.sparse,
                 },
             }))
         }
@@ -477,10 +759,10 @@ pub fn decode_collection_wal_payload(
             let dim = env
                 .dims
                 .ok_or_else(|| "collection_upsert_batch missing dims".to_string())?;
-            let items = env
+            let mut items = env
                 .items
                 .ok_or_else(|| "collection_upsert_batch missing items".to_string())?;
-            for it in &items {
+            for it in &mut items {
                 if it.values.len() != dim {
                     return Err(format!(
                         "dim mismatch: item id={} len={} expected dim={}",
@@ -488,6 +770,19 @@ pub fn decode_collection_wal_payload(
                         it.values.len(),
                         dim
                     ));
+                }
+                // 解码侧按同一规则归一化并校验：重复 term 求和、升序，拒绝
+                // 越界/非法权重。`None` 与 `[]` 的语义差异原样保留。
+                // EN: Normalize and validate on decode with the same rule:
+                // duplicates summed and sorted; out-of-range/invalid weights
+                // rejected. The `None` vs `[]` distinction is preserved.
+                if let Some(terms) = it.sparse.as_deref() {
+                    it.sparse = Some(canonical_sparse_terms(terms).map_err(|e| {
+                        format!(
+                            "collection_upsert_batch (collection '{}') item id={}: {e}",
+                            env.name, it.id
+                        )
+                    })?);
                 }
             }
             Ok(Some(CollectionWalRecord::UpsertBatch {
@@ -547,12 +842,16 @@ mod tests {
                 values: vec![0.1, 0.2],
                 label: Some("doc-a".to_string()),
                 payload: Some(payload),
+                // 规范化后的稀疏词项（升序、无重复）。
+                // EN: Normalized sparse terms (ascending, no duplicates).
+                sparse: Some(vec![(1, 0.5), (3, 2.0)]),
             },
             CollectionWalItem {
                 id: 2,
                 values: vec![0.3, 0.4],
                 label: None,
                 payload: None,
+                sparse: None,
             },
         ]
     }
@@ -579,6 +878,9 @@ mod tests {
             hnsw_m: Some(32),
             hnsw_ef_construction: Some(200),
             hnsw_ef_search: Some(64),
+            vector_dtype: None,
+            quantization: None,
+            sparse: None,
         };
         let bytes = encode_collection_create_with_options("docs", 128, "hnsw", &options).unwrap();
         let env: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
@@ -604,6 +906,184 @@ mod tests {
             }
             other => panic!("unexpected record: {other:?}"),
         }
+    }
+
+    #[test]
+    fn roundtrip_create_with_vector_dtype() {
+        let options = CollectionCreateOptions {
+            metric: Some("cosine".to_string()),
+            hnsw_m: Some(16),
+            hnsw_ef_construction: Some(200),
+            hnsw_ef_search: Some(64),
+            vector_dtype: Some("f16".to_string()),
+            quantization: None,
+            sparse: None,
+        };
+        let bytes = encode_collection_create_with_options("docs", 128, "hnsw", &options).unwrap();
+        let env: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(env["v"], 1, "envelope stays v1");
+        assert_eq!(env["vector_dtype"], "f16");
+        let rec = decode_collection_wal_payload(&bytes).unwrap().unwrap();
+        assert_eq!(
+            rec,
+            CollectionWalRecord::Create {
+                name: "docs".to_string(),
+                dims: 128,
+                index_type: "hnsw".to_string(),
+                options,
+            }
+        );
+        // 缺省 dtype 的旧记录：f32 语义，与默认 options 等价。
+        // EN: Legacy records without dtype mean f32, equivalent to default options.
+        let legacy = br#"{"v":1,"op":"collection_create","name":"d","dims":4,"index_type":"hnsw","metric":"l2","hnsw_m":16,"hnsw_ef_construction":400,"hnsw_ef_search":256}"#;
+        match decode_collection_wal_payload(legacy).unwrap().unwrap() {
+            CollectionWalRecord::Create { options, .. } => assert_eq!(options.vector_dtype, None),
+            other => panic!("unexpected record: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn roundtrip_create_with_quantization() {
+        let options = CollectionCreateOptions {
+            metric: Some("l2".to_string()),
+            hnsw_m: Some(16),
+            hnsw_ef_construction: Some(200),
+            hnsw_ef_search: Some(64),
+            vector_dtype: Some("f16".to_string()),
+            quantization: Some("int8".to_string()),
+            sparse: None,
+        };
+        let bytes = encode_collection_create_with_options("docs", 128, "hnsw", &options).unwrap();
+        let env: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(env["v"], 1, "envelope stays v1");
+        assert_eq!(env["quantization"], "int8");
+        let rec = decode_collection_wal_payload(&bytes).unwrap().unwrap();
+        assert_eq!(
+            rec,
+            CollectionWalRecord::Create {
+                name: "docs".to_string(),
+                dims: 128,
+                index_type: "hnsw".to_string(),
+                options,
+            }
+        );
+        // 显式 "none" 合法；缺省等价于旧记录（不量化）。
+        // EN: An explicit "none" is legal; absence means a legacy (unquantized)
+        // record.
+        let none_opts = CollectionCreateOptions {
+            metric: Some("l2".to_string()),
+            quantization: Some("none".to_string()),
+            ..Default::default()
+        };
+        let bytes = encode_collection_create_with_options("docs", 128, "hnsw", &none_opts).unwrap();
+        let env: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(env["quantization"], "none");
+        match decode_collection_wal_payload(&bytes).unwrap().unwrap() {
+            CollectionWalRecord::Create { options, .. } => {
+                assert_eq!(options.quantization.as_deref(), Some("none"))
+            }
+            other => panic!("unexpected record: {other:?}"),
+        }
+        // RaBitQ 与 int8 同链路 roundtrip；度量限 l2/cosine。
+        // EN: RaBitQ roundtrips through the same path; the metric is l2/cosine.
+        let rabitq_opts = CollectionCreateOptions {
+            metric: Some("cosine".to_string()),
+            quantization: Some("rabitq".to_string()),
+            ..Default::default()
+        };
+        let bytes =
+            encode_collection_create_with_options("docs", 128, "hnsw", &rabitq_opts).unwrap();
+        let env: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(env["quantization"], "rabitq");
+        match decode_collection_wal_payload(&bytes).unwrap().unwrap() {
+            CollectionWalRecord::Create { options, .. } => {
+                assert_eq!(options.quantization.as_deref(), Some("rabitq"))
+            }
+            other => panic!("unexpected record: {other:?}"),
+        }
+        let legacy = br#"{"v":1,"op":"collection_create","name":"d","dims":4,"index_type":"hnsw","metric":"l2","hnsw_m":16,"hnsw_ef_construction":400,"hnsw_ef_search":256}"#;
+        match decode_collection_wal_payload(legacy).unwrap().unwrap() {
+            CollectionWalRecord::Create { options, .. } => {
+                assert_eq!(options.quantization, None)
+            }
+            other => panic!("unexpected record: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn quantization_validation_fails_closed() {
+        // 未知量化串：编码/解码两侧都拒绝。
+        // EN: Unknown quantization string: rejected by both writer and decoder.
+        let bad = CollectionCreateOptions {
+            quantization: Some("int4".to_string()),
+            ..Default::default()
+        };
+        assert!(encode_collection_create_with_options("d", 4, "hnsw", &bad).is_err());
+        let corrupt = br#"{"v":1,"op":"collection_create","name":"d","dims":4,"index_type":"hnsw","quantization":"int4"}"#;
+        assert!(decode_collection_wal_payload(corrupt).is_err());
+        // 量化给非 hnsw 后端：只有 hnsw 有图侧量化语义。
+        // EN: Quantization for a non-hnsw backend: only hnsw has graph-side
+        // quantization semantics.
+        let wrong_backend = CollectionCreateOptions {
+            quantization: Some("int8".to_string()),
+            ..Default::default()
+        };
+        assert!(encode_collection_create_with_options("d", 4, "flat", &wrong_backend).is_err());
+        let corrupt = br#"{"v":1,"op":"collection_create","name":"d","dims":4,"index_type":"flat","quantization":"int8"}"#;
+        assert!(decode_collection_wal_payload(corrupt).is_err());
+        // RaBitQ 只支持 l2/cosine：缺度量或 ip/l1 度量两侧都拒绝。
+        // EN: RaBitQ is l2/cosine-only: a missing or ip/l1 metric is rejected on
+        // both sides.
+        let rabitq_no_metric = CollectionCreateOptions {
+            quantization: Some("rabitq".to_string()),
+            ..Default::default()
+        };
+        assert!(encode_collection_create_with_options("d", 4, "hnsw", &rabitq_no_metric).is_err());
+        let corrupt = br#"{"v":1,"op":"collection_create","name":"d","dims":4,"index_type":"hnsw","quantization":"rabitq"}"#;
+        assert!(decode_collection_wal_payload(corrupt).is_err());
+        let rabitq_ip = CollectionCreateOptions {
+            metric: Some("ip".to_string()),
+            quantization: Some("rabitq".to_string()),
+            ..Default::default()
+        };
+        assert!(encode_collection_create_with_options("d", 4, "hnsw", &rabitq_ip).is_err());
+        let corrupt = br#"{"v":1,"op":"collection_create","name":"d","dims":4,"index_type":"hnsw","metric":"ip","quantization":"rabitq"}"#;
+        assert!(decode_collection_wal_payload(corrupt).is_err());
+        // 合法组合（l2/cosine）照常通过，避免上面的规则误伤。
+        // EN: Valid l2/cosine combinations still pass so the rule above cannot
+        // over-reject.
+        let rabitq_l2 = CollectionCreateOptions {
+            metric: Some("l2".to_string()),
+            quantization: Some("rabitq".to_string()),
+            ..Default::default()
+        };
+        assert!(encode_collection_create_with_options("d", 4, "hnsw", &rabitq_l2).is_ok());
+        let ok = br#"{"v":1,"op":"collection_create","name":"d","dims":4,"index_type":"hnsw","metric":"cosine","quantization":"rabitq"}"#;
+        assert!(decode_collection_wal_payload(ok).is_ok());
+    }
+
+    #[test]
+    fn vector_dtype_validation_fails_closed() {
+        // 未知编码：写入侧与解码侧都拒绝。
+        // EN: Unknown encoding: rejected by both writer and decoder.
+        let bad = CollectionCreateOptions {
+            metric: Some("cosine".to_string()),
+            vector_dtype: Some("bf16".to_string()),
+            ..Default::default()
+        };
+        assert!(encode_collection_create_with_options("d", 4, "hnsw", &bad).is_err());
+        let corrupt =
+            br#"{"v":1,"op":"collection_create","name":"d","dims":4,"index_type":"hnsw","vector_dtype":"bf16"}"#;
+        assert!(decode_collection_wal_payload(corrupt).is_err());
+        // 显式 dtype 给非 hnsw 后端：只有 hnsw 有 dtype 存储路径。
+        // EN: Explicit dtype for a non-hnsw backend: only hnsw has a dtype path.
+        let wrong_backend = CollectionCreateOptions {
+            vector_dtype: Some("f16".to_string()),
+            ..Default::default()
+        };
+        assert!(encode_collection_create_with_options("d", 4, "flat", &wrong_backend).is_err());
+        let corrupt = br#"{"v":1,"op":"collection_create","name":"d","dims":4,"index_type":"flat","vector_dtype":"f16"}"#;
+        assert!(decode_collection_wal_payload(corrupt).is_err());
     }
 
     #[test]
@@ -654,6 +1134,9 @@ mod tests {
             hnsw_m: Some(16),
             hnsw_ef_construction: Some(400),
             hnsw_ef_search: Some(256),
+            vector_dtype: None,
+            quantization: None,
+            sparse: None,
         };
         assert!(encode_collection_create_with_options("d", 4, "flat", &wrong_backend).is_err());
         let mut no_metric = wrong_backend.clone();
@@ -830,5 +1313,181 @@ mod tests {
     fn derived_path_sits_next_to_main_wal() {
         let p = collections_wal_path_for(Path::new("/data/houyidb.wal"));
         assert_eq!(p, PathBuf::from("/data/houyidb.collections.wal"));
+    }
+
+    #[test]
+    fn roundtrip_create_with_sparse_mode() {
+        let options = CollectionCreateOptions {
+            metric: Some("l2".to_string()),
+            sparse: Some("bm25".to_string()),
+            ..Default::default()
+        };
+        let bytes = encode_collection_create_with_options("docs", 128, "hnsw", &options).unwrap();
+        let env: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        // 信封保持 v1：稀疏是加法字段，旧二进制静默忽略。
+        // EN: The envelope stays v1: sparse is an additive field that old
+        // binaries silently ignore.
+        assert_eq!(env["v"], 1);
+        assert_eq!(env["sparse"], "bm25");
+        match decode_collection_wal_payload(&bytes).unwrap().unwrap() {
+            CollectionWalRecord::Create {
+                options: decoded, ..
+            } => {
+                assert_eq!(decoded.sparse.as_deref(), Some("bm25"))
+            }
+            other => panic!("unexpected record: {other:?}"),
+        }
+        // 显式 "none" 合法；缺省等价于旧记录（不建稀疏索引）。
+        // EN: An explicit "none" is legal; absence equals a legacy record (no
+        // sparse index).
+        let none_opts = CollectionCreateOptions {
+            metric: Some("l2".to_string()),
+            sparse: Some("none".to_string()),
+            ..Default::default()
+        };
+        let bytes = encode_collection_create_with_options("docs", 128, "flat", &none_opts).unwrap();
+        match decode_collection_wal_payload(&bytes).unwrap().unwrap() {
+            CollectionWalRecord::Create { options, .. } => {
+                assert_eq!(options.sparse.as_deref(), Some("none"))
+            }
+            other => panic!("unexpected record: {other:?}"),
+        }
+        let legacy = br#"{"v":1,"op":"collection_create","name":"d","dims":4,"index_type":"hnsw","metric":"l2"}"#;
+        match decode_collection_wal_payload(legacy).unwrap().unwrap() {
+            CollectionWalRecord::Create { options, .. } => assert_eq!(options.sparse, None),
+            other => panic!("unexpected record: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sparse_mode_validation_fails_closed() {
+        // 未知稀疏模式：写入/解码两侧都拒绝。
+        // EN: Unknown sparse mode: rejected by both writer and decoder.
+        let bad = CollectionCreateOptions {
+            metric: Some("l2".to_string()),
+            sparse: Some("splade".to_string()),
+            ..Default::default()
+        };
+        assert!(encode_collection_create_with_options("d", 4, "hnsw", &bad).is_err());
+        let corrupt = br#"{"v":1,"op":"collection_create","name":"d","dims":4,"index_type":"hnsw","sparse":"splade"}"#;
+        assert!(decode_collection_wal_payload(corrupt).is_err());
+        // bm25 只允许 hnsw/flat 后端。
+        // EN: bm25 is allowed only on hnsw/flat backends.
+        let wrong_backend = CollectionCreateOptions {
+            sparse: Some("bm25".to_string()),
+            ..Default::default()
+        };
+        assert!(encode_collection_create_with_options("d", 4, "pq-flat", &wrong_backend).is_err());
+        let corrupt = br#"{"v":1,"op":"collection_create","name":"d","dims":4,"index_type":"pq-flat","sparse":"bm25"}"#;
+        assert!(decode_collection_wal_payload(corrupt).is_err());
+        // flat + bm25 合法，避免规则误伤。
+        // EN: flat + bm25 is legal; the rule must not over-reject.
+        let ok = CollectionCreateOptions {
+            sparse: Some("bm25".to_string()),
+            ..Default::default()
+        };
+        assert!(encode_collection_create_with_options("d", 4, "flat", &ok).is_ok());
+        let ok = br#"{"v":1,"op":"collection_create","name":"d","dims":4,"index_type":"flat","sparse":"bm25"}"#;
+        assert!(decode_collection_wal_payload(ok).is_ok());
+    }
+
+    #[test]
+    fn upsert_sparse_presence_semantics_and_normalization() {
+        // 缺省 = 不改；`[]` = 清空；重复 term 求和并升序落盘。
+        // EN: Absent = no change; `[]` = clear; duplicate terms are summed and
+        // persisted ascending.
+        let items = vec![
+            CollectionWalItem {
+                id: 1,
+                values: vec![0.1, 0.2],
+                label: None,
+                payload: None,
+                sparse: None,
+            },
+            CollectionWalItem {
+                id: 2,
+                values: vec![0.3, 0.4],
+                label: None,
+                payload: None,
+                sparse: Some(Vec::new()),
+            },
+            CollectionWalItem {
+                id: 3,
+                values: vec![0.5, 0.6],
+                label: None,
+                payload: None,
+                sparse: Some(vec![(2, 0.5), (1, 1.0), (2, 1.0)]),
+            },
+        ];
+        let bytes = encode_collection_upsert_batch("docs", 2, &items).unwrap();
+        let env: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(env["v"], 1);
+        let wire_items = env["items"].as_array().unwrap();
+        assert!(
+            wire_items[0].get("sparse").is_none(),
+            "absent sparse must stay absent on the wire"
+        );
+        assert_eq!(wire_items[1]["sparse"], serde_json::json!([]));
+        assert_eq!(
+            wire_items[2]["sparse"],
+            serde_json::json!([[1, 1.0], [2, 1.5]])
+        );
+
+        let decoded = decode_collection_wal_payload(&bytes).unwrap().unwrap();
+        match decoded {
+            CollectionWalRecord::UpsertBatch { items: decoded, .. } => {
+                assert_eq!(decoded[0].sparse, None);
+                assert_eq!(decoded[1].sparse, Some(Vec::new()));
+                assert_eq!(decoded[2].sparse, Some(vec![(1, 1.0), (2, 1.5)]));
+            }
+            other => panic!("unexpected record: {other:?}"),
+        }
+
+        // 非法 term/权重在写入侧拒绝。
+        // EN: Invalid term ids/weights are rejected on the writer side.
+        for bad in [
+            vec![(0u32, 1.0f32)],
+            vec![((1 << 24), 1.0)],
+            vec![(1, 0.0)],
+            vec![(1, -1.0)],
+            vec![(1, f32::NAN)],
+            vec![(1, f32::INFINITY)],
+        ] {
+            let mut items = items.clone();
+            items[0].sparse = Some(bad);
+            assert!(encode_collection_upsert_batch("docs", 2, &items).is_err());
+        }
+        // 超量词项（1025 个不同 term）拒绝。
+        // EN: Over-limit term count (1025 distinct terms) is rejected.
+        let mut items = items.clone();
+        items[0].sparse = Some(
+            (1..=(SPARSE_MAX_TERMS_PER_DOC as u32 + 1))
+                .map(|t| (t, 1.0))
+                .collect(),
+        );
+        assert!(encode_collection_upsert_batch("docs", 2, &items).is_err());
+
+        // 解码侧对同一规则 fail-fast（手写 JSON 绕过写入侧归一化）。
+        // EN: The decoder fails fast on the same rules (hand-written JSON
+        // bypasses writer normalization).
+        for corrupt in [
+            r#"{"v":1,"op":"collection_upsert_batch","name":"d","dims":2,"items":[{"id":1,"values":[0.1,0.2],"sparse":[[0,1.0]]}]}"#,
+            r#"{"v":1,"op":"collection_upsert_batch","name":"d","dims":2,"items":[{"id":1,"values":[0.1,0.2],"sparse":[[1,0.0]]}]}"#,
+            r#"{"v":1,"op":"collection_upsert_batch","name":"d","dims":2,"items":[{"id":1,"values":[0.1,0.2],"sparse":[[1,-2.0]]}]}"#,
+        ] {
+            assert!(
+                decode_collection_wal_payload(corrupt.as_bytes()).is_err(),
+                "corrupt sparse must fail fast: {corrupt}"
+            );
+        }
+        // 手写 JSON 的未排序/重复词项按同规则归一化后接受。
+        // EN: Hand-written unsorted/duplicate terms are normalized and accepted.
+        let unsorted = br#"{"v":1,"op":"collection_upsert_batch","name":"d","dims":2,"items":[{"id":1,"values":[0.1,0.2],"sparse":[[2,1.0],[1,0.5],[2,2.0]]}]}"#;
+        match decode_collection_wal_payload(unsorted).unwrap().unwrap() {
+            CollectionWalRecord::UpsertBatch { items, .. } => {
+                assert_eq!(items[0].sparse, Some(vec![(1, 0.5), (2, 3.0)]));
+            }
+            other => panic!("unexpected record: {other:?}"),
+        }
     }
 }

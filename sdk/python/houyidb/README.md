@@ -2,7 +2,7 @@
 
 > [English](README.en.md)
 
-HouyiDB collections HTTP API 的薄封装：传输 + 类型，不含框架语义。
+HouyiDB collections HTTP API 的薄封装：传输 + 类型，不含框架语义。需要 Python ≥ 3.10。
 
 ```python
 from houyidb import HouyiClient, Vector, Filter

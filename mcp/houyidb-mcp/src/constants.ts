@@ -72,3 +72,45 @@ export const BACKEND_METRIC_CONSTRAINTS: Partial<
   "pq-flat": "l2",
   "hii-l0": "cosine",
 };
+
+// 服务端对 f16 的别名集合（大小写不敏感）：本地预拒绝必须识别所有别名，
+// 同时不得比服务端更严——schema 因此放宽为 string，由服务端做最终校验。
+// EN: f16 aliases accepted by the server (case-insensitive). Local
+// pre-rejection must recognize every alias yet stay no stricter than the
+// server, so the schema accepts a plain string and the server does final
+// validation.
+export const F16_DTYPE_ALIASES = ["f16", "float16", "fp16", "half"] as const;
+
+// 稀疏向量边界与服务端同口径：term ∈ [1, 2^24-1]，每文档最多 1024 对，
+// 查询最多 64 对（服务端对原始对数计数，重复 term 由服务端求和）。
+// EN: Sparse bounds mirror the server: term ∈ [1, 2^24-1], at most 1024 raw
+// pairs per document and 64 per query (counted before duplicate terms are
+// summed server-side).
+export const MAX_SPARSE_TERM_ID = (1 << 24) - 1;
+export const MAX_SPARSE_TERMS_PER_DOC = 1_024;
+export const MAX_SPARSE_QUERY_TERMS = 64;
+
+// 创建期稀疏索引模式（大小写不敏感的服务端归一不在 MCP schema 范围）。
+// EN: Sparse index modes accepted at creation (the server's
+// case-insensitive normalization is out of the MCP schema's scope).
+export const SPARSE_MODES = ["none", "bm25"] as const;
+
+// bm25 是可过滤后端上的旁路倒排索引，与服务端 validate_create 同口径。
+// EN: bm25 is a side inverted index on filterable backends, matching the
+// server's validate_create.
+export const SPARSE_BM25_BACKENDS: readonly IndexTypeName[] = ["hnsw", "flat"];
+
+// 融合模式、RRF 平滑常数上限与服务端缺省值（缺省值在 schema 描述与请求
+// 构造两处共用，避免字面量漂移）。
+// EN: Fusion modes, the RRF smoothing-constant ceiling, and the server
+// defaults (shared by the schema descriptions and request building so the
+// literals cannot drift).
+export const FUSION_MODES = ["rrf", "weighted"] as const;
+export type FusionModeName = (typeof FUSION_MODES)[number];
+export const MAX_RRF_K = 1_000;
+// 缺省值用联合类型约束：字面量拼错会在编译期失败，而不是到服务端才 400。
+// EN: The default is constrained by the union type so a typo fails at
+// compile time instead of surfacing as a server-side 400.
+export const DEFAULT_FUSION_MODE: FusionModeName = "rrf";
+export const DEFAULT_RRF_K = 60;
+export const DEFAULT_FUSION_ALPHA = 0.5;

@@ -49,7 +49,7 @@ void* houyi_mobile_create(uint32_t dims, const char* index_type);
 | 类型 | 内存 | 延迟 | Recall | 适用 |
 |------|------|------|--------|------|
 | `flat` | 无压缩 | O(N) | 1.0 (精确) | N < 5K, 离线评估 |
-| `flat-clustered` | 无压缩 | < 1ms | > 0.95 | **推荐移动端默认** |
+| `flat-clustered` | f16（约 f32 一半）/ i8（约 f16 一半，另有 scale） | ~0.5–1ms | > 0.95 | **推荐移动端默认（f16；内存紧张用 i8）** |
 | `clustered-hnsw` | 图结构 | ~1ms | > 0.99 | N > 50K, 高 recall |
 
 ### 2.2 插入向量
@@ -64,9 +64,15 @@ int32_t houyi_mobile_insert(void* handle, uint64_t id, const float* vector, uint
 | `id` | 向量唯一标识 |
 | `vector` | 浮点数组指针 |
 | `len` | 数组长度 (必须 = dims) |
-| 返回 | 0 成功, -1 失败 |
+| 返回 | 0 成功；-1 参数/维度/集合缺失；-2 语义拒绝（如 CH 建图后覆盖已有 id，需 rebuild） |
 
 支持幂等覆盖：同一 `id` 重复插入时覆盖旧值。
+
+> 建图后行为：
+> - `flat-clustered`：增量插入按最近质心归簇，**立即可查**；同 id 覆盖为跨簇搬移/原位更新，计数不变。
+> - `clustered-hnsw`：建图后允许追加**新 id**（立即可查）；覆盖已有 id 返回 -2，需**重建索引**后批量 upsert，避免陈旧副本。
+> - `flat`：始终直接扫描存储，无需单独建图。
+> - 再次调用 `build` 会从当前索引（含增量行）重新聚类，不依赖已释放的写入缓冲。
 
 ### 2.3 构建索引
 
@@ -109,9 +115,94 @@ uint32_t houyi_mobile_count(void* handle);
 void houyi_mobile_destroy(void* handle);
 ```
 
+### 2.7 ABI v2：批量写入 / u64 结果 / 显式配置
+
+```c
+void* houyi_mobile_create_v2(uint32_t dims, const char* index_type,
+                             uint8_t metric, uint8_t dtype); // NULL 非法
+int32_t houyi_mobile_insert_batch(void* handle, const uint64_t* ids,
+                                  const float* vectors, uint32_t count, uint32_t dims);
+typedef struct { uint64_t id; float score; } HouyiMobileResult; // sizeof=16
+uint32_t houyi_mobile_search_u64(void* handle, const float* query, uint32_t dims,
+                                 uint32_t k, HouyiMobileResult* results, uint32_t max_results);
+int32_t houyi_mobile_db_collection_v2(void* db, const char* name, uint32_t dims,
+                                      const char* index_type, uint8_t metric, uint8_t dtype);
+int32_t houyi_mobile_db_insert_batch(void* db, const char* name, const uint64_t* ids,
+                                     const float* vectors, uint32_t count, uint32_t dims);
+uint32_t houyi_mobile_db_search_u64(void* db, const char* name, const float* query,
+                                    uint32_t dims, uint32_t k,
+                                    HouyiMobileResult* results, uint32_t max_results);
+```
+
+- `metric`: 0=L2、1=Cosine、2=IP、3=L1；`dtype`: 0=f32、1=f16、2=i8（f16/i8
+  仅 `flat-clustered`；i8 每维 1 B + 每向量 4 B scale）。旧 `create`/`db_collection` 保持历史默认（flat=L2/f32、
+  flat-clustered=Cosine/f16、clustered-hnsw=Cosine/f32）。
+- 旧检索写 `float` id，超过 2^24 会丢精度；**新代码一律用 `*_u64` 版本**。
+- 批量写入一次加锁、按顺序应用；返回 0/-1/-2，失败前已写入的行不回滚。
+- 同名 Collection 改用不同配置时 `db_collection_v2` 返回 -1（不做静默复用）。
+
+### 2.8 保存 / 加载数据库
+
+```c
+int32_t houyi_mobile_db_save(void* db, const char* path);  // 0 成功，-1 失败
+void*   houyi_mobile_db_load(const char* path);            // NULL 表示失败
+```
+
+- 保存整个 `MobileDB`（多 collection + 标量页）：先写同目录临时文件并 `fsync`，再
+  `rename` 覆盖目标；文件含 magic/版本/长度/CRC32，损坏、截断、错版本一律拒绝。
+- `flat-clustered` 保存 **f16 构建态**（质心 + 分簇 id/向量），加载**不重建**；
+  `flat` 保存原始行；`clustered-hnsw` 保存原始行并在加载时重建。
+- 不引入 WAL：保存点由调用方控制；建议在写批次结束时调用，避开 UI 线程。
+- 实测（host，100k×192 f16）：文件 37.6 MB，save 0.10 s，load 0.064 s；
+  真实 7.3k×512：文件 7.3 MB，save 0.023 s，load 0.012 s。真机数值以实测为准。
+
+### 2.9 检索预算调优（flat-clustered 余弦）
+
+```c
+int32_t houyi_mobile_set_search_target(void* handle, uint32_t per_k);
+int32_t houyi_mobile_db_set_search_target(void* db, const char* name, uint32_t per_k);
+```
+
+- `per_k` 是「每个 k 的候选预算」：实际扫描候选约 `k * per_k`，默认 **2500**
+  （k=10 时约 25k 候选，保证高召回）。
+- 仅对 `flat-clustered` + Cosine 生效；其他后端返回 0 但无效果。Kotlin：
+  `HouyiDB.setSearchBudget(handle, name, perK)`。
+- 人脸场景实测（真实 7.3k×512，host）：`per_k=500` 时 p50 ≈ 0.30 ms、
+  recall@10 = 0.994；默认 2500 时 p50 ≈ 0.43 ms、recall = 1.000。可按
+  「延迟优先」或「召回优先」选择；该预算不写入快照，属于运行期设置。
+- f16/i8 余弦路径已预计算候选/质心范数（每向量 +4 B，100k 约 0.4 MB），
+  查询热循环只做一次点积；服务端默认 f32 路径不启用该缓存。
+- 真机实测（华为 CLS-AL00，k=10，中位数）：
+
+| 数据/配置 | 默认 per_k=2500 | per_k=500 | recall@10（500） |
+|---|---:|---:|---:|
+| 真实 7.3k×512 f16 | 1.448 ms / 1.000 | 1.127 ms | 0.994 |
+| 真实 7.3k×512 i8 | 1.293 ms / 0.996 | 0.974 ms | 0.991 |
+| 合成 100k×192 f16 | 2.125 ms / 0.955 | — | — |
+
+  真机噪声大于主机，数值仅代表该机型量级；默认预算优先保召回，预算 500
+  适合首屏/交互查询。
+
 ---
 
 ## 3. 平台示例
+
+### 3.0 Android AAR
+
+仓库新增 `houyi-mobile/android` Gradle library 工程与 JNI 桥：
+
+```bash
+./scripts/build_mobile_android_aar.sh
+# 产物 houyi-mobile/android/build/outputs/aar/houyi-mobile-android-release.aar（约 404 KB）
+./scripts/mobile_jni_smoke.sh   # 主机 JVM 冒烟，无需真机
+```
+
+Kotlin `cc.houyidb.mobile.HouyiDB` 提供 `open/close/createCollection/
+createCollection(metric,dtype)/insert/insertBatch/build/count/search/save/load/
+insertScalarsWithId/searchHybrid/setSearchBudget/lastError`；`search` 返回 `SearchHit(id: Long, score: Float)`，不再有 f32 id
+精度问题。AAR 当前仅含 arm64-v8a。构建需要 SDK 34 / NDK ≥26 / Gradle 8.9
+（wrapper 已入库）/ Java 17。
+
 
 ### 3.1 Swift (iOS)
 
@@ -257,12 +348,17 @@ houyi_mobile_db_collection(db, "photos", 512, "flat-clustered")
 
 // 插入向量 + 标量标签
 houyi_mobile_db_insert(db, "photos", 1, vector, 512)
-houyi_mobile_db_insert_scalars(db, "photos", 
+// 推荐：显式向量 id 写入，混合检索按 id 关联
+houyi_mobile_db_insert_scalars_v2(db, "photos", 1,
     "[{\"col\":\"tag\",\"val\":\"text:beach\"},{\"col\":\"date\",\"val\":\"ts:1717200000\"}]")
+// 旧接口 houyi_mobile_db_insert_scalars 仍按行号兼容；若已写入显式 id，
+// 行号可能顺延到空闲位，混合场景请只用 v2（显式 id）
 
 // 混合检索: tag=beach AND date>2024-06-01
 // filters_json: [{"col":"tag","op":"eq","val":"text:beach"},{"col":"date","op":"gt","val":"ts:1717200000"}]
-houyi_mobile_db_search_hybrid(db, "photos", query, 512, 10, filters_json, results, 10)
+// 新代码用 u64 结果；过滤条件在 flat-clustered 候选扫描阶段下推
+HouyiMobileResult results[10];
+houyi_mobile_db_search_hybrid_u64(db, "photos", query, 512, 10, filters_json, results, 10)
 ```
 
 ### 7.2 标量值格式

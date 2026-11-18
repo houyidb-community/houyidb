@@ -7,10 +7,10 @@ name = "llama-index-vector-stores-houyidb"
 version = "0.2.0b8"
 description = "LlamaIndex VectorStore adapter for HouyiDB"
 readme = "README.md"
-requires-python = ">=3.9"
+requires-python = ">=3.10"
 license = "Apache-2.0"
 authors = [{ name = "HouyiDB Contributors" }]
-dependencies = ["llama-index-core>=0.12", "houyidb>=0.2.0b5"]
+dependencies = ["llama-index-core>=0.12", "houyidb>=0.2.0b8"]
 
 [project.urls]
 Homepage = "https://github.com/houyidb-community/houyidb"

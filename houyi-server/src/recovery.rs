@@ -12,7 +12,10 @@ use houyi_persistence::vector_snapshot::{
 };
 use houyi_persistence::vector_wal::decode_vector_wal_payload;
 use houyi_persistence::WalEntry;
-use houyi_vector::{peek_graph_snapshot_dims_metric, DistanceMetric};
+use houyi_vector::sparse::SparseMode;
+use houyi_vector::{
+    peek_graph_snapshot_dims_metric_dtype_quantization, DistanceMetric, Quantization, VectorDtype,
+};
 use std::collections::HashMap;
 use std::fmt;
 use std::fs;
@@ -218,21 +221,82 @@ pub async fn apply_collection_graph_snapshots_with_encryption(
                 continue;
             }
         };
-        // 建 collection 需要 dims：只读快照头即可，不做全量解码。
-        // EN: dims come from a header-only peek (no full decode).
-        let dims = match peek_graph_snapshot_dims_metric(&snap.payload) {
-            Ok((dims, _metric)) => dims,
-            Err(e) => {
-                metrics.inc_rejects();
-                tracing::warn!(
-                    collection = %name,
-                    error = %e,
-                    "[houyi-recovery] collection graph snapshot discarded (bad header) — full replay"
-                );
-                continue;
+        // 建 collection 需要 dims/metric/dtype/quantization：只读快照头即可，
+        // 不做全量解码。未量化的 f32 走历史隐式创建路径（保持旧行为）；f16 或
+        // int8/rabitq 必须显式建 hnsw 后端，否则恢复期会以 Mismatch 拒绝该图
+        // 并回退全量重放（量化值若缺失则静默建成未量化，更是分叉）。
+        // EN: dims/metric/dtype/quantization come from a header-only peek (no
+        // full decode). Unquantized f32 keeps the historical implicit-creation
+        // path; f16 or int8/rabitq must build an explicit hnsw backend, otherwise
+        // the restore rejects the graph (Mismatch) and falls back to full replay
+        // (a missing quantization value would even silently build an unquantized
+        // graph).
+        let (dims, metric, vector_dtype, quantization) =
+            match peek_graph_snapshot_dims_metric_dtype_quantization(&snap.payload) {
+                Ok(peeked) => peeked,
+                Err(e) => {
+                    metrics.inc_rejects();
+                    tracing::warn!(
+                        collection = %name,
+                        error = %e,
+                        "[houyi-recovery] collection graph snapshot discarded (bad header) — full replay"
+                    );
+                    continue;
+                }
+            };
+        let created = if vector_dtype == VectorDtype::F32 && quantization == Quantization::None {
+            if manager.default_index_type() == "hnsw" {
+                // 默认后端为 hnsw 时按快照头中的度量显式重建：历史隐式路径
+                // 会丢弃 peeked metric、改用缺省度量，非缺省度量的 f32 图快照
+                // 因此恢复失败并回退全量重放（OCR #6）。
+                // EN: With hnsw as the default backend, rebuild explicitly with the
+                // metric from the snapshot header: the legacy implicit path drops
+                // the peeked metric and uses the default one, so f32 graph
+                // snapshots built under a non-default metric failed restore and
+                // fell back to full replay (OCR #6).
+                manager.get_or_create_typed_with_metric_and_quantization(
+                    name,
+                    dims,
+                    "hnsw",
+                    Some(metric),
+                    None,
+                    Some(vector_dtype),
+                    Some(quantization),
+                    // legacy 图快照头不含稀疏模式：不比对，交给 create 记录重放对账。
+                    // EN: The legacy graph-snapshot header carries no sparse mode:
+                    // skip the comparison; replayed create records reconcile it.
+                    None,
+                )
+            } else {
+                // 非 hnsw 默认后端（如 flat）：保持历史隐式创建语义，
+                // 该后端随后会安全跳过非 HNSW 快照。
+                // EN: Non-hnsw default backend (e.g. flat): keep the legacy
+                // implicit-creation semantics; that backend then safely skips
+                // non-HNSW snapshots.
+                manager.get_or_create_flagged(name, Some(dims))
             }
+        } else {
+            // f16 主表或 int8/rabitq 图侧量化必须显式重建同配置的 hnsw 后端：
+            // 任一缺失都会在 restore 时 Mismatch（量化缺失则是静默分叉）。
+            // EN: An f16 main store or int8/rabitq graph-side quantization must
+            // be rebuilt with the same explicit hnsw configuration: a missing
+            // value yields a restore Mismatch (or silent divergence for
+            // quantization).
+            manager.get_or_create_typed_with_metric_and_quantization(
+                name,
+                dims,
+                "hnsw",
+                Some(metric),
+                None,
+                Some(vector_dtype),
+                Some(quantization),
+                // legacy 图快照头不含稀疏模式：不比对，交给 create 记录重放对账。
+                // EN: The legacy graph-snapshot header carries no sparse mode:
+                // skip the comparison; replayed create records reconcile it.
+                None,
+            )
         };
-        let (col, _) = match manager.get_or_create_flagged(name, Some(dims)) {
+        let (col, _) = match created {
             Ok(v) => v,
             Err(e) => {
                 metrics.inc_rejects();
@@ -760,6 +824,14 @@ pub struct CollectionsReplayStats {
     /// 重建的标量行数。
     /// EN: Rebuilt scalar rows.
     pub scalar_rows: usize,
+    /// 重放写入稀疏侧索引的文档数（covered/uncovered 两分支都计）。
+    /// EN: Documents replayed into the sparse side index (both covered and
+    /// uncovered branches count).
+    pub sparse_upserts: usize,
+    /// 重放从稀疏侧索引移除的文档数（幂等：不存在也计一次应用）。
+    /// EN: Documents removed from the sparse side index during replay (idempotent:
+    /// a missing id still counts one application).
+    pub sparse_removals: usize,
     /// 应用的删除批次数。
     /// EN: Applied delete batches.
     pub delete_batches: usize,
@@ -969,6 +1041,52 @@ pub(crate) async fn apply_collection_wal_record(
                 // EN: The decoder already guarantees all-or-none; None means legacy.
                 _ => None,
             };
+            // 存储编码：解码侧已校验规范串；None = 旧记录（f32）。
+            // EN: Storage encoding: the decoder already validated the canonical
+            // string; None means a legacy record (f32).
+            let vector_dtype = match options.vector_dtype.as_deref() {
+                Some("f32") => Some(VectorDtype::F32),
+                Some("f16") => Some(VectorDtype::F16),
+                Some(raw) => {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!("collection_create has unparsable vector_dtype {raw:?}"),
+                    ))
+                }
+                None => None,
+            };
+            // 图侧量化：解码侧已校验规范串；None = 旧记录（未量化，不比对）。
+            // EN: Graph-side quantization: the decoder already validated the
+            // canonical string; None means a legacy record (unquantized, not
+            // compared).
+            let quantization = match options.quantization.as_deref() {
+                Some("none") => Some(Quantization::None),
+                Some("int8") => Some(Quantization::Int8),
+                Some("rabitq") => Some(Quantization::RaBitQ),
+                Some(raw) => {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!("collection_create has unparsable quantization {raw:?}"),
+                    ))
+                }
+                None => None,
+            };
+            // 稀疏模式：解码侧已校验规范串；None = 旧记录（无稀疏，不比对）。
+            // bm25 仅能在 hnsw/flat 上构造，解码侧已拒绝非法组合。
+            // EN: Sparse mode: the decoder already validated the canonical string;
+            // None means a legacy record (no sparse, not compared). bm25 is only
+            // constructible on hnsw/flat and the decoder rejected illegal combos.
+            let sparse = match options.sparse.as_deref() {
+                Some("none") => Some(SparseMode::None),
+                Some("bm25") => Some(SparseMode::Bm25),
+                Some(raw) => {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!("collection_create has unparsable sparse {raw:?}"),
+                    ))
+                }
+                None => None,
+            };
             // 重放入口不严格比对 HNSW 参数：快照恢复会把运行期调参写回后端，
             // 而记录保存的是创建时参数，严格比对会让合法的冷启动失败
             // （OCR 195e6be #11）。
@@ -977,7 +1095,16 @@ pub(crate) async fn apply_collection_wal_record(
             // while the record holds creation-time parameters, so a strict check
             // would reject a legitimate cold start (OCR 195e6be #11).
             let (col, created) = manager
-                .get_or_create_replayed(&name, dims, &index_type, metric, hnsw)
+                .get_or_create_replayed_with_quantization(
+                    &name,
+                    dims,
+                    &index_type,
+                    metric,
+                    hnsw,
+                    vector_dtype,
+                    quantization,
+                    sparse,
+                )
                 .map_err(std::io::Error::other)?;
             // 与快照/压实共用写锁：Create 也要参与 applied_lsn 的串行推进。
             // 已删的旧 Arc（并发删除）告警跳过，不写入孤儿。
@@ -1003,9 +1130,23 @@ pub(crate) async fn apply_collection_wal_record(
             }
         }
         CollectionWalRecord::UpsertBatch { name, dim, items } => {
+            // 本批是否携带稀疏数据决定「create 记录缺失」时新建集合的模式：
+            // 带稀疏必须建 bm25，否则隐式建 none 后写入会误判为腐坏记录。
+            // EN: Whether this batch carries sparse data decides the mode when the
+            // create record is missing: sparse data must build bm25, otherwise an
+            // implicit none collection would misclassify the write as corruption.
+            let sparse_hint = items
+                .iter()
+                .any(|it| it.sparse.is_some())
+                .then_some(SparseMode::Bm25);
             let (col, _) = manager
-                .get_or_create_flagged(&name, Some(dim))
-                .map_err(std::io::Error::other)?;
+                .get_or_create_for_collection_upsert(&name, Some(dim), sparse_hint)
+                .map_err(|e| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!("collections WAL upsert cannot resolve collection '{name}': {e}"),
+                    )
+                })?;
             if col.dims != dim {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
@@ -1051,6 +1192,58 @@ pub(crate) async fn apply_collection_wal_record(
                 }
                 stats.upsert_rows += items.len() - skipped;
             }
+            // 稀疏侧写：covered 与 uncovered 两分支都应用。快照只持久化 live
+            // postings；整文档替换语义让「按 LSN 顺序重放」与标量/向量路径的
+            // 最终态一致（后续 covered delete 会再移除）。集合模式已由上面的
+            // 解析入口严格保证（none 却带稀疏的既有集合会被 InvalidData 拒绝，
+            // create 缺失时则按 sparse_hint 新建 bm25），这里不再重复校验。
+            // EN: Apply sparse side writes in both branches. The snapshot persists
+            // live postings only; whole-document replacement keeps LSN-ordered
+            // replay consistent with the scalar/vector final state (later covered
+            // deletes remove again). The collection mode is already guaranteed
+            // strictly by the resolution entry above (an existing none collection
+            // with sparse data is rejected as InvalidData, and a missing create is
+            // rebuilt as bm25 from the sparse hint), so no duplicate check here.
+            if items.iter().any(|it| it.sparse.is_some()) {
+                // 不变量在正常路径由解析入口保证；这里仍以 InvalidData 报错而
+                // 非 panic——冷启动面对磁盘上的 WAL，可诊断的启动错误远优于
+                // 进程崩溃（与 Delete 分支同口径）。
+                // EN: The resolution entry guarantees this invariant on normal
+                // paths; report InvalidData instead of panicking here — during
+                // cold start the process faces an on-disk WAL, and a diagnosable
+                // startup error beats a crash (same policy as the Delete branch).
+                let lock = col.sparse_index().ok_or_else(|| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!(
+                            "collections WAL upsert carries sparse data for collection \
+                             '{name}' with sparse={} — corrupt record",
+                            col.sparse_mode().as_str()
+                        ),
+                    )
+                })?;
+                let mut index = lock
+                    .write()
+                    .map_err(|e| std::io::Error::other(e.to_string()))?;
+                for it in &items {
+                    if let Some(terms) = it.sparse.as_ref() {
+                        index.upsert_doc(it.id, terms).map_err(|e| {
+                            std::io::Error::new(
+                                std::io::ErrorKind::InvalidData,
+                                format!(
+                                    "collections WAL sparse terms for id {} are invalid: {e}",
+                                    it.id
+                                ),
+                            )
+                        })?;
+                        stats.sparse_upserts += 1;
+                    }
+                }
+                // 死 posting 压缩只在写锁内做；阈值见内核模块。
+                // EN: Dead-posting compaction runs only under the write lock;
+                // the threshold lives in the kernel module.
+                index.compact_if_needed();
+            }
             let mut scalars = col
                 .scalars
                 .lock()
@@ -1085,6 +1278,35 @@ pub(crate) async fn apply_collection_wal_record(
                 );
                 return Ok(());
             };
+            // 稀疏移除先于标量墓碑（与写入侧固定顺序一致）；covered 与
+            // uncovered 都应用——快照墓碑只覆盖标量/向量，稀疏移除同样幂等。
+            // EN: Sparse removal precedes scalar tombstones (the fixed write-path
+            // order); apply it in both branches — snapshot tombstones only cover
+            // scalars/vectors, and sparse removal is idempotent.
+            if col.sparse_mode() == SparseMode::Bm25 {
+                // 不变量在正常路径恒成立；冷启动面对磁盘上的 WAL，可诊断的
+                // InvalidData 远优于 panic（与 upsert 分支同口径，OCR 9fda139）。
+                // EN: The invariant always holds on normal paths; during cold start
+                // the process faces an on-disk WAL, so a diagnosable InvalidData
+                // beats a panic (same policy as the upsert branch, OCR 9fda139).
+                let lock = col.sparse_index().ok_or_else(|| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!(
+                            "collections WAL delete for collection '{name}' with sparse=bm25 \
+                             but no sparse index — corrupt in-memory state"
+                        ),
+                    )
+                })?;
+                let mut index = lock
+                    .write()
+                    .map_err(|e| std::io::Error::other(e.to_string()))?;
+                for id in &ids {
+                    index.remove_doc(*id);
+                    stats.sparse_removals += 1;
+                }
+                index.compact_if_needed();
+            }
             {
                 let mut scalars = col
                     .scalars
@@ -1302,6 +1524,18 @@ pub async fn drain_pending_builder(index: &IndexBackend) {
     while index.pending_build_count().await > 0 && i < MAX {
         let _ = index.run_async_builder_once().await;
         i += 1;
+    }
+    // 关停/快照前 worker 已停止，低于累计阈值的尾批不会再有空闲 tick 兜底：
+    // 在这里显式做一次全层连通兜底，保证持久化的图是最终一致状态。
+    // EN: The worker is already stopped during shutdown/snapshot, so a tail
+    // batch below the accumulation threshold would never get an idle-tick
+    // sweep; run the all-layer backstop explicitly here so the persisted graph
+    // is the final consistent state.
+    if index.unswept_rows_since_connectivity_sweep() > 0 {
+        let added = index.ensure_connectivity().await;
+        if added > 0 {
+            tracing::debug!(added, "[connectivity-sweep-drain]");
+        }
     }
 }
 
@@ -1928,6 +2162,253 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// P1.7：f16 collection 图快照 —— 目标 manager 的默认后端是 flat（f32），
+    /// 恢复必须依据快照头的 dtype 建 typed hnsw 后端；若沿用隐式创建，f32
+    /// 索引会在 restore 时对 f16 图报 Mismatch 并回退全量重放（silent 退化）。
+    /// EN: P1.7 — an f16 collection graph snapshot: the target manager defaults to
+    /// the flat (f32) backend, so restore must create a typed hnsw backend from
+    /// the snapshot header's dtype. Implicit creation would make the f32 index
+    /// reject the f16 graph with Mismatch and silently fall back to full replay.
+    #[tokio::test]
+    async fn collections_graph_snapshot_restores_f16_dtype_not_default_backend() {
+        let dir = std::env::temp_dir().join(format!(
+            "houyi-colsnap-f16-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let snaps_dir = dir.join("snapshots");
+        std::fs::create_dir_all(&snaps_dir).unwrap();
+        let collections_wal_path = dir.join("collections.wal");
+
+        // 源：f16 hnsw collection，id 1/2 入图（checkpoint=2）。
+        // EN: Source: an f16 hnsw collection with ids 1/2 in the graph (checkpoint=2).
+        let src_manager = crate::collection::CollectionManager::new(4, "hnsw");
+        let src_col = src_manager
+            .get_or_create_typed_with_metric(
+                "docs",
+                4,
+                "hnsw",
+                Some(DistanceMetric::Cosine),
+                None,
+                Some(VectorDtype::F16),
+            )
+            .unwrap()
+            .0;
+        assert_eq!(src_col.vector_dtype(), VectorDtype::F16);
+        src_col
+            .backend
+            .insert_batch(vec![(1, vec4(1)), (2, vec4(2))])
+            .await
+            .unwrap();
+        for _ in 0..1000 {
+            if src_col.backend.run_async_builder_once().await.flushed == 0 {
+                break;
+            }
+        }
+        let payload = src_col.backend.encode_graph_snapshot().await.unwrap();
+        write_graph_snapshot_atomic(&snaps_dir.join("docs.graph_snapshot.bin"), 2, &payload)
+            .unwrap();
+
+        // 目标：默认后端是 flat；恢复必须把 docs 建成 f16 hnsw。
+        // EN: Target defaults to flat; restore must build docs as f16 hnsw.
+        let manager = crate::collection::CollectionManager::new(4, "flat");
+        let checkpoints = apply_collection_graph_snapshots_with_encryption(
+            &manager,
+            &collections_wal_path,
+            &GraphSnapshotMetrics::default(),
+            None,
+        )
+        .await
+        .expect("plaintext f16 snapshot restore");
+        assert_eq!(checkpoints.get("docs"), Some(&2));
+        {
+            let col = manager.get("docs").expect("restored from snapshot");
+            assert_eq!(col.vector_dtype(), VectorDtype::F16);
+            assert_eq!(col.index_type, "hnsw");
+            assert_eq!(
+                col.backend.indexed_count().await,
+                2,
+                "f16 graph restored without WAL replay"
+            );
+            let hits = col.backend.search(&vec4(2), 10, None).await;
+            assert!(hits.contains(&2), "restored f16 id searchable: {hits:?}");
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// P2：int8 collection 的图快照必须恢复成 int8 图后端——不得静默回退
+    /// 未量化（回退会让重启后的距离/内存语义与写入侧分叉）。
+    /// EN: P2 — an int8 collection's graph snapshot must restore as an int8 graph
+    /// backend; silently falling back to unquantized would diverge distance and
+    /// memory semantics from the writer.
+    #[tokio::test]
+    async fn collections_graph_snapshot_restores_int8_quantization_not_unquantized() {
+        let dir = std::env::temp_dir().join(format!(
+            "houyi-colsnap-int8-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let snaps_dir = dir.join("snapshots");
+        std::fs::create_dir_all(&snaps_dir).unwrap();
+        let collections_wal_path = dir.join("collections.wal");
+
+        // 源：余弦 int8 + f16 主表的 hnsw collection，id 1/2 入图（checkpoint=2）。
+        // EN: Source: cosine int8 graph over an f16 main store, ids 1/2 in the
+        // graph (checkpoint=2).
+        let src_manager = crate::collection::CollectionManager::new(4, "hnsw");
+        let src_col = src_manager
+            .get_or_create_typed_with_metric_and_quantization(
+                "docs",
+                4,
+                "hnsw",
+                Some(DistanceMetric::Cosine),
+                None,
+                Some(VectorDtype::F16),
+                Some(Quantization::Int8),
+                None,
+            )
+            .unwrap()
+            .0;
+        assert_eq!(src_col.quantization(), Quantization::Int8);
+        src_col
+            .backend
+            .insert_batch(vec![(1, vec4(1)), (2, vec4(2))])
+            .await
+            .unwrap();
+        for _ in 0..1000 {
+            if src_col.backend.run_async_builder_once().await.flushed == 0 {
+                break;
+            }
+        }
+        let payload = src_col.backend.encode_graph_snapshot().await.unwrap();
+        write_graph_snapshot_atomic(&snaps_dir.join("docs.graph_snapshot.bin"), 2, &payload)
+            .unwrap();
+
+        // 目标：默认后端是 flat；恢复必须把 docs 建成 int8 + f16 hnsw。
+        // EN: Target defaults to flat; restore must build docs as int8 + f16 hnsw.
+        let manager = crate::collection::CollectionManager::new(4, "flat");
+        let checkpoints = apply_collection_graph_snapshots_with_encryption(
+            &manager,
+            &collections_wal_path,
+            &GraphSnapshotMetrics::default(),
+            None,
+        )
+        .await
+        .expect("plaintext int8 snapshot restore");
+        assert_eq!(checkpoints.get("docs"), Some(&2));
+        let col = manager.get("docs").expect("restored from snapshot");
+        assert_eq!(col.quantization(), Quantization::Int8);
+        assert_eq!(col.vector_dtype(), VectorDtype::F16);
+        assert_eq!(col.index_type, "hnsw");
+        match &col.backend {
+            IndexBackend::Hnsw(idx) => {
+                assert_eq!(idx.vector_quantization(), Quantization::Int8);
+                assert_eq!(idx.vector_dtype(), VectorDtype::F16);
+            }
+            _ => panic!("restored backend must be hnsw"),
+        }
+        assert_eq!(
+            col.backend.indexed_count().await,
+            2,
+            "int8 graph restored without WAL replay"
+        );
+        let hits = col.backend.search(&vec4(2), 10, None).await;
+        assert!(hits.contains(&2), "restored int8 id searchable: {hits:?}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// P3：rabitq collection 的 v4 图快照必须经头部 peek 恢复成 rabitq 图后端，
+    /// 不得静默回退未量化（回退会让重启后的距离语义与写入侧分叉）。
+    /// EN: P3 — a rabitq collection's v4 graph snapshot must be peeked and
+    /// restored as a rabitq graph backend; silently falling back to unquantized
+    /// would diverge distance semantics from the writer.
+    #[tokio::test]
+    async fn collections_graph_snapshot_restores_rabitq_quantization_not_unquantized() {
+        let dir = std::env::temp_dir().join(format!(
+            "houyi-colsnap-rabitq-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let snaps_dir = dir.join("snapshots");
+        std::fs::create_dir_all(&snaps_dir).unwrap();
+        let collections_wal_path = dir.join("collections.wal");
+
+        // 源：余弦 rabitq 图 + f32 主表的 hnsw collection，id 1/2 入图。
+        // EN: Source: cosine rabitq graph over an f32 main store, ids 1/2 in
+        // the graph.
+        let src_manager = crate::collection::CollectionManager::new(4, "hnsw");
+        let src_col = src_manager
+            .get_or_create_typed_with_metric_and_quantization(
+                "docs",
+                4,
+                "hnsw",
+                Some(DistanceMetric::Cosine),
+                None,
+                Some(VectorDtype::F32),
+                Some(Quantization::RaBitQ),
+                None,
+            )
+            .unwrap()
+            .0;
+        assert_eq!(src_col.quantization(), Quantization::RaBitQ);
+        src_col
+            .backend
+            .insert_batch(vec![(1, vec4(1)), (2, vec4(2))])
+            .await
+            .unwrap();
+        for _ in 0..1000 {
+            if src_col.backend.run_async_builder_once().await.flushed == 0 {
+                break;
+            }
+        }
+        let payload = src_col.backend.encode_graph_snapshot().await.unwrap();
+        write_graph_snapshot_atomic(&snaps_dir.join("docs.graph_snapshot.bin"), 2, &payload)
+            .unwrap();
+
+        // 目标：默认后端是 flat；恢复必须把 docs 建成 rabitq hnsw。
+        // EN: Target defaults to flat; restore must build docs as rabitq hnsw.
+        let manager = crate::collection::CollectionManager::new(4, "flat");
+        let checkpoints = apply_collection_graph_snapshots_with_encryption(
+            &manager,
+            &collections_wal_path,
+            &GraphSnapshotMetrics::default(),
+            None,
+        )
+        .await
+        .expect("plaintext rabitq snapshot restore");
+        assert_eq!(checkpoints.get("docs"), Some(&2));
+        let col = manager.get("docs").expect("restored from snapshot");
+        assert_eq!(col.quantization(), Quantization::RaBitQ);
+        assert_eq!(col.vector_dtype(), VectorDtype::F32);
+        assert_eq!(col.index_type, "hnsw");
+        match &col.backend {
+            IndexBackend::Hnsw(idx) => {
+                assert_eq!(idx.vector_quantization(), Quantization::RaBitQ);
+            }
+            _ => panic!("restored backend must be hnsw"),
+        }
+        assert_eq!(
+            col.backend.indexed_count().await,
+            2,
+            "rabitq graph restored without WAL replay"
+        );
+        let hits = col.backend.search(&vec4(2), 10, None).await;
+        assert!(hits.contains(&2), "restored rabitq id searchable: {hits:?}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// 覆盖的 delete（LSN ≤ checkpoint）：墓碑已在快照内，跳过后端 delete，
     /// 但标量墓碑仍重建。
     /// EN: A covered delete skips the backend delete (the snapshot already
@@ -2230,8 +2711,11 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// 非 HNSW 后端：主索引与 collection 均安全跳过（无文件、无计数）。
-    /// EN: Non-HNSW backends are skipped cleanly — no files, no counters.
+    /// 非 HNSW 主索引：legacy 图快照安全跳过（无 legacy 文件）；clustered
+    /// collection 自 P5 快照压缩起由 collection manifest 承载。
+    /// EN: A non-HNSW main index skips the legacy graph snapshot cleanly (no
+    /// legacy file); clustered collections are carried by the collection
+    /// manifest since P5 snapshot compaction.
     #[tokio::test]
     async fn graph_snapshot_writer_skips_non_hnsw_backends() {
         let dir = unique_snap_dir("non-hnsw");
@@ -2245,8 +2729,11 @@ mod tests {
 
         let index = IndexBackend::new_flat(4);
         index.insert_batch(vec![(1, vec4(1))]).await.unwrap();
-        // clustered 不在 P5.0.2 压缩范围：manifest 不写，legacy 图快照也无。
-        // EN: clustered is outside P5.0.2 compaction: no manifest, no legacy graph.
+        // legacy 图快照只服务主索引（HNSW）；P5 快照压缩已覆盖 clustered
+        // collection，故此时只写 collection manifest。
+        // EN: the legacy graph snapshot only serves the main HNSW index; P5
+        // compaction now covers clustered collections, so only the collection
+        // manifest is written.
         let manager = crate::collection::CollectionManager::new(4, "clustered");
         let col = manager.get_or_create("docs", Some(4)).unwrap();
         col.backend.insert_batch(vec![(1, vec4(1))]).await.unwrap();
@@ -2272,12 +2759,16 @@ mod tests {
             metrics
                 .writes_total
                 .load(std::sync::atomic::Ordering::Relaxed),
-            0
+            1,
+            "only the collection snapshot is written"
         );
         assert!(graph_snapshot_path_for_wal(&wal_path).metadata().is_err());
         let snap_dir = collection_snapshots_dir(&collections_wal_path);
         assert!(!snap_dir.join("docs.graph_snapshot.bin").exists());
-        assert!(!snap_dir.join("collections.manifest").exists());
+        assert!(
+            snap_dir.join("collections.manifest").exists(),
+            "clustered collections now commit the collection manifest"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -2468,8 +2959,9 @@ mod tests {
     // EN: collections WAL replay.
 
     use houyi_persistence::collection_wal::{
-        encode_collection_create, encode_collection_delete, encode_collection_upsert_batch,
-        CollectionWalItem,
+        encode_collection_create, encode_collection_create_with_options, encode_collection_delete,
+        encode_collection_upsert_batch, CollectionCreateOptions, CollectionWalItem,
+        CollectionWalRecord,
     };
     use houyi_persistence::{FileWal, Wal};
 
@@ -2484,6 +2976,7 @@ mod tests {
             values,
             label: label.map(str::to_string),
             payload: payload.and_then(|v| v.as_object().cloned()),
+            sparse: None,
         }
     }
 
@@ -2551,6 +3044,465 @@ mod tests {
         );
         assert_eq!(matched, vec![1]);
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// P2：collections WAL 的 create 记录携带 quantization——重放必须建成 int8
+    /// 图后端；旧记录（无该字段）仍按未量化创建（解码兼容性由 persistence 单测
+    /// 覆盖）。
+    /// EN: P2 — a collections-WAL create record carries quantization; replay must
+    /// build the int8 graph backend, while legacy records (field absent) still
+    /// build unquantized (decode-level back-compat is covered by persistence
+    /// unit tests).
+    #[tokio::test]
+    async fn collections_wal_replay_builds_int8_backend_from_create_record() {
+        let path = unique_wal_path("collections-int8");
+        let _ = std::fs::remove_file(&path);
+        {
+            let (mut wal, _) = FileWal::open(&path).unwrap();
+            let options = CollectionCreateOptions {
+                metric: Some("cosine".to_string()),
+                hnsw_m: Some(16),
+                hnsw_ef_construction: Some(100),
+                hnsw_ef_search: Some(50),
+                vector_dtype: Some("f16".to_string()),
+                quantization: Some("int8".to_string()),
+                sparse: None,
+            };
+            wal.append(encode_collection_create_with_options("docs", 4, "hnsw", &options).unwrap());
+            let items = vec![wal_item(1, vec![1.0, 0.0, 0.0, 0.0], None, None)];
+            wal.append(encode_collection_upsert_batch("docs", 4, &items).unwrap());
+        }
+        let (_wal, entries) = FileWal::open(&path).unwrap();
+        let manager = crate::collection::CollectionManager::new(4, "flat");
+        let stats = replay_collections_wal_into_manager(&entries, &manager, &HashMap::new())
+            .await
+            .unwrap();
+        assert_eq!(stats.creates, 1);
+        let col = manager.get("docs").expect("collection replayed");
+        assert_eq!(col.index_type, "hnsw");
+        assert_eq!(col.quantization(), Quantization::Int8);
+        assert_eq!(col.vector_dtype(), VectorDtype::F16);
+        match &col.backend {
+            IndexBackend::Hnsw(idx) => {
+                assert_eq!(idx.vector_quantization(), Quantization::Int8);
+            }
+            _ => panic!("replay must build the hnsw backend"),
+        }
+        let hits = col.backend.search(&[1.0, 0.0, 0.0, 0.0], 4, None).await;
+        assert!(hits.contains(&1), "replayed int8 id searchable: {hits:?}");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// P3：collections WAL 的 create 记录携带 `rabitq`——重放必须建成 rabitq
+    /// 图后端；旧二进制遇此记录解码侧已 fail-fast（见 persistence 单测）。
+    /// EN: P3 — a collections-WAL create record carrying `rabitq`; replay must
+    /// build the rabitq graph backend (older binaries already fail fast at
+    /// decode time, see the persistence unit tests).
+    #[tokio::test]
+    async fn collections_wal_replay_builds_rabitq_backend_from_create_record() {
+        let path = unique_wal_path("collections-rabitq");
+        let _ = std::fs::remove_file(&path);
+        {
+            let (mut wal, _) = FileWal::open(&path).unwrap();
+            let options = CollectionCreateOptions {
+                metric: Some("l2".to_string()),
+                hnsw_m: Some(16),
+                hnsw_ef_construction: Some(100),
+                hnsw_ef_search: Some(50),
+                vector_dtype: Some("f32".to_string()),
+                quantization: Some("rabitq".to_string()),
+                sparse: None,
+            };
+            wal.append(encode_collection_create_with_options("docs", 4, "hnsw", &options).unwrap());
+            let items = vec![wal_item(1, vec![1.0, 0.0, 0.0, 0.0], None, None)];
+            wal.append(encode_collection_upsert_batch("docs", 4, &items).unwrap());
+        }
+        let (_wal, entries) = FileWal::open(&path).unwrap();
+        let manager = crate::collection::CollectionManager::new(4, "flat");
+        let stats = replay_collections_wal_into_manager(&entries, &manager, &HashMap::new())
+            .await
+            .unwrap();
+        assert_eq!(stats.creates, 1);
+        let col = manager.get("docs").expect("collection replayed");
+        assert_eq!(col.index_type, "hnsw");
+        assert_eq!(col.quantization(), Quantization::RaBitQ);
+        match &col.backend {
+            IndexBackend::Hnsw(idx) => {
+                assert_eq!(idx.vector_quantization(), Quantization::RaBitQ);
+            }
+            _ => panic!("replay must build the hnsw backend"),
+        }
+        let hits = col.backend.search(&[1.0, 0.0, 0.0, 0.0], 4, None).await;
+        assert!(hits.contains(&1), "replayed rabitq id searchable: {hits:?}");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// P4：collections WAL 重放稀疏——create(bm25)、upsert（整文档替换）、
+    /// delete 全部按 LSN 顺序应用，反向索引最终态与写入语义一致。
+    /// EN: P4 — collections WAL replays sparse: create (bm25), upsert (whole-
+    /// document replacement), and delete apply in LSN order; the inverted index
+    /// ends in the same state the write path would produce.
+    #[tokio::test]
+    async fn collections_wal_replay_applies_sparse_create_upsert_delete() {
+        let path = unique_wal_path("collections-sparse");
+        let _ = std::fs::remove_file(&path);
+        {
+            let (mut wal, _) = FileWal::open(&path).unwrap();
+            // flat 后端不接受 HNSW 参数与 dtype 字段（编码侧 fail-fast）。
+            // EN: flat rejects HNSW parameters and dtype fields at encode time.
+            let options = CollectionCreateOptions {
+                metric: Some("cosine".to_string()),
+                sparse: Some("bm25".to_string()),
+                ..Default::default()
+            };
+            wal.append(encode_collection_create_with_options("docs", 4, "flat", &options).unwrap());
+            let items = vec![
+                CollectionWalItem {
+                    id: 1,
+                    values: vec![1.0, 0.0, 0.0, 0.0],
+                    label: None,
+                    payload: None,
+                    sparse: Some(vec![(10, 2.0), (20, 1.0)]),
+                },
+                CollectionWalItem {
+                    id: 2,
+                    values: vec![0.0, 1.0, 0.0, 0.0],
+                    label: None,
+                    payload: None,
+                    sparse: Some(vec![(10, 1.0)]),
+                },
+            ];
+            wal.append(encode_collection_upsert_batch("docs", 4, &items).unwrap());
+            // 整文档替换：id 2 重写为只含 term 20（term 10 的旧 posting 必须失效）。
+            // EN: Whole-document replacement: id 2 is rewritten with only term 20
+            // (its old term-10 posting must stop being live).
+            let rewrite = vec![CollectionWalItem {
+                id: 2,
+                values: vec![0.0, 1.0, 0.0, 0.0],
+                label: None,
+                payload: None,
+                sparse: Some(vec![(20, 0.5)]),
+            }];
+            wal.append(encode_collection_upsert_batch("docs", 4, &rewrite).unwrap());
+            wal.append(encode_collection_delete("docs", &[2]).unwrap());
+        }
+        let (_wal, entries) = FileWal::open(&path).unwrap();
+        let manager = crate::collection::CollectionManager::new(4, "flat");
+        let stats = replay_collections_wal_into_manager(&entries, &manager, &HashMap::new())
+            .await
+            .unwrap();
+        assert_eq!(stats.creates, 1);
+        assert_eq!(stats.sparse_upserts, 3);
+        assert_eq!(stats.sparse_removals, 1);
+
+        let col = manager.get("docs").expect("collection replayed");
+        assert_eq!(col.sparse_mode(), SparseMode::Bm25);
+        let index = col
+            .sparse_index()
+            .expect("bm25 collection owns an index")
+            .read()
+            .unwrap();
+        assert_eq!(index.doc_count(), 1);
+        let hits = index.search(&[(10, 1.0)], 4);
+        assert_eq!(
+            hits.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+            vec![1],
+            "deleted id 2 must not surface: {hits:?}"
+        );
+        let hits = index.search(&[(20, 1.0)], 4);
+        assert_eq!(
+            hits.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+            vec![1],
+            "id 2 was deleted after its rewrite: {hits:?}"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// P4：covered 重放（快照已含该批）仍重复应用稀疏——整文档替换让同批
+    /// 重复 apply 幂等，live 文档数与检索结果不变。
+    /// EN: P4 — covered replay (the snapshot already holds the batch) still
+    /// applies sparse; whole-document replacement makes repeated applies of the
+    /// same batch idempotent (live doc count and hits stay stable).
+    #[tokio::test]
+    async fn covered_sparse_replay_is_idempotent() {
+        let manager = crate::collection::CollectionManager::new(4, "flat");
+        let mut stats = CollectionsReplayStats::default();
+        let mut skipped_non_finite = 0usize;
+        let mut poison = crate::recovery::PoisonedRowLog::new();
+        let create = CollectionWalRecord::Create {
+            name: "docs".to_string(),
+            dims: 4,
+            index_type: "flat".to_string(),
+            options: CollectionCreateOptions {
+                metric: Some("cosine".to_string()),
+                sparse: Some("bm25".to_string()),
+                ..Default::default()
+            },
+        };
+        apply_collection_wal_record(
+            &manager,
+            1,
+            create,
+            |_| Some(1),
+            &mut stats,
+            &mut skipped_non_finite,
+            &mut poison,
+        )
+        .await
+        .unwrap();
+        let upsert = CollectionWalRecord::UpsertBatch {
+            name: "docs".to_string(),
+            dim: 4,
+            items: vec![CollectionWalItem {
+                id: 1,
+                values: vec![1.0, 0.0, 0.0, 0.0],
+                label: None,
+                payload: None,
+                sparse: Some(vec![(5, 1.5)]),
+            }],
+        };
+        for _ in 0..2 {
+            apply_collection_wal_record(
+                &manager,
+                2,
+                upsert.clone(),
+                |_| Some(2),
+                &mut stats,
+                &mut skipped_non_finite,
+                &mut poison,
+            )
+            .await
+            .unwrap();
+        }
+        assert_eq!(stats.upsert_batches_skipped_snapshot, 2);
+        let col = manager.get("docs").expect("collection exists");
+        let index = col
+            .sparse_index()
+            .expect("bm25 collection owns an index")
+            .read()
+            .unwrap();
+        assert_eq!(index.doc_count(), 1);
+        assert_eq!(index.live_postings(), 1);
+        assert_eq!(index.search(&[(5, 1.0)], 4).len(), 1);
+    }
+
+    /// P4：legacy 图快照恢复先建集合（快照头不含稀疏模式），重放的 create
+    /// 记录才是事实：none → bm25 一次性对账升级。
+    /// EN: P4 — a legacy graph-snapshot restore creates the collection first
+    /// (the header carries no sparse mode); the replayed create record is the
+    /// fact, so replay reconciles none -> bm25 exactly once.
+    #[tokio::test]
+    async fn legacy_restored_collection_reconciles_sparse_from_create_record() {
+        let manager = crate::collection::CollectionManager::new(4, "flat");
+        let (col, _) = manager
+            .get_or_create_typed_with_metric_and_quantization(
+                "docs",
+                4,
+                "flat",
+                Some(houyi_vector::DistanceMetric::Cosine),
+                None,
+                None,
+                None,
+                Some(SparseMode::None),
+            )
+            .unwrap();
+        let mut stats = CollectionsReplayStats::default();
+        let mut skipped_non_finite = 0usize;
+        let mut poison = crate::recovery::PoisonedRowLog::new();
+        let create = CollectionWalRecord::Create {
+            name: "docs".to_string(),
+            dims: 4,
+            index_type: "flat".to_string(),
+            options: CollectionCreateOptions {
+                metric: Some("cosine".to_string()),
+                sparse: Some("bm25".to_string()),
+                ..Default::default()
+            },
+        };
+        apply_collection_wal_record(
+            &manager,
+            5,
+            create,
+            |_| Some(5),
+            &mut stats,
+            &mut skipped_non_finite,
+            &mut poison,
+        )
+        .await
+        .unwrap();
+        assert_eq!(stats.creates, 0, "existing collection must be reconciled");
+        assert_eq!(col.sparse_mode(), SparseMode::Bm25);
+        assert!(col.sparse_index().is_some());
+    }
+
+    /// P4：none 集合携带稀疏数据是写入侧不可能产生的腐坏记录，重放 fail-fast。
+    /// EN: P4 — sparse data on a none-mode collection cannot be produced by the
+    /// write path; replay treats it as corruption and fails fast.
+    #[tokio::test]
+    async fn sparse_upsert_on_none_collection_is_corruption() {
+        let manager = crate::collection::CollectionManager::new(4, "flat");
+        let mut stats = CollectionsReplayStats::default();
+        let mut skipped_non_finite = 0usize;
+        let mut poison = crate::recovery::PoisonedRowLog::new();
+        apply_collection_wal_record(
+            &manager,
+            1,
+            CollectionWalRecord::Create {
+                name: "docs".to_string(),
+                dims: 4,
+                index_type: "flat".to_string(),
+                options: CollectionCreateOptions::default(),
+            },
+            |_| None,
+            &mut stats,
+            &mut skipped_non_finite,
+            &mut poison,
+        )
+        .await
+        .unwrap();
+        let err = apply_collection_wal_record(
+            &manager,
+            2,
+            CollectionWalRecord::UpsertBatch {
+                name: "docs".to_string(),
+                dim: 4,
+                items: vec![CollectionWalItem {
+                    id: 1,
+                    values: vec![1.0, 0.0, 0.0, 0.0],
+                    label: None,
+                    payload: None,
+                    sparse: Some(vec![(2, 1.0)]),
+                }],
+            },
+            |_| None,
+            &mut stats,
+            &mut skipped_non_finite,
+            &mut poison,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("sparse=none"), "got: {err}");
+    }
+
+    /// P4：create 记录缺失但 upsert 携带稀疏时，自动补建必须按 sparse_hint
+    /// 建 bm25 并应用词项（此前隐式建 none 会把合法历史误判为腐坏）。
+    /// EN: P4 — when the create record is missing but the upsert carries sparse
+    /// data, auto-creation must honor the sparse hint (bm25) and apply the terms;
+    /// previously the implicit none collection misclassified valid history as
+    /// corruption.
+    #[tokio::test]
+    async fn sparse_upsert_without_create_auto_builds_bm25() {
+        let manager = crate::collection::CollectionManager::new(4, "flat");
+        let mut stats = CollectionsReplayStats::default();
+        let mut skipped_non_finite = 0usize;
+        let mut poison = crate::recovery::PoisonedRowLog::new();
+        apply_collection_wal_record(
+            &manager,
+            1,
+            CollectionWalRecord::UpsertBatch {
+                name: "orphan".to_string(),
+                dim: 4,
+                items: vec![CollectionWalItem {
+                    id: 7,
+                    values: vec![1.0, 0.0, 0.0, 0.0],
+                    label: None,
+                    payload: None,
+                    sparse: Some(vec![(2, 1.5), (9, 0.5)]),
+                }],
+            },
+            |_| None,
+            &mut stats,
+            &mut skipped_non_finite,
+            &mut poison,
+        )
+        .await
+        .unwrap();
+        let col = manager.get("orphan").expect("upsert auto-created");
+        assert_eq!(col.sparse_mode(), SparseMode::Bm25);
+        let index = col.sparse_index().expect("bm25 index exists");
+        let index = index.read().unwrap();
+        assert_eq!(index.doc_terms(7), Some(vec![(2, 1.5), (9, 0.5)]));
+        assert_eq!(stats.upsert_batches, 1);
+        assert_eq!(stats.sparse_upserts, 1);
+    }
+
+    /// P4 OCR：create 记录缺失时，先 dense-only 批隐式建出 none、后稀疏批
+    /// 必须仍能对账为 bm25——对账依据是「集合自己没有 create 记录」，而不是
+    /// 「本批是否带稀疏」，否则合法历史会晚一条记录才被判腐坏。
+    /// EN: P4 OCR — with the create record missing, a dense-only batch first
+    /// builds none implicitly and a later sparse batch must still reconcile to
+    /// bm25: reconciliation keys off "the collection has no create record",
+    /// not "this batch carries sparse data"; otherwise legitimate history is
+    /// misclassified as corruption one record later.
+    #[tokio::test]
+    async fn sparse_upsert_upgrades_implicit_none_collection_when_create_missing() {
+        let manager = crate::collection::CollectionManager::new(4, "flat");
+        let mut stats = CollectionsReplayStats::default();
+        let mut skipped_non_finite = 0usize;
+        let mut poison = crate::recovery::PoisonedRowLog::new();
+        // 首条记录即 dense-only upsert：create 记录已丢失。
+        // EN: The first record is a dense-only upsert: the create record was lost.
+        apply_collection_wal_record(
+            &manager,
+            1,
+            CollectionWalRecord::UpsertBatch {
+                name: "docs".to_string(),
+                dim: 4,
+                items: vec![CollectionWalItem {
+                    id: 3,
+                    values: vec![0.0, 1.0, 0.0, 0.0],
+                    label: None,
+                    payload: None,
+                    sparse: None,
+                }],
+            },
+            |_| None,
+            &mut stats,
+            &mut skipped_non_finite,
+            &mut poison,
+        )
+        .await
+        .unwrap();
+        let col = manager.get("docs").expect("implicit collection");
+        assert_eq!(col.sparse_mode(), SparseMode::None);
+        assert!(
+            !col.create_logged(),
+            "implicit creation logs no create record"
+        );
+
+        // 后续稀疏批：create 仍缺失 → 对账 none → bm25 并应用词项。
+        // EN: Later sparse batch: the create record is still missing -> reconcile
+        // none -> bm25 and apply the terms.
+        apply_collection_wal_record(
+            &manager,
+            2,
+            CollectionWalRecord::UpsertBatch {
+                name: "docs".to_string(),
+                dim: 4,
+                items: vec![CollectionWalItem {
+                    id: 4,
+                    values: vec![1.0, 0.0, 0.0, 0.0],
+                    label: None,
+                    payload: None,
+                    sparse: Some(vec![(7, 2.0)]),
+                }],
+            },
+            |_| None,
+            &mut stats,
+            &mut skipped_non_finite,
+            &mut poison,
+        )
+        .await
+        .unwrap();
+        assert_eq!(col.sparse_mode(), SparseMode::Bm25);
+        let index = col.sparse_index().expect("bm25 index after reconcile");
+        let index = index.read().unwrap();
+        assert_eq!(index.doc_terms(4), Some(vec![(7, 2.0)]));
+        let hits = index.search(&[(7, 1.0)], 10);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].0, 4);
+        assert_eq!(stats.sparse_upserts, 1);
     }
 
     /// 韧性：缺 create 记录的 upsert 自动补建 collection；指向未知 collection 的
@@ -2863,5 +3815,51 @@ mod tests {
         assert_eq!(blue, vec![1], "latest payload must match after replay");
         drop(scalars);
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// 关停/快照路径的连通兜底回归：低于累计阈值的尾批在 `drain_pending_builder`
+    /// 之后必须被扫过（计数器归零），不能等已停止的 worker 空闲 tick。
+    /// EN: Shutdown/snapshot backstop regression: a sub-threshold tail must be
+    /// swept (counter cleared) by `drain_pending_builder`; the stopped worker's
+    /// idle tick can no longer do it.
+    #[tokio::test]
+    async fn drain_pending_builder_sweeps_sub_threshold_tail() {
+        let index = IndexBackend::new_hnsw(4);
+        let rows: Vec<(u64, Vec<f32>)> = (0..10u64)
+            .map(|id| (id, vec![id as f32, 1.0, 0.0, 0.0]))
+            .collect();
+        index.insert_batch(rows).await.unwrap();
+        // 以队列长度（而非 flushed）为有界循环条件：批次可能被墓碑全部
+        // 过滤而 flushed==0，但队列仍有行；队列空才是排空完成的信号，
+        // 达到上限则断言失败而不是悬挂测试二进制。
+        // EN: Bound the loop by queue length (not flushed): a batch can be
+        // entirely tombstone-filtered and report flushed==0 while rows remain;
+        // an empty queue is the real completion signal, and hitting the cap
+        // fails the assertion instead of hanging the test binary.
+        let mut pending = index.pending_build_count().await;
+        for _ in 0..1_000 {
+            if pending == 0 {
+                break;
+            }
+            let report = index.run_async_builder_once().await;
+            let next = index.pending_build_count().await;
+            assert!(
+                next < pending || report.flushed > 0,
+                "drain made no progress: pending={pending}, flushed={}",
+                report.flushed
+            );
+            pending = next;
+        }
+        assert_eq!(pending, 0, "drain must finish");
+        assert!(
+            index.unswept_rows_since_connectivity_sweep() > 0,
+            "10-row drain is below the accumulation threshold and must stay unswept"
+        );
+        drain_pending_builder(&index).await;
+        assert_eq!(
+            index.unswept_rows_since_connectivity_sweep(),
+            0,
+            "drain_pending_builder must clear the tail"
+        );
     }
 }

@@ -71,10 +71,18 @@ test = false
 doc = false
 bench = false
 
-# 5) collections 快照 payload / manifest 解码（P5.0.5）
+# 5) collections 快照 payload / manifest 解码（P5.0.5；P4 起含 v3/bit3 稀疏段）
 [[bin]]
 name = "collection_snapshot_decode"
 path = "fuzz_targets/collection_snapshot_decode.rs"
+test = false
+doc = false
+bench = false
+
+# 6) collections WAL payload 解码（P4；含 bm25 create 与稀疏 upsert）
+[[bin]]
+name = "collection_wal_decode"
+path = "fuzz_targets/collection_wal_decode.rs"
 test = false
 doc = false
 bench = false

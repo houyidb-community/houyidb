@@ -119,10 +119,12 @@ fn pgwire_result_columns_for_sql_with_params(
         }]);
     }
     match parse_houyi_pgwire_sql(sql) {
-        Ok(HouyiPgWireSql::VectorSearch { .. }) => Ok(vec![PgWireColumnMeta {
-            name: "id".to_string(),
-            type_oid: 20,
-        }]),
+        Ok(HouyiPgWireSql::VectorSearch { .. } | HouyiPgWireSql::FusionSearch { .. }) => {
+            Ok(vec![PgWireColumnMeta {
+                name: "id".to_string(),
+                type_oid: 20,
+            }])
+        }
         Ok(HouyiPgWireSql::Plain(s)) => {
             let exprs = pgwire_split_plain_select_exprs(&s).ok_or_else(|| {
                 "only simple SELECT literal[, literal...] is supported".to_string()
@@ -906,6 +908,158 @@ async fn pgwire_collect_rows(
                     ids.into_iter().map(|id| vec![id.to_string()]).collect(),
                 ))
             }
+            Ok(HouyiPgWireSql::FusionSearch {
+                sql_for_planner,
+                query_vector,
+                query_sparse,
+                k,
+                ef_search_override,
+                fusion,
+                alpha,
+            }) => {
+                // k/ef 上界在任何副作用前拒绝（与 VectorSearch 同口径，22023）。
+                // EN: Enforce the k/ef cap before any side effect (same as
+                // VectorSearch; 22023).
+                if let Some(msg) =
+                    crate::http_handler::search_limit_violation(k, ef_search_override)
+                {
+                    return Err(("22023".to_string(), msg));
+                }
+                // pgwire 融合只做查询，默认主索引没有稀疏侧：必须显式指名
+                // collection；缺指令 0A000（feature not supported）。
+                // EN: pgwire fusion is query-only and the default index has no
+                // sparse side, so an explicit collection directive is required;
+                // a missing directive is 0A000 (feature not supported).
+                let coll_name = houyi_query::extract_collection_directive(&sql_for_planner)
+                    .ok_or_else(|| {
+                        (
+                            "0A000".to_string(),
+                            "fusion search requires /* houyi:collection=<name> */".to_string(),
+                        )
+                    })?;
+                // leader 与 follower 一律不隐式建集合：缺名按 PostgreSQL 语义
+                // 回 42P01，绝不把本地幻影集合写进复制流之外的状态。
+                // EN: Neither leader nor follower implicitly creates: missing
+                // name returns 42P01 (undefined_table), never a local phantom
+                // collection outside the replication stream.
+                let col = state.collections.get(&coll_name).ok_or_else(|| {
+                    (
+                        "42P01".to_string(),
+                        format!("undefined collection \"{coll_name}\""),
+                    )
+                })?;
+                // 稀疏未启用的集合上融合检索无意义：显式 0A000 而非半路结果。
+                // EN: Fusion is meaningless on a sparse-disabled collection;
+                // refuse with 0A000 instead of a half-modal result.
+                if col.sparse_mode() != houyi_vector::sparse::SparseMode::Bm25 {
+                    return Err((
+                        "0A000".to_string(),
+                        format!(
+                            "fusion search requires a collection created with sparse=\"bm25\" \
+                             (collection \"{coll_name}\" has sparse=\"none\")"
+                        ),
+                    ));
+                }
+                if query_vector.len() != col.dims {
+                    return Err((
+                        "22000".to_string(),
+                        format!(
+                            "query vector dim {} != expected dim {}",
+                            query_vector.len(),
+                            col.dims
+                        ),
+                    ));
+                }
+                // 分量有限性复用 HTTP 边界校验；维度已在上方映射 22000，
+                // 此处只可能是 NaN/Infinity，统一 22023（区别于维度 22000）。
+                // EN: Component finiteness reuses the HTTP boundary validator;
+                // dim already mapped to 22000 above, so only NaN/Infinity can
+                // remain — mapped to 22023 (distinct from dim's 22000).
+                crate::http_handler::validate_query_vector(&query_vector, col.dims, "query")
+                    .map_err(|(_status, msg)| ("22023".to_string(), msg))?;
+                // 稀疏词项走内核规范化：范围/有限正权重/数量上限/重复求和与
+                // HTTP 完全同口径，越界映射 22023。
+                // EN: Sparse terms go through kernel normalization (range,
+                // finite positive weights, count cap, duplicate summing) —
+                // identical to HTTP; out-of-domain values map to 22023.
+                let sparse_query = houyi_vector::sparse::normalize_terms(
+                    &query_sparse,
+                    houyi_vector::sparse::MAX_SPARSE_QUERY_TERMS,
+                )
+                .map_err(|e| ("22023".to_string(), format!("invalid sparse query: {e}")))?;
+                let mode = match fusion.as_deref() {
+                    Some(value) => crate::types::FusionMode::parse_str(value).ok_or_else(|| {
+                        (
+                            "22023".to_string(),
+                            format!("invalid fusion {value:?} (expect rrf|weighted)"),
+                        )
+                    })?,
+                    None => crate::types::FusionMode::Rrf,
+                };
+                // 显式提供的 alpha 即使当前模式不参与计算也严格校验
+                // （与 HTTP 同契约：可预测的 22023 优于静默忽略）。
+                // EN: An explicit alpha is validated even when the active mode
+                // ignores it (same contract as HTTP: predictable 22023 over
+                // silent ignore).
+                let alpha = match alpha {
+                    Some(value) if !value.is_finite() || !(0.0..=1.0).contains(&value) => {
+                        return Err((
+                            "22023".to_string(),
+                            format!("alpha={value} out of range 0..=1 (must be finite)"),
+                        ));
+                    }
+                    Some(value) => value,
+                    None => crate::types::DEFAULT_FUSION_ALPHA,
+                };
+                // WHERE 中的 id 谓词与既有 pgwire 向量检索同口径：QueryPlanner
+                // 提取下推 bitset 后作为融合过滤；没有 id 谓词时为 None（其余
+                // WHERE 条件与向量路径一致地不下推）。pgwire 无 rrf_k 指令，
+                // 固定缺省 60。执行错误只可能是不变式违背（bm25 集合缺稀疏
+                // 索引/锁毒化），映射 XX000。
+                // EN: id predicates in WHERE follow the existing pgwire vector
+                // search contract: QueryPlanner extracts the pushed-down bitset
+                // and hands it to fusion filtering; None without id predicates
+                // (other WHERE conditions are not pushed down, same as the vector
+                // path). pgwire has no rrf_k directive (default 60). Execution
+                // errors can only be invariant violations (bm25 collection missing
+                // its sparse index / poisoned lock), mapped to XX000.
+                // sql_for_planner 在此处已是最后一次使用，按值移入规划器，
+                // 避免为一次纯读查询复制整条 SQL。
+                // EN: This is the last use of sql_for_planner; move it into the
+                // planner instead of copying the whole SQL for a read-only query.
+                let filter_ids = match QueryPlanner::plan(PgWireQuery {
+                    sql: sql_for_planner,
+                }) {
+                    ExecutionPlan::HybridSearch {
+                        pushed_down_bitset, ..
+                    } => pushed_down_bitset,
+                    ExecutionPlan::RawSql(_) => None,
+                };
+                let outcome = crate::http_handler::execute_fusion(
+                    &col,
+                    &query_vector,
+                    &sparse_query,
+                    k,
+                    ef_search_override,
+                    filter_ids.as_deref(),
+                    mode,
+                    crate::types::DEFAULT_RRF_K,
+                    alpha,
+                )
+                .await
+                .map_err(|(_status, msg)| ("XX000".to_string(), msg))?;
+                Ok((
+                    vec![PgWireColumnMeta {
+                        name: "id".to_string(),
+                        type_oid: 20,
+                    }],
+                    outcome
+                        .ids
+                        .into_iter()
+                        .map(|id| vec![id.to_string()])
+                        .collect(),
+                ))
+            }
             Ok(HouyiPgWireSql::Plain(s)) => {
                 if is_copy_sql(&s) {
                     Err(("0A000".to_string(), "COPY SQL is not supported".to_string()))
@@ -975,7 +1129,7 @@ async fn pgwire_collect_rows(
             }
             _ => Err((
                 "0A000".to_string(),
-                "vector search requires pg_wire shared state".to_string(),
+                "vector/fusion search requires pg_wire shared state".to_string(),
             )),
         },
     }
@@ -2186,6 +2340,10 @@ where
                                             values: values.clone(),
                                             label: None,
                                             payload: None,
+                                            // pgwire 本轮只读稀疏：二进制行不带稀疏字段。
+                                            // EN: pgwire is sparse read-only this round; the
+                                            // binary row carries no sparse field.
+                                            sparse: None,
                                         }
                                     })
                                     .collect();
@@ -2560,6 +2718,48 @@ where
     }
 }
 
+/// pgwire 测试共用的共享状态夹具（此前三个测试模块各存一份逐字节相同的副本，
+/// 新增字段要改三处；OCR f42415a）。`temp_prefix` 让各模块的临时集群目录分离。
+/// EN: Shared shared-state fixture for pgwire tests (three test modules used to
+/// keep byte-identical copies, forcing three edits per new field; OCR f42415a).
+/// `temp_prefix` keeps each module's temporary cluster directory distinct.
+#[cfg(test)]
+pub(crate) fn test_pg_state(temp_prefix: &str) -> Arc<PgWireSharedState> {
+    Arc::new(PgWireSharedState {
+        replication_metrics: crate::types::shared_replication_metrics(None),
+        index: IndexBackend::new_hnsw(4),
+        collections: Arc::new(crate::collection::CollectionManager::new(4, "hnsw")),
+        vector_dim: 4,
+        pgwire_hnsw_m: None,
+        pgwire_hnsw_ef_construction: None,
+        wal: None,
+        collections_wal: None,
+        role: crate::types::RoleState::default(),
+        cluster: std::sync::Arc::new(
+            crate::cluster::ClusterControl::open(
+                &std::env::temp_dir()
+                    .join(format!(
+                        "{temp_prefix}-{}-{}-{}",
+                        std::process::id(),
+                        std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap()
+                            .as_nanos(),
+                        {
+                            static SEQ: std::sync::atomic::AtomicU64 =
+                                std::sync::atomic::AtomicU64::new(0);
+                            SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                        }
+                    ))
+                    .join("test.wal"),
+                false,
+            )
+            .expect("cluster control"),
+        ),
+        query_log: None,
+    })
+}
+
 /// pgwire 边缘的检索放大面封边回归（OCR 复扫：HTTP 加上 k 上界后，pgwire 的
 /// `LIMIT n` / `/* houyi:ef_search=N */` 仍是裸 usize，可驱动同样的 16×ann_k
 /// 访问器预分配直至 alloc-abort）。
@@ -2569,43 +2769,10 @@ where
 #[cfg(test)]
 mod search_limit_edge_tests {
     use super::*;
-    use crate::collection::CollectionManager;
     use crate::http_handler::{MAX_SEARCH_EF, MAX_SEARCH_K};
 
     fn pg_state() -> Arc<PgWireSharedState> {
-        Arc::new(PgWireSharedState {
-            replication_metrics: crate::types::shared_replication_metrics(None),
-            index: IndexBackend::new_hnsw(4),
-            collections: Arc::new(CollectionManager::new(4, "hnsw")),
-            vector_dim: 4,
-            pgwire_hnsw_m: None,
-            pgwire_hnsw_ef_construction: None,
-            wal: None,
-            collections_wal: None,
-            role: crate::types::RoleState::default(),
-            cluster: std::sync::Arc::new(
-                crate::cluster::ClusterControl::open(
-                    &std::env::temp_dir()
-                        .join(format!(
-                            "houyi-pgwire-test-cluster-{}-{}-{}",
-                            std::process::id(),
-                            std::time::SystemTime::now()
-                                .duration_since(std::time::UNIX_EPOCH)
-                                .unwrap()
-                                .as_nanos(),
-                            {
-                                static SEQ: std::sync::atomic::AtomicU64 =
-                                    std::sync::atomic::AtomicU64::new(0);
-                                SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-                            }
-                        ))
-                        .join("test.wal"),
-                    false,
-                )
-                .expect("cluster control"),
-            ),
-            query_log: None,
-        })
+        super::test_pg_state("houyi-pgwire-test-cluster")
     }
 
     /// 超大 LIMIT 必须在进入检索链前以 22023（invalid_parameter_value）拒绝。
@@ -2667,48 +2834,298 @@ mod search_limit_edge_tests {
     }
 }
 
+/// P4 融合检索 pgwire 边缘：指令→执行→SQLSTATE 映射与「不隐式建集合」契约。
+/// EN: P4 fusion-search pgwire edge: directive → execution → SQLSTATE mapping
+/// and the "no implicit create" contract.
+#[cfg(test)]
+mod fusion_tests {
+    use super::*;
+    use crate::http_handler::MAX_SEARCH_K;
+    use crate::types::ReplicationRole;
+    use houyi_vector::sparse::{SparseMode, MAX_SPARSE_QUERY_TERMS, MAX_SPARSE_TERM_ID};
+
+    fn pg_state() -> Arc<PgWireSharedState> {
+        super::test_pg_state("houyi-pgwire-fusion-test-cluster")
+    }
+
+    /// 建 bm25 集合、写两条向量与稀疏词项（1 号文档两个词项，2 号一个）。
+    /// EN: Create a bm25 collection with two vectors and sparse terms (doc 1
+    /// carries two terms, doc 2 one).
+    async fn seeded_bm25_state() -> Arc<PgWireSharedState> {
+        let pg = pg_state();
+        let (col, _) = pg
+            .collections
+            .get_or_create_typed_with_metric_and_quantization(
+                "docs",
+                4,
+                "hnsw",
+                None,
+                None,
+                None,
+                None,
+                Some(SparseMode::Bm25),
+            )
+            .expect("create bm25 collection");
+        col.backend
+            .insert_batch(vec![
+                (1, vec![1.0, 0.0, 0.0, 0.0]),
+                (2, vec![0.0, 1.0, 0.0, 0.0]),
+            ])
+            .await
+            .expect("insert vectors");
+        {
+            let index = col.sparse_index().expect("bm25 index");
+            let mut guard = index.write().expect("sparse write lock");
+            guard.upsert_doc(1, &[(1, 5.0), (2, 1.0)]).expect("doc 1");
+            guard.upsert_doc(2, &[(1, 1.0)]).expect("doc 2");
+        }
+        pg
+    }
+
+    fn fusion_sql(extra_before_vector: &str, limit: usize) -> String {
+        format!(
+            /* 样例 / EN: sample */
+            "/* houyi:collection=docs */ \
+             {extra_before_vector} /* houyi:vector=1,0,0,0 */ SELECT id FROM docs LIMIT {limit}"
+        )
+    }
+
+    /// 正常路径：单列 id（oid 20），dense+稀疏两路命中的 id 都出现。
+    /// EN: Happy path: a single id column (oid 20) with ids from both modalities.
+    #[tokio::test]
+    async fn fusion_happy_path_returns_single_id_column() {
+        let pg = seeded_bm25_state().await;
+        let sql = fusion_sql("/* houyi:sparse=1:2.5 */", 2);
+        let (columns, rows) = pgwire_collect_rows(Some(&pg), &sql)
+            .await
+            .expect("fusion search succeeds");
+        assert_eq!(columns.len(), 1);
+        assert_eq!(columns[0].name, "id");
+        assert_eq!(columns[0].type_oid, 20);
+        let ids: Vec<&str> = rows.iter().map(|r| r[0].as_str()).collect();
+        assert_eq!(ids, vec!["1", "2"], "both modalities must contribute");
+    }
+
+    /// WHERE 中的 id 谓词与向量检索同口径下推：融合结果只含被过滤的 id
+    /// （OCR f42415a：此前 filter_ids=None 会静默忽略 WHERE，产生错结果）。
+    /// EN: id predicates in WHERE are pushed down like vector search: fused
+    /// results contain only the matching ids (OCR f42415a: filter_ids=None used
+    /// to silently ignore WHERE and return wrong results).
+    #[tokio::test]
+    async fn fusion_applies_where_id_filter() {
+        let pg = seeded_bm25_state().await;
+        let sql = concat!(
+            /* 样例 / EN: sample */
+            "/* houyi:collection=docs */ /* houyi:sparse=1:1 */ ",
+            "/* houyi:vector=1,0,0,0 */ SELECT id FROM docs WHERE id IN (1) LIMIT 2"
+        );
+        let (_columns, rows) = pgwire_collect_rows(Some(&pg), sql)
+            .await
+            .expect("fusion search with WHERE succeeds");
+        assert_eq!(
+            rows,
+            vec![vec!["1".to_string()]],
+            "WHERE id IN (1) must filter"
+        );
+    }
+
+    /// 重复 term 在服务端内核求和（原始对数量计入上限，求和后按单 term 计分）。
+    /// EN: Duplicate terms are summed server-side (raw pairs count toward the
+    /// cap; scoring uses the summed term).
+    #[tokio::test]
+    async fn fusion_duplicate_terms_sum_server_side() {
+        let pg = seeded_bm25_state().await;
+        let sql = fusion_sql("/* houyi:sparse=1:1.0,1:2.0 */", 2);
+        let (_columns, rows) = pgwire_collect_rows(Some(&pg), &sql)
+            .await
+            .expect("duplicate terms sum");
+        // 求和后 term 1 权重 3.0，排序仍是 [1, 2]。
+        // EN: Summed term-1 weight is 3.0; ordering stays [1, 2].
+        assert_eq!(rows, vec![vec!["1".to_string()], vec!["2".to_string()]]);
+    }
+
+    /// 缺 collection 指令 → 0A000（默认主索引没有稀疏侧）。
+    /// EN: Missing collection directive → 0A000 (the default index has no sparse side).
+    #[tokio::test]
+    async fn fusion_requires_collection_directive() {
+        let pg = seeded_bm25_state().await;
+        let sql = "/* houyi:sparse=1:1 */ /* houyi:vector=1,0,0,0 */ SELECT id FROM docs LIMIT 1";
+        let (sqlstate, msg) = pgwire_collect_rows(Some(&pg), sql)
+            .await
+            .err()
+            .expect("missing collection directive must be rejected");
+        assert_eq!(sqlstate, "0A000");
+        assert!(msg.contains("houyi:collection"), "got: {msg}");
+    }
+
+    /// 缺集合 → 42P01，且 leader 不隐式建集合（查询后仍不存在）。
+    /// EN: Missing collection → 42P01 and the leader does not implicitly create
+    /// (the collection stays absent after the query).
+    #[tokio::test]
+    async fn fusion_missing_collection_is_42p01_and_does_not_create() {
+        let pg = seeded_bm25_state().await;
+        let sql = "/* houyi:collection=ghost */ /* houyi:sparse=1:1 */ /* houyi:vector=1,0,0,0 */ \
+                   SELECT id FROM ghost LIMIT 1";
+        let (sqlstate, msg) = pgwire_collect_rows(Some(&pg), sql)
+            .await
+            .err()
+            .expect("missing collection must be rejected");
+        assert_eq!(sqlstate, "42P01");
+        assert!(msg.contains("ghost"), "got: {msg}");
+        assert!(
+            pg.collections.get("ghost").is_none(),
+            "fusion search must never implicitly create a collection"
+        );
+    }
+
+    /// follower 缺集合同样是 42P01（只读副本语义与 leader 的「不隐式建」一致）。
+    /// EN: A follower with a missing collection also returns 42P01.
+    #[tokio::test]
+    async fn fusion_follower_missing_collection_is_42p01() {
+        let pg = pg_state();
+        pg.role.set(ReplicationRole::Follower);
+        let sql = "/* houyi:collection=ghost */ /* houyi:sparse=1:1 */ /* houyi:vector=1,0,0,0 */ \
+                   SELECT id FROM ghost LIMIT 1";
+        let (sqlstate, _msg) = pgwire_collect_rows(Some(&pg), sql)
+            .await
+            .err()
+            .expect("follower missing collection must be rejected");
+        assert_eq!(sqlstate, "42P01");
+    }
+
+    /// `sparse=none` 集合上的融合检索 → 0A000。
+    /// EN: Fusion search on a sparse=none collection → 0A000.
+    #[tokio::test]
+    async fn fusion_sparse_none_collection_is_0a000() {
+        let pg = pg_state();
+        pg.collections
+            .get_or_create("plain", Some(4))
+            .expect("create plain collection");
+        let sql = "/* houyi:collection=plain */ /* houyi:sparse=1:1 */ /* houyi:vector=1,0,0,0 */ \
+                   SELECT id FROM plain LIMIT 1";
+        let (sqlstate, msg) = pgwire_collect_rows(Some(&pg), sql)
+            .await
+            .err()
+            .expect("sparse=none fusion must be rejected");
+        assert_eq!(sqlstate, "0A000");
+        assert!(msg.contains("bm25"), "got: {msg}");
+    }
+
+    /// 稠密维度不符 → 22000（与向量检索同 SQLSTATE）。
+    /// EN: Dense dim mismatch → 22000 (same SQLSTATE as vector search).
+    #[tokio::test]
+    async fn fusion_dim_mismatch_is_22000() {
+        let pg = seeded_bm25_state().await;
+        let sql = "/* houyi:collection=docs */ /* houyi:sparse=1:1 */ /* houyi:vector=1,0,0 */ \
+                   SELECT id FROM docs LIMIT 1";
+        let (sqlstate, msg) = pgwire_collect_rows(Some(&pg), sql)
+            .await
+            .err()
+            .expect("dim mismatch must be rejected");
+        assert_eq!(sqlstate, "22000");
+        assert!(msg.contains("expected dim 4"), "got: {msg}");
+    }
+
+    /// 语义越界矩阵统一 22023：term 域、非正/非有限权重、数量上限、
+    /// 非有限稠密分量、alpha 越界、未知融合模式。
+    /// EN: Semantic out-of-domain matrix uniformly 22023: term domain,
+    /// non-positive/non-finite weights, count cap, non-finite dense component,
+    /// alpha out of range, unknown fusion mode.
+    #[tokio::test]
+    async fn fusion_semantic_violations_are_22023() {
+        let pg = seeded_bm25_state().await;
+        let mut too_many = String::new();
+        for term in 1..=(MAX_SPARSE_QUERY_TERMS as u32 + 1) {
+            if !too_many.is_empty() {
+                too_many.push(',');
+            }
+            too_many.push_str(&format!("{term}:1"));
+        }
+        let cases = vec![
+            "/* houyi:sparse=0:1 */".to_string(),
+            format!("/* houyi:sparse={}:1 */", MAX_SPARSE_TERM_ID + 1),
+            "/* houyi:sparse=1:0 */".to_string(),
+            "/* houyi:sparse=1:-1 */".to_string(),
+            "/* houyi:sparse=1:NaN */".to_string(),
+            format!("/* houyi:sparse={too_many} */"),
+            "/* houyi:alpha=1.5 */ /* houyi:sparse=1:1 */".to_string(),
+            "/* houyi:alpha=NaN */ /* houyi:sparse=1:1 */".to_string(),
+            "/* houyi:fusion=max */ /* houyi:sparse=1:1 */".to_string(),
+        ];
+        for extra in cases {
+            let sql = fusion_sql(&extra, 1);
+            let (sqlstate, msg) = pgwire_collect_rows(Some(&pg), &sql)
+                .await
+                .err()
+                .unwrap_or_else(|| panic!("{extra} must be rejected"));
+            assert_eq!(sqlstate, "22023", "{extra}: {msg}");
+        }
+        // 非有限稠密分量单独走 22023（维度正确、分量 NaN）。
+        // EN: A non-finite dense component also maps to 22023 (correct dim,
+        // NaN component).
+        let sql =
+            "/* houyi:collection=docs */ /* houyi:sparse=1:1 */ /* houyi:vector=NaN,0,0,0 */ \
+                   SELECT id FROM docs LIMIT 1";
+        let (sqlstate, _msg) = pgwire_collect_rows(Some(&pg), sql)
+            .await
+            .err()
+            .expect("non-finite dense component must be rejected");
+        assert_eq!(sqlstate, "22023");
+    }
+
+    /// 超大 LIMIT 在融合路径同样 22023（放大面封边先于集合解析）。
+    /// EN: An over-cap LIMIT is 22023 on the fusion path too (caps before
+    /// collection resolution).
+    #[tokio::test]
+    async fn fusion_over_cap_limit_is_22023() {
+        let pg = seeded_bm25_state().await;
+        let sql = fusion_sql("/* houyi:sparse=1:1 */", MAX_SEARCH_K + 1);
+        let (sqlstate, msg) = pgwire_collect_rows(Some(&pg), &sql)
+            .await
+            .err()
+            .expect("over-cap LIMIT must be rejected");
+        assert_eq!(sqlstate, "22023");
+        assert!(msg.contains(&MAX_SEARCH_K.to_string()), "got: {msg}");
+    }
+
+    /// 只有稀疏指令没有向量指令 → 42601（解析层语法错误）。
+    /// EN: Sparse directive without a vector directive → 42601.
+    #[tokio::test]
+    async fn fusion_without_vector_directive_is_42601() {
+        let pg = seeded_bm25_state().await;
+        let sql = "/* houyi:collection=docs */ /* houyi:sparse=1:1 */ SELECT id FROM docs LIMIT 1";
+        let (sqlstate, msg) = pgwire_collect_rows(Some(&pg), sql)
+            .await
+            .err()
+            .expect("sparse-only SQL must be rejected");
+        assert_eq!(sqlstate, "42601");
+        assert!(msg.contains("houyi:vector"), "got: {msg}");
+    }
+
+    /// Describe 列元数据：融合 SQL 也必须是单列 id（oid 20）。
+    /// EN: Describe column metadata: fusion SQL is a single id column (oid 20).
+    #[test]
+    fn result_columns_for_fusion_sql_is_id() {
+        let columns = pgwire_result_columns_for_sql_with_params(
+            &fusion_sql("/* houyi:sparse=1:1 */", 5),
+            &[],
+        )
+        .expect("fusion columns");
+        assert_eq!(columns.len(), 1);
+        assert_eq!(columns[0].name, "id");
+        assert_eq!(columns[0].type_oid, 20);
+    }
+}
+
 /// P4.7.2 配额裁决（OCR 批次三十四）：SELECT 隐式建集合、SQLSTATE 54000、
 /// 计数分账。
 /// EN: quota adjudication — implicit creates via SELECT, 54000, metric split.
 #[cfg(test)]
 mod quota_tests {
     use super::*;
-    use crate::collection::CollectionManager;
 
     fn pg_state() -> Arc<PgWireSharedState> {
-        Arc::new(PgWireSharedState {
-            replication_metrics: crate::types::shared_replication_metrics(None),
-            index: IndexBackend::new_hnsw(4),
-            collections: Arc::new(CollectionManager::new(4, "hnsw")),
-            vector_dim: 4,
-            pgwire_hnsw_m: None,
-            pgwire_hnsw_ef_construction: None,
-            wal: None,
-            collections_wal: None,
-            role: crate::types::RoleState::default(),
-            cluster: std::sync::Arc::new(
-                crate::cluster::ClusterControl::open(
-                    &std::env::temp_dir()
-                        .join(format!(
-                            "houyi-pgwire-test-cluster-{}-{}-{}",
-                            std::process::id(),
-                            std::time::SystemTime::now()
-                                .duration_since(std::time::UNIX_EPOCH)
-                                .unwrap()
-                                .as_nanos(),
-                            {
-                                static SEQ: std::sync::atomic::AtomicU64 =
-                                    std::sync::atomic::AtomicU64::new(0);
-                                SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-                            }
-                        ))
-                        .join("test.wal"),
-                    false,
-                )
-                .expect("cluster control"),
-            ),
-            query_log: None,
-        })
+        super::test_pg_state("houyi-pgwire-test-cluster")
     }
 
     fn principal_with_quota(max_collections: usize) -> crate::rbac::Principal {

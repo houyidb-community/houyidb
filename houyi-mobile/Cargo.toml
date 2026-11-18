@@ -8,7 +8,7 @@ authors.workspace = true
 description = "HouyiDB Mobile: 轻量级向量索引，面向 iOS / Android"
 
 [lib]
-crate-type = ["staticlib", "cdylib"]
+crate-type = ["staticlib", "cdylib", "rlib"]
 
 [features]
 default = ["portable"]
@@ -19,6 +19,8 @@ simd-neon = ["houyi-vector/simd-neon"]
 houyi-vector = { path = "../houyi-vector", version = "0.2.0-beta.8", default-features = false, features = ["portable", "simd-neon"] }
 houyi-core = { path = "../houyi-core", version = "0.2.0-beta.8", default-features = false, features = ["portable"] }
 ahash = "0.8"
+crc32fast.workspace = true
+serde_json.workspace = true
 
 [dev-dependencies]
 rand.workspace = true

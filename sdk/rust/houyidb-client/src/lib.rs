@@ -21,6 +21,16 @@
 //!   EN: [`stable_id`] uses the same algorithm as the Python/TS/Go SDKs and the
 //!   server OpenAI gateway (BLAKE2b-8 big-endian & 2^63-1), so deletes replay
 //!   across SDKs.
+//! - 稀疏词项由客户端给定（无分词器）；`sparse=bm25` 必须显式建集合，写入
+//!   仅 HTTP/SDK（pgwire 不提供稀疏写入）。稀疏键缺省 = 不改，`[]` = 清空。
+//!   EN: sparse terms are client-supplied (no tokenizer); `sparse=bm25` requires
+//!   explicit creation and writes exist only over HTTP/SDK (pgwire offers no
+//!   sparse writes). An absent sparse key means unchanged and `[]` clears it.
+//! - 融合检索的 `score` 仅表达融合排序（RRF 或加权），不属于任何度量口径；
+//!   `dense_score` 才按集合度量换算，`sparse_score` 为 BM25 原始分。
+//!   EN: fusion `score` only expresses fused ranking (RRF or weighted) and
+//!   belongs to no metric; `dense_score` follows the collection metric while
+//!   `sparse_score` is the raw BM25 score.
 
 use blake2::digest::generic_array::typenum::U8;
 use blake2::Digest;
@@ -50,9 +60,14 @@ pub fn stable_id(text: &str) -> u64 {
     u64::from_be_bytes(digest.into()) & U64_MASK
 }
 
-/// 客户端错误：HTTP 非 2xx（状态码 + 服务端诊断文本）或传输层失败。
-/// EN: Client error: HTTP non-2xx (status code + server diagnostic text) or a
-/// transport failure.
+/// 客户端错误：HTTP 非 2xx（状态码 + 服务端诊断文本）、传输层失败、响应
+/// 违反协议形状，或调用方传入的参数在发出请求前就违反协议约束。
+/// EN: Client error: HTTP non-2xx (status code + server diagnostic text), a
+/// transport failure, a response violating the protocol shape, or an argument
+/// rejected before the request is sent.
+// 非穷尽枚举：后续新增变体不破坏下游的穷尽匹配。
+// EN: Non-exhaustive enum: future variants do not break downstream exhaustive matches.
+#[non_exhaustive]
 #[derive(Debug)]
 pub enum HouyiError {
     /// 服务端返回的非 2xx（状态码 + 纯文本诊断，axum 元组错误原样透出）。
@@ -62,6 +77,15 @@ pub enum HouyiError {
     /// 连接/读取等传输层失败。
     /// EN: Transport failure such as connect/read errors.
     Transport(String),
+    /// 2xx 响应体违反协议形状（例如平行数组宽度错位）：确定性错误，
+    /// 调用方不应重试。
+    /// EN: A 2xx response body violates the protocol shape (e.g. misaligned
+    /// parallel arrays): a deterministic error callers must not retry.
+    InvalidResponse(String),
+    /// 请求参数未通过客户端预校验（与服务端同口径的快速失败，未发出请求）。
+    /// EN: Request arguments failed client-side pre-validation (the same limits
+    /// as the server, failed fast without sending the request).
+    InvalidRequest(String),
 }
 
 impl fmt::Display for HouyiError {
@@ -69,14 +93,76 @@ impl fmt::Display for HouyiError {
         match self {
             Self::Http { status, message } => write!(f, "houyidb HTTP {status}: {message}"),
             Self::Transport(e) => write!(f, "houyidb transport error: {e}"),
+            Self::InvalidResponse(e) => write!(f, "houyidb invalid response: {e}"),
+            Self::InvalidRequest(e) => write!(f, "houyidb invalid request: {e}"),
         }
     }
 }
 
 impl std::error::Error for HouyiError {}
 
-/// 一条待写入向量：id + 分量 + 可选 label/payload。
-/// EN: A vector to write: id + components + optional label/payload.
+/// 稀疏词项对 `(term_id, weight)`：词项 id 由客户端给定（无分词器），
+/// 线上形状为 `[term, weight]` 二元数组；权重必须有限且 > 0。
+/// EN: Sparse term pair `(term_id, weight)`: the term id is client-supplied
+/// (no tokenizer) and the wire shape is a `[term, weight]` pair array; the
+/// weight must be finite and > 0.
+pub type SparseTerms = Vec<(u32, f32)>;
+
+/// 稀疏词项 id 上界：24 位（与服务端一致；词表充足且编码紧凑）。
+/// EN: Upper bound of sparse term ids: 24 bits (matches the server; ample
+/// vocabulary headroom while staying compact).
+pub const MAX_SPARSE_TERM_ID: u32 = (1 << 24) - 1;
+
+/// 单文档稀疏词项原始条目上限（重复词项先求和再判重）。
+/// EN: Raw sparse-pair cap per document (duplicates are summed before dedup).
+pub const MAX_SPARSE_TERMS_PER_DOC: usize = 1024;
+
+/// 单次稀疏查询的原始词项上限。
+/// EN: Raw term cap for one sparse query.
+pub const MAX_SPARSE_QUERY_TERMS: usize = 64;
+
+/// RRF 平滑常数 `rrf_k` 的合法上界（下界为 1；与服务端一致）。
+/// EN: Valid upper bound of the RRF smoothing constant `rrf_k` (lower bound is
+/// 1; matches the server).
+pub const MAX_RRF_K: u32 = 1000;
+
+/// 客户端侧稀疏词项预校验（与服务端同口径的快速失败）：条目数、term 范围、
+/// 权重有限且 > 0。空列表是否合法由调用方判定（查询必须非空，清空文档允许空）。
+/// EN: Client-side sparse pre-validation (fail fast with the server's own
+/// limits): pair count, term range, and finite weights > 0. Whether an empty
+/// list is legal is decided by the caller (queries require non-empty; clearing
+/// a document's terms allows empty).
+fn validate_sparse_terms(
+    terms: &[(u32, f32)],
+    max_terms: usize,
+    field: &str,
+) -> Result<(), HouyiError> {
+    if terms.len() > max_terms {
+        return Err(HouyiError::InvalidRequest(format!(
+            "{field} carries {} pairs, over the {max_terms}-pair limit",
+            terms.len()
+        )));
+    }
+    for &(term, weight) in terms {
+        if term == 0 || term > MAX_SPARSE_TERM_ID {
+            return Err(HouyiError::InvalidRequest(format!(
+                "{field} term id {term} outside 1..={MAX_SPARSE_TERM_ID}"
+            )));
+        }
+        // 权重 0/负数会让 BM25 的 tf/dl 失去意义，NaN/∞ 会污染全部累加分数。
+        // EN: Zero or negative weights make BM25's tf/dl meaningless, and
+        // NaN/∞ contaminates every accumulated score.
+        if !weight.is_finite() || weight <= 0.0 {
+            return Err(HouyiError::InvalidRequest(format!(
+                "{field} term {term} weight {weight} must be finite and > 0"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// 一条待写入向量：id + 分量 + 可选 label/payload/稀疏词项。
+/// EN: A vector to write: id + components + optional label/payload/sparse terms.
 #[derive(Debug, Clone, Serialize)]
 pub struct Vector {
     pub id: u64,
@@ -85,6 +171,11 @@ pub struct Vector {
     pub label: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub payload: Option<HashMap<String, serde_json::Value>>,
+    /// 稀疏词项（仅 `sparse=bm25` 集合）：None = 不改，Some([]) = 清空。
+    /// EN: Sparse terms (only `sparse=bm25` collections): None means unchanged,
+    /// `Some([])` clears.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sparse: Option<SparseTerms>,
 }
 
 /// 过滤算子白名单（与服务端一致；多条 [`Filter`] 之间取交集）。
@@ -174,6 +265,95 @@ impl SearchResponse {
     }
 }
 
+/// 融合响应的 fusion 参数块（与 ids 对齐的平行数组之外单列）。
+/// EN: The fusion parameter block of a fusion response (separate from the
+/// parallel arrays aligned with ids).
+#[derive(Deserialize, Default)]
+struct FusionParamsWire {
+    #[serde(default)]
+    mode: String,
+    #[serde(default)]
+    rrf_k: Option<u32>,
+    #[serde(default)]
+    alpha: Option<f32>,
+}
+
+/// 融合检索响应的 wire 形状：`dense_scores`/`sparse_scores` 是与 ids 对齐的
+/// 平行数组，缺席模态为 JSON null。
+/// EN: Wire shape of a fusion response: `dense_scores`/`sparse_scores` are
+/// arrays parallel to ids, with JSON null for an absent modality.
+#[derive(Deserialize)]
+struct FusionResponse {
+    #[serde(default)]
+    ids: Vec<u64>,
+    #[serde(default)]
+    scores: Vec<f64>,
+    #[serde(default)]
+    dense_scores: Vec<Option<f64>>,
+    #[serde(default)]
+    sparse_scores: Vec<Option<f64>>,
+    #[serde(default)]
+    metric: String,
+    #[serde(default)]
+    fusion: FusionParamsWire,
+    #[serde(default)]
+    payloads: HashMap<String, HashMap<String, serde_json::Value>>,
+}
+
+impl FusionResponse {
+    /// 校验平行数组宽度：scores 必须与 ids 等宽；模态分数组缺席（空）时容忍，
+    /// 出现时必须等宽。宽度错位说明响应被截断/损坏，继续按索引取值会把分数
+    /// 静默错配给别的 id，这里改为显式失败（`InvalidResponse` 而非 `Transport`：
+    /// 确定性协议违反，不可重试）。
+    /// EN: Checks parallel-array widths: scores must equal ids in length;
+    /// modality score arrays are tolerated when absent (empty) but must match
+    /// when present. Misaligned widths mean a truncated/corrupt response where
+    /// index-based access would silently pair scores with the wrong ids, so
+    /// fail explicitly (`InvalidResponse`, not `Transport`: a deterministic
+    /// protocol violation that must not be retried).
+    fn validate_parity(&self) -> Result<(), HouyiError> {
+        let ids = self.ids.len();
+        if self.scores.len() != ids {
+            return Err(HouyiError::InvalidResponse(format!(
+                "fusion response scores has {} entries for {ids} ids",
+                self.scores.len()
+            )));
+        }
+        let check = |name: &str, len: usize| {
+            if len != 0 && len != ids {
+                return Err(HouyiError::InvalidResponse(format!(
+                    "fusion response {name} has {len} entries for {ids} ids"
+                )));
+            }
+            Ok(())
+        };
+        check("dense_scores", self.dense_scores.len())?;
+        check("sparse_scores", self.sparse_scores.len())
+    }
+
+    fn into_result(self) -> FusionResult {
+        let hits = self
+            .ids
+            .iter()
+            .enumerate()
+            .map(|(i, &id)| FusionHit {
+                id,
+                score: self.scores.get(i).copied().unwrap_or(0.0),
+                dense_score: self.dense_scores.get(i).copied().flatten(),
+                sparse_score: self.sparse_scores.get(i).copied().flatten(),
+                payload: self.payloads.get(&id.to_string()).cloned(),
+            })
+            .collect();
+        FusionResult {
+            hits,
+            metric: self.metric,
+            fusion_mode: self.fusion.mode,
+            rrf_k: self.fusion.rrf_k,
+            alpha: self.fusion.alpha,
+        }
+    }
+}
+
 /// 建集合时的 HNSW 参数三元组（必须三个全给，否则服务端 400）。
 /// EN: HNSW parameter triple for explicit creation (all three or the server
 /// returns 400).
@@ -211,6 +391,29 @@ pub struct CreateCollectionOptions {
     /// three fields are required; combining it with another backend is rejected
     /// by the server (400).
     pub hnsw: Option<HnswConfig>,
+    /// 向量存储编码：`f32`（缺省）或 `f16`（仅 hnsw，省一半向量内存）。创建
+    /// 后不可变；非 f32 与非 hnsw 组合会被服务端拒绝（400）。
+    /// EN: Vector storage encoding: `f32` (default) or `f16` (hnsw only, halves
+    /// vector memory). Immutable after creation; non-f32 with a non-hnsw backend
+    /// is rejected by the server (400).
+    pub vector_dtype: Option<String>,
+    /// 图侧量化：`none`（缺省）、`int8` 或 `rabitq`（仅 hnsw，压缩图内距离
+    /// 工作集；主表保留原始向量并在检索时精确重排）。`rabitq` 为 1 bit/dim，
+    /// 仅支持 `metric = l2 | cosine`（`ip`/`l1` 返回 400）。创建后不可变；
+    /// 非 none 与非 hnsw 组合会被服务端拒绝（400）。
+    /// EN: Graph-side quantization: `none` (default), `int8`, or `rabitq`
+    /// (hnsw only, shrinks the in-graph distance working set; the main store
+    /// keeps raw vectors and reranks exactly at search time). `rabitq` packs
+    /// 1 bit/dim and supports `metric = l2 | cosine` only (`ip`/`l1` return
+    /// 400). Immutable after creation; non-none with a non-hnsw backend is
+    /// rejected by the server (400).
+    pub quantization: Option<String>,
+    /// 稀疏旁路索引：`none`（缺省）或 `bm25`（客户端给定词项，仅 hnsw/flat，
+    /// 创建后不可变）。`bm25` 与其他后端组合返回 400。
+    /// EN: Sparse side index: `none` (default) or `bm25` (client-supplied
+    /// terms, hnsw/flat-only, immutable after creation). Combining `bm25` with
+    /// another backend returns 400.
+    pub sparse: Option<String>,
 }
 
 /// 建集合响应：服务端回显实际生效的参数（同名已存在返回 409）。
@@ -223,6 +426,22 @@ pub struct CreateCollectionResult {
     pub dims: usize,
     pub metric: String,
     pub index_type: String,
+    /// 实际生效的存储编码（`f32` | `f16`）；旧服务端不返回时为 None。
+    /// EN: Effective storage encoding (`f32` | `f16`); None from older servers.
+    #[serde(default)]
+    pub vector_dtype: Option<String>,
+    /// 实际生效的图侧量化（`none` | `int8` | `rabitq`）；旧服务端不返回时为
+    /// None。
+    /// EN: Effective graph-side quantization (`none` | `int8` | `rabitq`);
+    /// None from older servers.
+    #[serde(default)]
+    pub quantization: Option<String>,
+    /// 实际生效的稀疏索引模式（`none` | `bm25`）；旧服务端不返回时为 None
+    /// （按可选字段容忍，不得报错）。
+    /// EN: Effective sparse index mode (`none` | `bm25`); None from older
+    /// servers (tolerated as an optional field, never an error).
+    #[serde(default)]
+    pub sparse: Option<String>,
     /// 仅 `index_type=hnsw` 时存在。
     /// EN: Present only for `index_type=hnsw`.
     #[serde(default)]
@@ -236,6 +455,63 @@ pub struct SearchOptions {
     pub ef_search: Option<usize>,
     pub include_payload: bool,
     pub filters: Vec<Filter>,
+}
+
+/// 融合检索可选参数（`Default` 即 rrf + 服务端缺省 rrf_k=60/alpha=0.5）。
+///
+/// `fusion` 取 `rrf`（缺省）或 `weighted`；`rrf_k` 仅 rrf 模式参与计算，
+/// `alpha` 仅 weighted 模式参与计算，但显式给出的值服务端一律严格校验
+/// （越界 400，即使当前模式不参与计算）。
+/// EN: Optional fusion-search parameters (`Default` is rrf plus the server
+/// defaults rrf_k=60/alpha=0.5). `fusion` is `rrf` (default) or `weighted`;
+/// `rrf_k` scores only under rrf and `alpha` only under weighted, yet the
+/// server strictly validates explicit values (400 when out of range, even
+/// under the inactive mode).
+#[derive(Debug, Clone, Default)]
+pub struct FusionOptions {
+    pub ef_search: Option<usize>,
+    pub include_payload: bool,
+    pub filters: Vec<Filter>,
+    pub fusion: Option<String>,
+    pub rrf_k: Option<u32>,
+    pub alpha: Option<f32>,
+}
+
+/// 一个融合命中：id + 融合分（仅排序语义）+ 两路原始分 + 可选 payload。
+/// EN: One fusion hit: id + fused score (ranking only) + both raw modality
+/// scores + optional payload.
+#[derive(Debug, Clone)]
+pub struct FusionHit {
+    pub id: u64,
+    pub score: f64,
+    /// 按集合度量换算的稠密分（cosine/l2/l1 为 `1-d`、ip 为原始点积）；
+    /// 仅稠密一路命中时存在。
+    /// EN: Dense score converted under the collection metric (cosine/l2/l1 as
+    /// `1-d`, ip as the raw dot product); present only when the dense path hit.
+    pub dense_score: Option<f64>,
+    /// BM25 原始分；仅稀疏一路命中时存在。
+    /// EN: Raw BM25 score; present only when the sparse path hit.
+    pub sparse_score: Option<f64>,
+    pub payload: Option<HashMap<String, serde_json::Value>>,
+}
+
+/// 融合检索响应：hits 按融合分从高到低排列。
+/// EN: Fusion response: hits ordered by fused score, highest first.
+#[derive(Debug, Clone, Default)]
+pub struct FusionResult {
+    pub hits: Vec<FusionHit>,
+    /// 仅用于解释 `dense_score` 的度量口径。
+    /// EN: Metric that explains `dense_score` only.
+    pub metric: String,
+    /// 生效的融合模式（`rrf` | `weighted`）。
+    /// EN: Effective fusion mode (`rrf` | `weighted`).
+    pub fusion_mode: String,
+    /// 仅 rrf 模式回显。
+    /// EN: Echoed only under rrf.
+    pub rrf_k: Option<u32>,
+    /// 仅 weighted 模式回显。
+    /// EN: Echoed only under weighted.
+    pub alpha: Option<f32>,
 }
 
 /// HouyiDB 客户端入口（同步阻塞；`ureq::Agent` 连接池复用）。
@@ -363,6 +639,15 @@ impl Client {
         if let Some(index_type) = &opts.index_type {
             map.insert("index_type".to_string(), serde_json::json!(index_type));
         }
+        if let Some(vector_dtype) = &opts.vector_dtype {
+            map.insert("vector_dtype".to_string(), serde_json::json!(vector_dtype));
+        }
+        if let Some(quantization) = &opts.quantization {
+            map.insert("quantization".to_string(), serde_json::json!(quantization));
+        }
+        if let Some(sparse) = &opts.sparse {
+            map.insert("sparse".to_string(), serde_json::json!(sparse));
+        }
         if let Some(hnsw) = &opts.hnsw {
             map.insert("hnsw_m".to_string(), serde_json::json!(hnsw.m));
             map.insert(
@@ -430,6 +715,20 @@ impl Collection {
     /// EN: Writes a batch of vectors (the collection is created implicitly on
     /// first write). Returns the number of inserted rows.
     pub fn upsert(&self, vectors: &[Vector]) -> Result<usize, HouyiError> {
+        // 稀疏词项在发出请求前按服务端口径校验：越界会在服务端整批 400，
+        // 这里提前失败能给出具体到向量 id 的诊断。
+        // EN: Validate sparse terms against the server's limits before sending:
+        // out-of-range values would 400 the whole batch server-side, so fail
+        // early with diagnostics that name the offending vector id.
+        for vector in vectors {
+            if let Some(terms) = &vector.sparse {
+                validate_sparse_terms(
+                    terms,
+                    MAX_SPARSE_TERMS_PER_DOC,
+                    &format!("vector {}", vector.id),
+                )?;
+            }
+        }
         #[derive(Deserialize)]
         struct Inserted {
             inserted: usize,
@@ -472,6 +771,58 @@ impl Collection {
                 .post(&format!("{}/hybrid/search", self.base))
                 .send_json(search_request(vector, k, opts, true)),
         )?;
+        Ok(body.into_result())
+    }
+
+    /// 稠密 + 稀疏融合检索（仅创建时开启 `sparse=bm25` 的集合）。
+    ///
+    /// 两路各自过取 4×k 后融合：rrf（缺省，`rrf_k` 平滑）或 weighted
+    /// （两路 min-max 归一后 `alpha*dense + (1-alpha)*sparse`）。
+    /// 稀疏查询词项为空或集合未启用稀疏时服务端返回 400。
+    /// EN: Dense + sparse fusion search (only for collections created with
+    /// `sparse=bm25`). Both paths over-fetch 4×k, then fuse: rrf (default, with
+    /// `rrf_k` smoothing) or weighted (per-path min-max, then
+    /// `alpha*dense + (1-alpha)*sparse`). The server returns 400 for an empty
+    /// sparse query or a collection without sparse enabled.
+    pub fn fusion_search(
+        &self,
+        vector: &[f32],
+        sparse: &[(u32, f32)],
+        k: usize,
+        opts: &FusionOptions,
+    ) -> Result<FusionResult, HouyiError> {
+        // 与服务端同一份约束：查询词项非空且不超限、term/权重合法、
+        // alpha∈[0,1]、rrf_k∈[1,1000]；先在本端拒绝，省一次必然 400 的往返。
+        // EN: The same constraints the server enforces: a non-empty, bounded
+        // sparse query with legal term/weight pairs, alpha within [0,1], and
+        // rrf_k within [1,1000] — rejected here to spare a guaranteed-400 round
+        // trip.
+        if sparse.is_empty() {
+            return Err(HouyiError::InvalidRequest(
+                "fusion_search requires a non-empty sparse query".to_string(),
+            ));
+        }
+        validate_sparse_terms(sparse, MAX_SPARSE_QUERY_TERMS, "sparse query")?;
+        if let Some(alpha) = opts.alpha {
+            if !alpha.is_finite() || !(0.0..=1.0).contains(&alpha) {
+                return Err(HouyiError::InvalidRequest(format!(
+                    "alpha {alpha} must be finite and within [0, 1]"
+                )));
+            }
+        }
+        if let Some(rrf_k) = opts.rrf_k {
+            if rrf_k == 0 || rrf_k > MAX_RRF_K {
+                return Err(HouyiError::InvalidRequest(format!(
+                    "rrf_k {rrf_k} outside 1..={MAX_RRF_K}"
+                )));
+            }
+        }
+        let body: FusionResponse = checked(
+            self.agent
+                .post(&format!("{}/fusion/search", self.base))
+                .send_json(fusion_request(vector, sparse, k, opts)),
+        )?;
+        body.validate_parity()?;
         Ok(body.into_result())
     }
 
@@ -529,6 +880,40 @@ fn search_request(
     }
     if opts.include_payload {
         map.insert("include_payload".to_string(), serde_json::json!(true));
+    }
+    req
+}
+
+/// 构造融合检索请求体：稀疏词项序列化为 `[term, weight]` 二元数组；
+/// 融合模式与调参旋钮只在显式给出时携带（缺省由服务端补齐）。
+/// EN: Builds the fusion request body: sparse terms serialize as
+/// `[term, weight]` pairs; the fusion mode and tuning knobs are carried only
+/// when explicitly set (the server fills the defaults otherwise).
+fn fusion_request(
+    vector: &[f32],
+    sparse: &[(u32, f32)],
+    k: usize,
+    opts: &FusionOptions,
+) -> serde_json::Value {
+    let mut req = serde_json::json!({ "vector": vector, "sparse": sparse, "k": k });
+    let map = req.as_object_mut().expect("request is an object");
+    if !opts.filters.is_empty() {
+        map.insert("filters".to_string(), serde_json::json!(opts.filters));
+    }
+    if let Some(ef) = opts.ef_search {
+        map.insert("ef_search".to_string(), serde_json::json!(ef));
+    }
+    if opts.include_payload {
+        map.insert("include_payload".to_string(), serde_json::json!(true));
+    }
+    if let Some(fusion) = &opts.fusion {
+        map.insert("fusion".to_string(), serde_json::json!(fusion));
+    }
+    if let Some(rrf_k) = opts.rrf_k {
+        map.insert("rrf_k".to_string(), serde_json::json!(rrf_k));
+    }
+    if let Some(alpha) = opts.alpha {
+        map.insert("alpha".to_string(), serde_json::json!(alpha));
     }
     req
 }
@@ -678,7 +1063,7 @@ mod tests {
     #[test]
     fn create_collection_sends_metric_backend_and_hnsw() {
         let (base, server) = serve_one_request(
-            r#"{"created":true,"collection":"docs","dims":4,"metric":"ip","index_type":"hnsw","hnsw":{"m":16,"ef_construction":100,"ef_search":32}}"#,
+            r#"{"created":true,"collection":"docs","dims":4,"metric":"ip","index_type":"hnsw","vector_dtype":"f16","quantization":"int8","hnsw":{"m":16,"ef_construction":100,"ef_search":32}}"#,
         );
         let result = Client::new(&base)
             .with_admin_token("tok")
@@ -693,10 +1078,15 @@ mod tests {
                         ef_construction: 100,
                         ef_search: 32,
                     }),
+                    vector_dtype: Some("f16".to_string()),
+                    quantization: Some("int8".to_string()),
+                    sparse: None,
                 },
             )
             .expect("create");
         assert_eq!(result.metric, "ip");
+        assert_eq!(result.vector_dtype.as_deref(), Some("f16"));
+        assert_eq!(result.quantization.as_deref(), Some("int8"));
         assert_eq!(result.hnsw.map(|h| h.m), Some(16));
         let request = server.join().expect("server thread");
         assert!(
@@ -709,12 +1099,349 @@ mod tests {
         assert_eq!(body["dims"], 4);
         assert_eq!(body["metric"], "ip");
         assert_eq!(body["index_type"], "hnsw");
+        assert_eq!(body["vector_dtype"], "f16");
+        assert_eq!(body["quantization"], "int8");
         assert_eq!(body["hnsw_m"], 16);
         assert_eq!(body["hnsw_ef_construction"], 100);
         assert_eq!(body["hnsw_ef_search"], 32);
         assert!(
             !request.to_ascii_lowercase().contains("authorization:"),
             "create is a normal write and must not carry the admin token: {request}"
+        );
+    }
+
+    /// rabitq 量化：wire body 原样携带 `"rabitq"`，响应回显同样解码出来。
+    /// EN: rabitq quantization: the wire body carries `"rabitq"` verbatim and the
+    /// echoed response decodes back to the same value.
+    #[test]
+    fn create_collection_sends_rabitq_quantization() {
+        let (base, server) = serve_one_request(
+            r#"{"created":true,"collection":"docs","dims":8,"metric":"cosine","index_type":"hnsw","vector_dtype":"f32","quantization":"rabitq","hnsw":{"m":16,"ef_construction":100,"ef_search":32}}"#,
+        );
+        let result = Client::new(&base)
+            .with_admin_token("tok")
+            .create_collection(
+                "docs",
+                8,
+                &CreateCollectionOptions {
+                    metric: Some("cosine".to_string()),
+                    index_type: Some("hnsw".to_string()),
+                    hnsw: Some(HnswConfig {
+                        m: 16,
+                        ef_construction: 100,
+                        ef_search: 32,
+                    }),
+                    vector_dtype: Some("f32".to_string()),
+                    quantization: Some("rabitq".to_string()),
+                    sparse: None,
+                },
+            )
+            .expect("create");
+        assert_eq!(result.metric, "cosine");
+        assert_eq!(result.quantization.as_deref(), Some("rabitq"));
+        let request = server.join().expect("server thread");
+        let body: serde_json::Value =
+            serde_json::from_str(request.split_once("\r\n\r\n").expect("body separator").1)
+                .expect("request body is JSON");
+        assert_eq!(body["metric"], "cosine");
+        assert_eq!(body["quantization"], "rabitq");
+    }
+
+    /// 不设置 quantization 时：wire body 不出现该键（保持旧服务端兼容），
+    /// 且旧服务端响应缺席该字段时结果解码为 None（不创建自有键）。
+    /// EN: when quantization is unset the wire body omits the key (old-server
+    /// compatible), and a response from an older server without the field decodes
+    /// to None (no key of our own is fabricated).
+    #[test]
+    fn create_collection_omits_quantization_when_unset() {
+        let (base, server) = serve_one_request(
+            r#"{"created":true,"collection":"docs","dims":4,"metric":"ip","index_type":"hnsw","hnsw":{"m":16,"ef_construction":100,"ef_search":32}}"#,
+        );
+        let result = Client::new(&base)
+            .create_collection(
+                "docs",
+                4,
+                &CreateCollectionOptions {
+                    metric: Some("ip".to_string()),
+                    index_type: Some("hnsw".to_string()),
+                    hnsw: Some(HnswConfig {
+                        m: 16,
+                        ef_construction: 100,
+                        ef_search: 32,
+                    }),
+                    vector_dtype: None,
+                    quantization: None,
+                    sparse: None,
+                },
+            )
+            .expect("create");
+        assert_eq!(result.quantization, None);
+        assert_eq!(result.vector_dtype, None);
+        let request = server.join().expect("server thread");
+        let body: serde_json::Value =
+            serde_json::from_str(request.split_once("\r\n\r\n").expect("body separator").1)
+                .expect("request body is JSON");
+        assert!(
+            body.get("quantization").is_none(),
+            "unset quantization must omit the wire key: {body}"
+        );
+        assert!(
+            body.get("vector_dtype").is_none(),
+            "unset vector_dtype must omit the wire key: {body}"
+        );
+        assert!(
+            body.get("sparse").is_none(),
+            "unset sparse must omit the wire key: {body}"
+        );
+    }
+
+    /// 稀疏创建：wire body 携带 `sparse`，响应回显生效模式。
+    /// EN: Sparse creation: the wire body carries `sparse` and the response
+    /// echoes the effective mode.
+    #[test]
+    fn create_collection_sends_sparse() {
+        let (base, server) = serve_one_request(
+            r#"{"created":true,"collection":"docs","dims":8,"metric":"cosine","index_type":"hnsw","sparse":"bm25"}"#,
+        );
+        let result = Client::new(&base)
+            .create_collection(
+                "docs",
+                8,
+                &CreateCollectionOptions {
+                    sparse: Some("bm25".to_string()),
+                    ..Default::default()
+                },
+            )
+            .expect("create");
+        assert_eq!(result.sparse.as_deref(), Some("bm25"));
+        let request = server.join().expect("server thread");
+        let body: serde_json::Value =
+            serde_json::from_str(request.split_once("\r\n\r\n").expect("body separator").1)
+                .expect("request body is JSON");
+        assert_eq!(body["dims"], 8);
+        assert_eq!(body["sparse"], "bm25");
+    }
+
+    /// per-vector 稀疏形状：None 省略键（不改）、`Some([])` 为 `[]`（清空）、
+    /// 词项队序列化为 `[term, weight]` 二元数组。
+    /// EN: per-vector sparse shape: None omits the key (unchanged), `Some([])`
+    /// serializes as `[]` (clear), and pairs as `[term, weight]` arrays.
+    #[test]
+    fn vector_sparse_wire_shape() {
+        let unset = Vector {
+            id: 1,
+            values: vec![1.0],
+            label: None,
+            payload: None,
+            sparse: None,
+        };
+        let wire = serde_json::to_value(&unset).expect("serialize");
+        assert!(
+            wire.get("sparse").is_none(),
+            "unset sparse must omit the key: {wire}"
+        );
+
+        let set = Vector {
+            id: 2,
+            values: vec![1.0],
+            label: None,
+            payload: None,
+            sparse: Some(vec![(3, 1.5), (5, 0.25)]),
+        };
+        let wire = serde_json::to_value(&set).expect("serialize");
+        assert_eq!(wire["sparse"], serde_json::json!([[3, 1.5], [5, 0.25]]));
+
+        let cleared = Vector {
+            id: 3,
+            values: vec![1.0],
+            label: None,
+            payload: None,
+            sparse: Some(Vec::new()),
+        };
+        let wire = serde_json::to_value(&cleared).expect("serialize");
+        assert_eq!(wire["sparse"], serde_json::json!([]));
+    }
+
+    /// 客户端预校验：非法稀疏词项与融合参数在任一请求发出前就失败
+    /// （用例指向不可达端口，若校验漏网会以 Transport 失败而非本断言）。
+    /// EN: Client pre-validation: illegal sparse terms and fusion params fail
+    /// before any request goes out (cases target an unreachable port, so a
+    /// validation miss would surface as Transport instead of this assertion).
+    #[test]
+    fn fusion_search_rejects_invalid_arguments_before_wire() {
+        let client = Client::new("http://127.0.0.1:9");
+        let col = client.collection("docs");
+        let expect_invalid = |result: Result<FusionResult, HouyiError>| match result {
+            Err(HouyiError::InvalidRequest(_)) => {}
+            other => panic!("expected InvalidRequest, got {other:?}"),
+        };
+        let valid = [(1u32, 1.0f32)];
+        expect_invalid(col.fusion_search(&[0.0], &[], 1, &FusionOptions::default()));
+        let over: Vec<(u32, f32)> = (1..=65).map(|t| (t, 1.0)).collect();
+        expect_invalid(col.fusion_search(&[0.0], &over, 1, &FusionOptions::default()));
+        expect_invalid(col.fusion_search(&[0.0], &[(0, 1.0)], 1, &FusionOptions::default()));
+        expect_invalid(col.fusion_search(
+            &[0.0],
+            &[(MAX_SPARSE_TERM_ID + 1, 1.0)],
+            1,
+            &FusionOptions::default(),
+        ));
+        expect_invalid(col.fusion_search(&[0.0], &[(1, 0.0)], 1, &FusionOptions::default()));
+        expect_invalid(col.fusion_search(&[0.0], &[(1, f32::NAN)], 1, &FusionOptions::default()));
+        expect_invalid(col.fusion_search(
+            &[0.0],
+            &valid,
+            1,
+            &FusionOptions {
+                alpha: Some(1.5),
+                ..Default::default()
+            },
+        ));
+        expect_invalid(col.fusion_search(
+            &[0.0],
+            &valid,
+            1,
+            &FusionOptions {
+                rrf_k: Some(0),
+                ..Default::default()
+            },
+        ));
+        expect_invalid(col.fusion_search(
+            &[0.0],
+            &valid,
+            1,
+            &FusionOptions {
+                rrf_k: Some(MAX_RRF_K + 1),
+                ..Default::default()
+            },
+        ));
+    }
+
+    /// upsert 的 per-vector 稀疏预校验与错误信息中的向量 id。
+    /// EN: Per-vector sparse pre-validation on upsert, including the vector id
+    /// named in the diagnostics.
+    #[test]
+    fn upsert_rejects_invalid_sparse_terms_before_wire() {
+        let client = Client::new("http://127.0.0.1:9");
+        let col = client.collection("docs");
+        let vector = |sparse: Option<SparseTerms>| Vector {
+            id: 7,
+            values: vec![0.0; 4],
+            label: None,
+            payload: None,
+            sparse,
+        };
+        let expect_invalid = |result: Result<usize, HouyiError>| match result {
+            Err(HouyiError::InvalidRequest(message)) => {
+                assert!(message.contains("vector 7"), "missing id in: {message}");
+            }
+            other => panic!("expected InvalidRequest, got {other:?}"),
+        };
+        expect_invalid(col.upsert(&[vector(Some(vec![(0, 1.0)]))]));
+        expect_invalid(col.upsert(&[vector(Some(vec![(MAX_SPARSE_TERM_ID + 1, 1.0)]))]));
+        expect_invalid(col.upsert(&[vector(Some(vec![(1, 0.0)]))]));
+        expect_invalid(col.upsert(&[vector(Some(vec![(1, f32::INFINITY)]))]));
+        let over: SparseTerms = (1..=1025).map(|t| (t, 1.0)).collect();
+        expect_invalid(col.upsert(&[vector(Some(over))]));
+        // 空列表是合法输入（清空文档的稀疏词项），校验本身不得拒绝它。
+        // EN: An empty list is legal input (clears the document's sparse
+        // terms); the validator itself must not reject it.
+        validate_sparse_terms(&[], MAX_SPARSE_TERMS_PER_DOC, "vector 7")
+            .expect("empty sparse list is legal");
+    }
+
+    /// 融合响应平行数组宽度校验：scores 必须与 ids 等宽，模态数组缺席可容忍、
+    /// 出现时必须等宽。
+    /// EN: Fusion response parallel-array width validation: scores must match
+    /// ids, modality arrays are tolerated when absent but must match when
+    /// present.
+    #[test]
+    fn fusion_response_parity_rejects_misaligned_scores() {
+        let parse = |json: &str| serde_json::from_str::<FusionResponse>(json).expect("wire");
+        parse(r#"{"ids":[1,2],"scores":[1.0,0.5],"dense_scores":[0.1,null],"sparse_scores":[null,9.0]}"#)
+            .validate_parity()
+            .expect("aligned arrays pass");
+        parse(r#"{"ids":[1,2],"scores":[1.0,0.5]}"#)
+            .validate_parity()
+            .expect("absent modality arrays are tolerated");
+        let bad = parse(r#"{"ids":[1,2],"scores":[1.0]}"#);
+        assert!(
+            matches!(bad.validate_parity(), Err(HouyiError::InvalidResponse(_))),
+            "short scores must be rejected"
+        );
+        let bad = parse(r#"{"ids":[1,2],"scores":[1.0,0.5],"dense_scores":[0.1]}"#);
+        assert!(
+            matches!(bad.validate_parity(), Err(HouyiError::InvalidResponse(_))),
+            "short modality array must be rejected"
+        );
+    }
+
+    /// 融合检索：路由、请求体（稀疏对/融合参数）与响应（平行分数组含
+    /// null、fusion 参数块）逐项对齐。
+    /// EN: Fusion search: route, request body (sparse pairs/fusion params), and
+    /// response (parallel score arrays with nulls plus the fusion params block)
+    /// line up item by item.
+    #[test]
+    fn fusion_search_wire_and_response() {
+        let (base, server) = serve_one_request(
+            r#"{"ids":[9,4],"scores":[0.75,0.02],"dense_scores":[0.9,null],"sparse_scores":[null,4.2],"metric":"cosine","fusion":{"mode":"weighted","rrf_k":null,"alpha":0.5},"payloads":{"9":{"text":"nine"}}}"#,
+        );
+        let result = Client::new(&base)
+            .collection("docs")
+            .fusion_search(
+                &[1.0, 0.0],
+                &[(7, 0.5), (8, 0.25)],
+                2,
+                &FusionOptions {
+                    include_payload: true,
+                    fusion: Some("weighted".to_string()),
+                    alpha: Some(0.5),
+                    ..Default::default()
+                },
+            )
+            .expect("fusion");
+        assert_eq!(
+            result.hits.iter().map(|h| h.id).collect::<Vec<_>>(),
+            vec![9, 4]
+        );
+        assert_eq!(result.hits[0].dense_score, Some(0.9));
+        assert_eq!(result.hits[0].sparse_score, None);
+        assert_eq!(result.hits[1].dense_score, None);
+        assert_eq!(result.hits[1].sparse_score, Some(4.2));
+        assert_eq!(
+            result.hits[0]
+                .payload
+                .as_ref()
+                .and_then(|p| p.get("text"))
+                .and_then(|v| v.as_str()),
+            Some("nine")
+        );
+        assert_eq!(result.metric, "cosine");
+        assert_eq!(result.fusion_mode, "weighted");
+        assert_eq!(result.rrf_k, None);
+        assert_eq!(result.alpha, Some(0.5));
+
+        let request = server.join().expect("server thread");
+        assert!(
+            request.starts_with("POST /v1/collections/docs/fusion/search"),
+            "unexpected request line: {request}"
+        );
+        let body: serde_json::Value =
+            serde_json::from_str(request.split_once("\r\n\r\n").expect("body separator").1)
+                .expect("request body is JSON");
+        assert_eq!(body["vector"], serde_json::json!([1.0, 0.0]));
+        assert_eq!(body["sparse"], serde_json::json!([[7, 0.5], [8, 0.25]]));
+        assert_eq!(body["k"], 2);
+        assert_eq!(body["include_payload"], true);
+        assert_eq!(body["fusion"], "weighted");
+        assert_eq!(body["alpha"], 0.5);
+        assert!(
+            body.get("rrf_k").is_none(),
+            "unset rrf_k must omit the wire key: {body}"
+        );
+        assert!(
+            body.get("filters").is_none(),
+            "empty filters must omit the wire key: {body}"
         );
     }
 

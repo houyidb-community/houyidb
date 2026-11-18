@@ -1,18 +1,25 @@
-//! 复制协议 v8 — 纯编解码层（无 IO），全大端字节序（对齐 WAL v2 文件格式）。
-//! Replication protocol v8 — pure codec layer (no IO), big-endian throughout
+//! 复制协议 v9 — 纯编解码层（无 IO），全大端字节序（对齐 WAL v2 文件格式）。
+//! Replication protocol v9 — pure codec layer (no IO), big-endian throughout
 //! (aligned with the WAL v2 on-disk format, eliminating the v1 LE/BE split).
 //! v3 = v2 + ERROR 帧 kind 字节；v4 = v3 + HANDSHAKE 日志前缀指纹（P4.6.1）；
 //! v5 = v4 + HANDSHAKE 认证 token（P4.6.3）；v6 = v5 + follower 保留基线与
 //! 锚点协商（P5.0.4：`log_start_lsn` / `snapshot_checkpoint` / `follower_id`，
 //! ANCHOR/HNDA，`BEHIND_RETAINED`，WELCOME 携带 leader first-available）；
 //! v7 = v6 + `collection_drop`；v8 = v7 + `collection_create` 的 metric/HNSW
-//! 参数语义（线格式不变，版本门只为阻止旧二进制静默按 Cosine 重建）。
+//! 参数语义（线格式不变，版本门只为阻止旧二进制静默按 Cosine 重建）；
+//! v9 = v8 + `collection_create` 的 `vector_dtype`（f16 存储）：v8 二进制解码
+//! 时忽略该字段，follower 会把 f16 集合建成 f32（静默分叉），因此 v8/v9 也
+//! 禁止混跑。降级禁止：v8 二进制重放 v9 WAL 会重新解释 f16 collection 为 f32。
 //! v3 = v2 + ERROR kind byte; v4 = v3 + log-prefix fingerprint (P4.6.1);
 //! v5 = v4 + shared-secret auth token in HANDSHAKE (P4.6.3); v6 = v5 +
 //! follower retention baseline and anchor negotiation (P5.0.4);
 //! v7 = v6 + `collection_drop`; v8 = v7 + metric/HNSW parameters carried by
 //! `collection_create` records (wire format unchanged; the gate only stops old
-//! binaries from silently rebuilding collections with Cosine).
+//! binaries from silently rebuilding collections with Cosine); v9 = v8 +
+//! `vector_dtype` (f16 storage) in `collection_create`. A v8 binary ignores the
+//! new field and builds f16 collections as f32 (silent divergence), so v8/v9
+//! must not be mixed either. Downgrade is forbidden: a v8 binary replaying a
+//! v9 WAL reinterprets f16 collections as f32.
 //!
 //! 帧布局 / Frame layouts:
 //! ```text
@@ -69,6 +76,9 @@ use std::io;
 /// （P5.1）：线格式未变，但 v7 二进制解码时忽略未知字段，follower 会按
 /// 默认 Cosine 建集合——全是静默分叉，因此 v7/v8 同样禁止混跑（协调式升级）。
 /// 降级限制：v7 二进制重放 v8 WAL 会把非 Cosine 集合建成 Cosine，禁止。
+/// v9 = v8 + `collection_create` 信封新增 `vector_dtype`（f16 存储，P1）：
+/// 同理，v8 二进制忽略该字段会把 f16 集合建成 f32——静默分叉，v8/v9 禁止
+/// 混跑；v8 二进制重放 v9 WAL 会把 f16 collection 重新解释为 f32，禁止降级。
 /// EN: v3 = v2 + kind byte in ERROR frames. v4 = v3 + log-prefix fingerprint
 /// (P4.6.1). v5 = v4 + auth token (P4.6.3). v6 = v5 + retention baseline and
 /// anchor negotiation (P5.0.4). v7 = v6 + `collection_drop` semantics: the wire
@@ -84,7 +94,41 @@ use std::io;
 /// Cosine metric — silent divergence again, so v7/v8 must not be mixed either
 /// (coordinated upgrade). A v7 binary replaying a v8 WAL would recreate
 /// non-Cosine collections as Cosine — downgrade is forbidden.
-pub const REPL_PROTOCOL_VERSION: u32 = 8;
+/// v9 = v8 + optional `vector_dtype` (f16 storage) in `collection_create`.
+/// The same silent-divergence rule applies: a v8 binary ignores the field and
+/// builds f16 collections as f32, so v8/v9 must not be mixed, and a v8 binary
+/// replaying a v9 WAL reinterprets f16 collections as f32 — downgrade forbidden.
+/// v10 = v9 + optional `quantization` (graph-side int8) in `collection_create`：
+/// 同理，v9 二进制忽略该字段会把 int8 集合建成未量化图——静默分叉，v9/v10
+/// 禁止混跑（握手精确等值）；v9 二进制重放 v10 WAL 会把 int8 collection 建回
+/// 未量化图，禁止降级。
+/// EN: v10 = v9 + optional `quantization` (graph-side int8) in
+/// `collection_create`. Same rule: a v9 binary ignores the field and builds int8
+/// collections unquantized — silent divergence, so v9/v10 must not be mixed
+/// (handshake requires exact equality), and a v9 binary replaying a v10 WAL
+/// rebuilds int8 collections unquantized — downgrade forbidden.
+/// v11 = v10 + `rabitq` in the `quantization` value domain（P3）：v10 二进制
+/// 会把 rabitq 串判为非规范值并在重放时 fail-fast（而不是静默降级），但为了
+/// 让「旧二进制 + 新 WAL」在握手阶段就干净拒绝，v10/v11 禁止混跑，v10 及更
+/// 早二进制重放 v11 WAL 属于禁止降级。
+/// EN: v11 = v10 + `rabitq` in the `quantization` value domain (P3). A v10
+/// binary treats the rabitq string as non-canonical and fails fast during replay
+/// (it never silently downgrades), but the handshake gate must reject "old
+/// binary + new WAL" up front, so v10/v11 must not be mixed and replaying a
+/// v11 WAL on v10 or older binaries is a forbidden downgrade.
+/// v12 = v11 + 稀疏字段（`collection_create.sparse` 与每个 upsert 条目的可选
+/// `sparse`，P4）。这些字段是加法式可选字段：旧二进制解码时会静默忽略，
+/// 尚无快照时稀疏数据会静默丢失；握手精确等值因此是唯一硬门——v11 及更早
+/// 二进制不得与 v12 混跑，重放 v12 WAL 属于禁止降级。严格拒绝还存在于
+/// 快照 v3 / 清单 format 4 一侧。
+/// EN: v12 = v11 + sparse fields (`collection_create.sparse` and the optional
+/// per-item `sparse` on every upsert, P4). These are additive optional fields:
+/// old binaries silently ignore them on decode, so sparse data is silently lost
+/// until a snapshot exists. The exact-equality handshake is therefore the only
+/// hard gate — v11 and older binaries must not be mixed with v12, and replaying
+/// a v12 WAL is a forbidden downgrade. Strict rejection also lives on the
+/// snapshot-v3 / manifest-format-4 side.
+pub const REPL_PROTOCOL_VERSION: u32 = 12;
 
 /// 流标识：collections.wal（v1 唯一流）。
 /// EN: Stream id: collections.wal (the only v1 stream).
@@ -1119,7 +1163,13 @@ mod tests {
         // v7 = v6 + `collection_drop` 语义（线格式不变，版本门只为阻止旧二进制
         //      静默跳过 drop 导致 follower 保留已删集合）；
         // v8 = v7 + `collection_create` 的 metric/HNSW 参数（版本门阻止旧二进制
-        //      静默按 Cosine 重建，v7/v8 同样禁止混跑）。
+        //      静默按 Cosine 重建，v7/v8 同样禁止混跑）；
+        // v9 = v8 + `vector_dtype`（f16 存储，版本门阻止旧二进制按 f32 重建）；
+        // v10 = v9 + `quantization`（图侧 int8，版本门阻止旧二进制建回未量化图）；
+        // v11 = v10 + `quantization` 取值域新增 rabitq（版本门阻止旧二进制与
+        //       rabitq WAL 混跑，禁止降级）；
+        // v12 = v11 + 稀疏字段（create.sparse / upsert item.sparse，加法式可选
+        //       字段在旧二进制上会被静默忽略，握手版本门是唯一硬门）。
         // 版本号变动必须显式改测试；协议不做跨版本兼容。
         // EN: Pin the version: any wire-format change must bump it.
         // v3 = v2 + ERROR kind byte; v4 = v3 + log-prefix fingerprint;
@@ -1127,9 +1177,17 @@ mod tests {
         // v7 = v6 + `collection_drop` semantics (wire format unchanged; the gate only
         // blocks old binaries from silently skipping drop and retaining the collection);
         // v8 = v7 + metric/HNSW params in `collection_create` (the gate stops old
-        // binaries from silently rebuilding with Cosine; no mixed v7/v8 either).
+        // binaries from silently rebuilding with Cosine; no mixed v7/v8 either);
+        // v9 = v8 + `vector_dtype` (f16; the gate stops old binaries rebuilding as f32);
+        // v10 = v9 + `quantization` (graph-side int8; the gate stops old binaries
+        // from rebuilding an unquantized graph);
+        // v11 = v10 + rabitq in the `quantization` value domain (the gate stops old
+        // binaries from mixing with a rabitq WAL; downgrade forbidden);
+        // v12 = v11 + sparse fields (create.sparse / upsert item.sparse; additive
+        // optional fields are silently ignored by old binaries, so the handshake
+        // version gate is the only hard stop).
         // Version changes must explicitly touch the test; the protocol is not
         // cross-version compatible.
-        assert_eq!(REPL_PROTOCOL_VERSION, 8);
+        assert_eq!(REPL_PROTOCOL_VERSION, 12);
     }
 }

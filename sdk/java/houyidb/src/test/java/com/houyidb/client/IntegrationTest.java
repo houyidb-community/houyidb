@@ -19,6 +19,7 @@ package com.houyidb.client;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.junit.jupiter.api.Assumptions.assumeTrue;
@@ -27,10 +28,14 @@ import com.houyidb.client.Types.CreateCollectionOptions;
 import com.houyidb.client.Types.CreateCollectionResult;
 import com.houyidb.client.Types.Filter;
 import com.houyidb.client.Types.FilterOp;
+import com.houyidb.client.Types.FusionHit;
+import com.houyidb.client.Types.FusionOptions;
+import com.houyidb.client.Types.FusionResult;
 import com.houyidb.client.Types.HnswParams;
 import com.houyidb.client.Types.SearchHit;
 import com.houyidb.client.Types.SearchOptions;
 import com.houyidb.client.Types.SearchResult;
+import com.houyidb.client.Types.SparseTerm;
 import com.houyidb.client.Types.Vector;
 import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
@@ -257,6 +262,87 @@ class IntegrationTest {
     }
 
     /**
+     * 显式建 f16 + int8 hnsw 集合：vector_dtype/quantization 透传、响应回显、
+     * status 可观测。
+     * EN: Explicitly creates an f16 + int8 hnsw collection: vector_dtype and
+     * quantization are forwarded, echoed in the response, and observable via
+     * status.
+     */
+    @Test
+    void createCollectionF16Int8RoundTrip() throws Exception {
+        String name = "java_it_f16_int8";
+        try {
+            client.deleteCollection(name);
+        } catch (HouyiException e) {
+            // 不存在（404）或启用了鉴权（401/403）：无需清理。
+            // EN: missing (404) or auth enabled (401/403): nothing to clean up.
+            assertTrue(e.statusCode() == 404 || e.statusCode() == 401 || e.statusCode() == 403,
+                    "cleanup delete must succeed or be 404/401/403");
+        }
+
+        CreateCollectionResult created = client.createCollection(name, TEST_DIMS,
+                new CreateCollectionOptions()
+                        .metric("l2")
+                        .indexType("hnsw")
+                        .vectorDtype("f16")
+                        .quantization("int8")
+                        .hnsw(new HnswParams(16, 100, 32)));
+        assertEquals("f16", created.vectorDtype);
+        assertEquals("int8", created.quantization);
+        assertEquals("hnsw", created.indexType);
+
+        var status = client.collection(name).status();
+        assertEquals("f16", status.get("vector_dtype").asText());
+        assertEquals("int8", status.get("quantization").asText());
+
+        client.deleteCollection(name);
+    }
+
+    /**
+     * 显式建 rabitq（l2/cosine-only）hnsw 集合：请求透传、响应与 status 回显；
+     * ip 组合返回 400。
+     * EN: Explicitly creates a rabitq (l2/cosine-only) hnsw collection: the
+     * request is forwarded, the response and status echo it, and the ip
+     * combination returns 400.
+     */
+    @Test
+    void createCollectionRabitqRoundTrip() throws Exception {
+        String name = "java_it_rabitq";
+        try {
+            client.deleteCollection(name);
+        } catch (HouyiException e) {
+            // 不存在（404）或启用了鉴权（401/403）：无需清理。
+            // EN: missing (404) or auth enabled (401/403): nothing to clean up.
+            assertTrue(e.statusCode() == 404 || e.statusCode() == 401 || e.statusCode() == 403,
+                    "cleanup delete must succeed or be 404/401/403");
+        }
+
+        CreateCollectionResult created = client.createCollection(name, TEST_DIMS,
+                new CreateCollectionOptions()
+                        .metric("cosine")
+                        .indexType("hnsw")
+                        .vectorDtype("f32")
+                        .quantization("rabitq")
+                        .hnsw(new HnswParams(16, 100, 32)));
+        assertEquals("cosine", created.metric);
+        assertEquals("hnsw", created.indexType);
+        assertEquals("rabitq", created.quantization);
+
+        var status = client.collection(name).status();
+        assertEquals("rabitq", status.get("quantization").asText());
+
+        HouyiException bad = assertThrows(HouyiException.class,
+                () -> client.createCollection(name + "_ip", TEST_DIMS,
+                        new CreateCollectionOptions()
+                                .metric("ip")
+                                .indexType("hnsw")
+                                .quantization("rabitq")));
+        assertEquals(400, bad.statusCode());
+
+        client.deleteCollection(name);
+    }
+
+    /**
      * 删除整库后 404；同名重建得到空 collection。
      * EN: Drops a whole collection (404 afterwards) and expects a same-name
      * recreate to start empty.
@@ -289,5 +375,116 @@ class IntegrationTest {
         HouyiException ex = assertThrows(HouyiException.class,
                 () -> client.deleteCollection("java_it_admin_never_created"));
         assertEquals(404, ex.statusCode());
+    }
+
+    /**
+     * bm25 建集合 → 带稀疏 upsert → 融合检索（RRF/加权回显）→ sparse=[] 清空
+     * 后仅剩稠密分。
+     * EN: Creates a bm25 collection, upserts with sparse terms, runs a fusion
+     * search (RRF/weighted echoes), and verifies that clearing with sparse=[]
+     * leaves the document with a dense score only.
+     */
+    @Test
+    void sparseCreateAndFusionSearch() throws Exception {
+        String name = "java_it_fusion";
+        try {
+            client.deleteCollection(name);
+        } catch (HouyiException e) {
+            // 不存在（404）或启用了鉴权（401/403）：无需清理。
+            // EN: missing (404) or auth enabled (401/403): nothing to clean up.
+            assertTrue(e.statusCode() == 404 || e.statusCode() == 401 || e.statusCode() == 403,
+                    "cleanup delete must succeed or be 404/401/403");
+        }
+
+        CreateCollectionResult created = client.createCollection(name, TEST_DIMS,
+                new CreateCollectionOptions().indexType("flat").sparse("bm25"));
+        assertEquals("bm25", created.sparse);
+        assertEquals("flat", created.indexType);
+
+        HouyiClient.Collection col = client.collection(name);
+        col.upsert(List.of(
+                new Vector(1, fakeEmbed("apple"), null, Map.of("text", "apple"),
+                        List.of(new SparseTerm(7, 1.0), new SparseTerm(8, 0.5))),
+                new Vector(2, fakeEmbed("banana"), null, Map.of("text", "banana"),
+                        List.of(new SparseTerm(8, 1.0))),
+                new Vector(3, fakeEmbed("cherry"), null, Map.of("text", "cherry"),
+                        List.of(new SparseTerm(9, 1.0)))));
+        waitFlushed(col);
+
+        FusionResult result = col.fusionSearch(fakeEmbed("apple"),
+                List.of(new SparseTerm(7, 1.0), new SparseTerm(8, 0.5)), 2,
+                new FusionOptions().includePayload(true));
+        assertFalse(result.hits.isEmpty(), "fusion must return hits");
+        FusionHit top = result.hits.get(0);
+        assertEquals(1, top.id);
+        assertEquals("rrf", result.fusionMode);
+        assertEquals(60, result.rrfK);
+        assertNull(result.alpha, "rrf must not echo alpha");
+        assertNotNull(top.denseScore, "both-modality hit must carry a dense score");
+        assertNotNull(top.sparseScore, "both-modality hit must carry a sparse score");
+        assertEquals("apple", top.payload.get("text"));
+        assertEquals("cosine", result.metric, "flat default metric");
+
+        FusionResult weighted = col.fusionSearch(fakeEmbed("apple"),
+                List.of(new SparseTerm(7, 1.0)), 2,
+                new FusionOptions().fusion("weighted").alpha(0.25));
+        assertEquals("weighted", weighted.fusionMode);
+        assertEquals(0.25, weighted.alpha);
+        assertNull(weighted.rrfK, "weighted must not echo rrf_k");
+
+        // sparse=[] 清空该文档词项（null 才是「不改」）；清空后仅剩稠密分。
+        // EN: sparse=[] clears this document's terms (null means "unchanged");
+        // afterwards only the dense score remains.
+        col.upsert(List.of(new Vector(1, fakeEmbed("apple"), null,
+                Map.of("text", "apple"), List.of())));
+        waitFlushed(col);
+        FusionResult cleared = col.fusionSearch(fakeEmbed("apple"),
+                List.of(new SparseTerm(8, 1.0)), 3, null);
+        FusionHit cleared1 = null;
+        for (FusionHit hit : cleared.hits) {
+            if (hit.id == 1) {
+                cleared1 = hit;
+            }
+        }
+        assertNotNull(cleared1, "cleared doc must stay reachable via the dense path");
+        assertNotNull(cleared1.denseScore);
+        assertNull(cleared1.sparseScore, "cleared doc must have no sparse score");
+
+        client.deleteCollection(name);
+    }
+
+    /**
+     * bm25 仅 hnsw/flat（clustered 组合 400）；隐式创建的 none 集合上融合检索 400。
+     * EN: bm25 is hnsw/flat-only (a clustered combo is 400); fusion search on an
+     * implicitly created none collection is 400.
+     */
+    @Test
+    void sparseCreateGuards() throws Exception {
+        String badName = "java_it_sparse_clustered";
+        String implicitName = "java_it_sparse_implicit";
+        for (String name : List.of(badName, implicitName)) {
+            try {
+                client.deleteCollection(name);
+            } catch (HouyiException e) {
+                assertTrue(e.statusCode() == 404 || e.statusCode() == 401
+                        || e.statusCode() == 403, "cleanup delete must succeed or be 404/401/403");
+            }
+        }
+
+        HouyiException bad = assertThrows(HouyiException.class,
+                () -> client.createCollection(badName, TEST_DIMS,
+                        new CreateCollectionOptions().indexType("clustered").sparse("bm25")));
+        assertEquals(400, bad.statusCode(), "clustered+bm25 must be rejected");
+
+        // 隐式创建恒为 none：融合检索被拒（400）。
+        // EN: implicit creation is always none, so fusion search is rejected (400).
+        client.collection(implicitName)
+                .upsert(List.of(new Vector(1, fakeEmbed("implicit none"), Map.of())));
+        HouyiException fusionErr = assertThrows(HouyiException.class,
+                () -> client.collection(implicitName).fusionSearch(fakeEmbed("implicit none"),
+                        List.of(new SparseTerm(1, 1.0)), 1, null));
+        assertEquals(400, fusionErr.statusCode());
+
+        client.deleteCollection(implicitName);
     }
 }

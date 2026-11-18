@@ -56,6 +56,22 @@ export function parseSearchResponse(raw: string): {
    * callers judge whether out-of-range l2/l1/ip scores are legitimate (OCR #30).
    */
   metric?: string;
+  /**
+   * 融合响应的两路平行分数组（与 ids 对齐，缺席模态为 null）。
+   * EN: The fusion response's parallel modality score arrays (aligned with
+   * ids; null for an absent modality).
+   */
+  dense_scores?: Array<number | null>;
+  sparse_scores?: Array<number | null>;
+  /**
+   * 融合参数回显块（缺省或旧服务端可能省略）。
+   * EN: The fusion parameter echo block (may be absent from older servers).
+   */
+  fusion?: {
+    mode?: string;
+    rrf_k?: number | null;
+    alpha?: number | null;
+  };
 } {
   const guarded = raw.replace(
     /("ids"\s*:\s*\[)([^\]]*)/,

@@ -7,10 +7,14 @@ import com.fasterxml.jackson.databind.node.ObjectNode;
 import com.houyidb.client.Types.CreateCollectionOptions;
 import com.houyidb.client.Types.CreateCollectionResult;
 import com.houyidb.client.Types.Filter;
+import com.houyidb.client.Types.FusionHit;
+import com.houyidb.client.Types.FusionOptions;
+import com.houyidb.client.Types.FusionResult;
 import com.houyidb.client.Types.HnswParams;
 import com.houyidb.client.Types.SearchHit;
 import com.houyidb.client.Types.SearchOptions;
 import com.houyidb.client.Types.SearchResult;
+import com.houyidb.client.Types.SparseTerm;
 import com.houyidb.client.Types.Vector;
 import java.io.IOException;
 import java.io.UncheckedIOException;
@@ -41,6 +45,13 @@ public final class HouyiClient {
 
     private static final Duration DEFAULT_TIMEOUT = Duration.ofSeconds(30);
     private static final ObjectMapper MAPPER = new ObjectMapper();
+    // 稀疏词项上限与服务端同口径：id ∈ [1, 2^24-1]，权重有限且 > 0；
+    // 写路径每文档 ≤1024 条、查询 ≤64 条。
+    // EN: Sparse term bounds match the server: id in [1, 2^24-1], weight finite
+    // and > 0; at most 1024 pairs per document on writes and 64 per query.
+    private static final int MAX_SPARSE_TERM_ID = (1 << 24) - 1;
+    private static final int MAX_SPARSE_TERMS_PER_DOC = 1024;
+    private static final int MAX_SPARSE_QUERY_TERMS = 64;
 
     private final HttpClient http;
     private final Duration timeout;
@@ -151,6 +162,9 @@ public final class HouyiClient {
         if (options != null) {
             if (options.metric != null) body.put("metric", options.metric);
             if (options.indexType != null) body.put("index_type", options.indexType);
+            if (options.vectorDtype != null) body.put("vector_dtype", options.vectorDtype);
+            if (options.quantization != null) body.put("quantization", options.quantization);
+            if (options.sparse != null) body.put("sparse", options.sparse);
             if (options.hnsw != null) {
                 body.put("hnsw_m", options.hnsw.m);
                 body.put("hnsw_ef_construction", options.hnsw.efConstruction);
@@ -166,12 +180,29 @@ public final class HouyiClient {
                 hnsw.get("m").asInt(),
                 hnsw.get("ef_construction").asInt(),
                 hnsw.get("ef_search").asInt());
+        // vector_dtype 旧服务端可能缺省：保持 null，不伪造 f32。
+        // EN: older servers may omit vector_dtype: keep null and never fake f32.
+        JsonNode vectorDtype = resp.get("vector_dtype");
+        String vectorDtypeText =
+                vectorDtype == null || vectorDtype.isNull() ? null : vectorDtype.asText();
+        // quantization 旧服务端可能缺省：保持 null，不伪造 none。
+        // EN: older servers may omit quantization: keep null and never fake none.
+        JsonNode quantization = resp.get("quantization");
+        String quantizationText =
+                quantization == null || quantization.isNull() ? null : quantization.asText();
+        // sparse 旧服务端可能缺省：保持 null，不伪造 none。
+        // EN: older servers may omit sparse: keep null and never fake none.
+        JsonNode sparse = resp.get("sparse");
+        String sparseText = sparse == null || sparse.isNull() ? null : sparse.asText();
         return new CreateCollectionResult(
                 resp.get("created").asBoolean(),
                 resp.get("collection").asText(),
                 resp.get("dims").asInt(),
                 resp.get("metric").asText(),
                 resp.get("index_type").asText(),
+                vectorDtypeText,
+                quantizationText,
+                sparseText,
                 hnswParams);
     }
 
@@ -243,6 +274,38 @@ public final class HouyiClient {
         }
     }
 
+    /**
+     * 预校验稀疏词项：写路径与融合查询共用同一诊断，避免发出必然 400 的请求。
+     * {@code maxTerms} 按用途给出（写 1024 / 查询 64）；null 列表只在写路径
+     * 合法（表示不改），由调用方先处理。
+     *
+     * EN: Pre-validates sparse terms; the write and fusion-query paths share the
+     * same diagnostics so a request that would surely 400 never goes out.
+     * {@code maxTerms} depends on the use (1024 for writes / 64 for queries);
+     * a null list is only legal on the write path (meaning unchanged) and is
+     * handled by the caller first.
+     */
+    private static void validateSparseTerms(List<SparseTerm> terms, int maxTerms) {
+        if (terms.size() > maxTerms) {
+            throw new IllegalArgumentException(
+                    "sparse term count " + terms.size() + " exceeds the limit " + maxTerms);
+        }
+        for (SparseTerm term : terms) {
+            if (term == null) {
+                throw new IllegalArgumentException(
+                        "sparse term list must not contain null entries");
+            }
+            if (term.term() < 1 || term.term() > MAX_SPARSE_TERM_ID) {
+                throw new IllegalArgumentException("sparse term id " + term.term()
+                        + " out of range [1, " + MAX_SPARSE_TERM_ID + "]");
+            }
+            if (!Double.isFinite(term.weight()) || term.weight() <= 0) {
+                throw new IllegalArgumentException(
+                        "sparse term weight must be finite and > 0: " + term.weight());
+            }
+        }
+    }
+
     private static ObjectNode vectorNode(Vector v) {
         ObjectNode node = MAPPER.createObjectNode();
         node.put("id", v.id);
@@ -250,6 +313,18 @@ public final class HouyiClient {
         for (double x : v.values) values.add(x);
         if (v.label != null) node.put("label", v.label);
         if (v.payload != null) node.set("payload", MAPPER.valueToTree(v.payload));
+        // null 省略该键（不改）；非 null（含空列表）输出数组，空数组即清空。
+        // EN: null omits the key (unchanged); non-null (including an empty list)
+        // emits an array, and an empty array clears the terms.
+        if (v.sparse != null) {
+            validateSparseTerms(v.sparse, MAX_SPARSE_TERMS_PER_DOC);
+            ArrayNode sparse = node.putArray("sparse");
+            for (SparseTerm term : v.sparse) {
+                ArrayNode pair = sparse.addArray();
+                pair.add(term.term());
+                pair.add(term.weight());
+            }
+        }
         return node;
     }
 
@@ -341,6 +416,52 @@ public final class HouyiClient {
             return postSearch(base + "/hybrid/search", vector, k, options, true);
         }
 
+        /**
+         * dense + sparse 融合检索（RRF 或加权；集合须为 sparse=bm25）。
+         *
+         * 融合分只表达排序（不是任何度量口径）；每命中的 denseScore 按集合度量
+         * 换算、sparseScore 为 BM25 原始分，某一路未命中时为 null。
+         * EN: Dense + sparse fusion search (RRF or weighted; the collection must
+         * be sparse=bm25). The fused score expresses ranking only (no metric
+         * semantics); each hit's denseScore follows the collection metric and
+         * sparseScore is the raw BM25 score, null when that modality missed.
+         */
+        public FusionResult fusionSearch(double[] vector, List<SparseTerm> sparse, int k,
+                FusionOptions options) throws IOException, HouyiException {
+            // 融合检索要求稀疏词项非空；在客户端先拒绝，避免发出必然 400 的请求。
+            // EN: Fusion search requires a non-empty sparse term list; reject
+            // client-side instead of sending a request that would surely 400.
+            if (sparse == null || sparse.isEmpty()) {
+                throw new IllegalArgumentException(
+                        "fusionSearch requires a non-empty sparse term list");
+            }
+            validateSparseTerms(sparse, MAX_SPARSE_QUERY_TERMS);
+            ObjectNode body = MAPPER.createObjectNode();
+            ArrayNode values = body.putArray("vector");
+            for (double x : vector) values.add(x);
+            ArrayNode sparseTerms = body.putArray("sparse");
+            for (SparseTerm term : sparse) {
+                ArrayNode pair = sparseTerms.addArray();
+                pair.add(term.term());
+                pair.add(term.weight());
+            }
+            body.put("k", k);
+            if (options != null) {
+                if (!options.filters.isEmpty()) putFilters(body, options.filters);
+                if (options.efSearch != null) body.put("ef_search", options.efSearch);
+                if (options.includePayload) body.put("include_payload", true);
+                if (options.fusion != null) body.put("fusion", options.fusion);
+                if (options.rrfK != null) body.put("rrf_k", options.rrfK);
+                if (options.alpha != null) body.put("alpha", options.alpha);
+            }
+            return toFusionResult(client.postJson(base + "/fusion/search", body));
+        }
+
+        private static void putFilters(ObjectNode body, List<Filter> filters) {
+            ArrayNode arr = body.putArray("filters");
+            for (Filter f : filters) arr.add(filterNode(f));
+        }
+
         private SearchResult postSearch(String url, double[] vector, int k,
                 SearchOptions options, boolean hybrid) throws IOException, HouyiException {
             ObjectNode body = MAPPER.createObjectNode();
@@ -348,8 +469,7 @@ public final class HouyiClient {
             for (double x : vector) values.add(x);
             body.put("k", k);
             if (hybrid && options != null && !options.filters.isEmpty()) {
-                ArrayNode filters = body.putArray("filters");
-                for (Filter f : options.filters) filters.add(filterNode(f));
+                putFilters(body, options.filters);
             }
             if (options != null && options.efSearch != null) {
                 body.put("ef_search", options.efSearch);
@@ -373,9 +493,10 @@ public final class HouyiClient {
             JsonNode scores = body.get("scores");
             JsonNode payloads = body.get("payloads");
             List<SearchHit> hits = new ArrayList<>();
-            if (ids != null && ids.isArray()) {
-                for (int i = 0; i < ids.size(); i++) {
-                    long id = ids.get(i).asLong();
+            int idCount = checkedIdCount("search", ids);
+            if (idCount > 0) {
+                for (int i = 0; i < idCount; i++) {
+                    long id = checkedIdAt("search", ids, i);
                     double score = scores != null && i < scores.size() ? scores.get(i).asDouble() : 0.0;
                     Map<String, Object> payload = null;
                     if (payloads != null && payloads.has(Long.toString(id))) {
@@ -385,6 +506,174 @@ public final class HouyiClient {
                 }
             }
             return new SearchResult(hits);
+        }
+
+        /**
+         * 融合响应 wire 形状：ids/scores 平行数组 + dense_scores/sparse_scores
+         * 平行分数组（缺席模态为 JSON null）+ metric + fusion 参数块 + 可选
+         * payloads。可选字段缺席时按 null 容忍（旧服务端/精简响应）。
+         * EN: Fusion wire shape: parallel ids/scores arrays plus the parallel
+         * dense_scores/sparse_scores arrays (JSON null for an absent modality),
+         * metric, the fusion params block, and optional payloads. Absent optional
+         * fields fall back to null (older servers / slim responses).
+         */
+        @SuppressWarnings("unchecked")
+        private static FusionResult toFusionResult(JsonNode body) {
+            JsonNode ids = body.get("ids");
+            JsonNode scores = body.get("scores");
+            JsonNode denseScores = body.get("dense_scores");
+            JsonNode sparseScores = body.get("sparse_scores");
+            JsonNode payloads = body.get("payloads");
+            int idCount = checkedIdCount("fusion", ids);
+            // 融合分是排序键：宽度错位说明响应被截断/损坏，按协议违反显式失败，
+            // 不能伪造成 0.0 让命中静默错排；同样，「存在但不是数组」也按腐坏
+            // 拒绝，不能当作缺席吞掉。模态数组缺席容忍、出现时必须等宽。
+            // EN: Fused scores are the ranking key; misaligned widths mean a
+            // truncated/corrupt response, so fail explicitly as a protocol
+            // violation instead of fabricating 0.0 and silently misordering.
+            // Likewise a present-but-non-array value is rejected as corruption
+            // rather than swallowed as absent. Modality arrays are tolerated
+            // when absent but must match when present.
+            int scoreCount = 0;
+            if (scores != null && !scores.isNull()) {
+                if (!scores.isArray()) {
+                    throw new IllegalStateException(
+                            "fusion response scores must be a JSON array");
+                }
+                scoreCount = scores.size();
+            }
+            if (scoreCount != idCount) {
+                throw new IllegalStateException("fusion response scores has " + scoreCount
+                        + " entries for " + idCount + " ids");
+            }
+            checkOptionalWidth("dense_scores", denseScores, idCount);
+            checkOptionalWidth("sparse_scores", sparseScores, idCount);
+            List<FusionHit> hits = new ArrayList<>();
+            if (idCount > 0) {
+                for (int i = 0; i < idCount; i++) {
+                    long id = checkedIdAt("fusion", ids, i);
+                    // asDouble() 会把 null/对象/文本静默转成 0.0；排序键必须先验
+                    // 数值类型，否则腐坏响应会被伪造成合法分数。
+                    // EN: asDouble() silently turns null/objects/text into 0.0;
+                    // the ranking key must be type-checked first, otherwise a
+                    // corrupt response is fabricated into a legal score.
+                    if (!scores.get(i).isNumber()) {
+                        throw new IllegalStateException("fusion response scores element "
+                                + i + " is not a number");
+                    }
+                    double score = scores.get(i).asDouble();
+                    Double denseScore = optionalScore("dense_scores", denseScores, i);
+                    Double sparseScore = optionalScore("sparse_scores", sparseScores, i);
+                    Map<String, Object> payload = null;
+                    if (payloads != null && payloads.has(Long.toString(id))) {
+                        payload = MAPPER.convertValue(payloads.get(Long.toString(id)), Map.class);
+                    }
+                    hits.add(new FusionHit(id, score, denseScore, sparseScore, payload));
+                }
+            }
+            JsonNode fusion = body.get("fusion");
+            JsonNode metric = body.get("metric");
+            return new FusionResult(
+                    hits,
+                    metric == null || metric.isNull() ? null : metric.asText(),
+                    fusion == null || fusion.isNull() ? null : optionalText(fusion.get("mode")),
+                    // 数值缺席（JSON null 或缺键）一律回 null，不伪造默认值。
+                    // EN: absent numbers (JSON null or missing key) become null;
+                    // never fake a default.
+                    optionalInt(fusion, "rrf_k"),
+                    optionalDouble(fusion, "alpha"));
+        }
+
+        /**
+         * ids 平行数组宽度：缺键/JSON null 视为空结果；存在但非数组按协议腐坏
+         * 拒绝，不能当成空结果静默吞掉（与 scores 的类型硬化对称）。
+         * EN: Width of the parallel ids array: a missing key / JSON null counts as
+         * an empty result; a present-but-non-array value is rejected as protocol
+         * corruption instead of being silently swallowed as empty (symmetric
+         * with the scores type hardening).
+         */
+        private static int checkedIdCount(String responseName, JsonNode ids) {
+            if (ids == null || ids.isNull()) {
+                return 0;
+            }
+            if (!ids.isArray()) {
+                throw new IllegalStateException(
+                        responseName + " response ids must be a JSON array");
+            }
+            return ids.size();
+        }
+
+        /**
+         * ids 元素必须是落在 [0, 2^63-1] 的 JSON 整数：asLong() 对文本/null 静默
+         * 给 0，对超出 long 的 BigInteger 会静默截断，两者都会伪造命中 id。
+         * EN: An ids element must be a JSON integer in [0, 2^63-1]: asLong()
+         * silently yields 0 for text/null and silently truncates a BigInteger
+         * beyond long, both fabricating a hit id.
+         */
+        private static long checkedIdAt(String responseName, JsonNode ids, int index) {
+            JsonNode node = ids.get(index);
+            if (!node.isIntegralNumber() || !node.canConvertToLong()) {
+                throw new IllegalStateException(responseName + " response ids element "
+                        + index + " is not a 64-bit signed integer");
+            }
+            long value = node.asLong();
+            if (value < 0) {
+                throw new IllegalStateException(responseName + " response ids element "
+                        + index + " is negative (ids fall in [0, 2^63-1])");
+            }
+            return value;
+        }
+
+        /**
+         * 模态分数组缺席（缺键/JSON null/空数组）容忍；出现时必须与 ids 等宽。
+         * EN: A modality score array is tolerated when absent (missing key, JSON
+         * null, or empty array) but must match the ids width when present.
+         */
+        private static void checkOptionalWidth(String name, JsonNode array, int idCount) {
+            if (array == null || array.isNull()) {
+                return;
+            }
+            if (!array.isArray()) {
+                throw new IllegalStateException(
+                        "fusion response " + name + " must be a JSON array");
+            }
+            int count = array.size();
+            if (count != 0 && count != idCount) {
+                throw new IllegalStateException("fusion response " + name + " has " + count
+                        + " entries for " + idCount + " ids");
+            }
+        }
+
+        private static Double optionalScore(String name, JsonNode scores, int index) {
+            if (scores == null || !scores.isArray() || index >= scores.size()) {
+                return null;
+            }
+            JsonNode node = scores.get(index);
+            if (node.isNull()) {
+                return null;
+            }
+            // 数值类型先验：asDouble() 对对象/文本会静默给 0.0，伪造模态分。
+            // EN: Check the numeric type first: asDouble() silently yields 0.0
+            // for objects/text, fabricating a modality score.
+            if (!node.isNumber()) {
+                throw new IllegalStateException("fusion response " + name + " element "
+                        + index + " is not a number");
+            }
+            return node.asDouble();
+        }
+
+        private static String optionalText(JsonNode node) {
+            return node == null || node.isNull() ? null : node.asText();
+        }
+
+        private static Integer optionalInt(JsonNode node, String field) {
+            JsonNode value = node == null || node.isNull() ? null : node.get(field);
+            return value == null || value.isNull() ? null : value.asInt();
+        }
+
+        private static Double optionalDouble(JsonNode node, String field) {
+            JsonNode value = node == null || node.isNull() ? null : node.get(field);
+            return value == null || value.isNull() ? null : value.asDouble();
         }
 
         /**

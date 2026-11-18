@@ -393,6 +393,72 @@ async fn duplicate_mask_ids_do_not_duplicate_results() {
 const HNSW_RECALL_MIN: f32 = 0.95;
 const HNSW_PREFIX_OVERLAP_MIN: f32 = 0.80;
 const HNSW_NOISE_JACCARD_MIN: f32 = 0.70;
+/// level-0 可达率下限，口径与 `tests/common/clustered_recall.rs` 的
+/// `REACHABLE_MIN_RATIO` 一致；该模块未被本文件引入（会额外编译整套语料
+/// 生成器），因此用本地常量显式标注耦合，调整任一处必须同时调整另一处。
+/// EN: Level-0 reachability floor, matching `tests/common/clustered_recall.rs`'s
+/// `REACHABLE_MIN_RATIO`. That module is not pulled in here (it would compile
+/// the whole corpus generator), so this local constant names the coupling
+/// explicitly — tuning one requires tuning the other.
+const GRAPH_REACHABLE_MIN_RATIO: f64 = 0.95;
+
+/// 图健康门禁：level-0 从入口点 BFS 的可达率 ≥95%，且不存在 L0 度 0 的存活
+/// 节点。召回均值会掩盖整簇不可达（4653 事故时 L0 可达率已跌到 48% 才开始
+/// 报警）；这两条不变量让结构断裂在召回数字崩塌之前暴露，口径与
+/// `tests/common/clustered_recall.rs` 的 `REACHABLE_MIN_RATIO` 一致。
+/// EN: Graph-health gate: level-0 reachability from the entry point >= 95% and
+/// no live node with L0 degree 0. Recall averages hide whole-cluster islands
+/// (the 4653 incident was already at 48% reachability before recall alarms
+/// fired); these invariants expose structural breaks before the recall number
+/// collapses, matching `tests/common/clustered_recall.rs`.
+fn assert_graph_health_for_data(index: &HotBufferIndex, data: &[(u64, Vec<f32>)], label: &str) {
+    let ids: Vec<u64> = data.iter().map(|(id, _)| *id).collect();
+    assert_graph_health(index, &ids, label);
+}
+
+fn assert_graph_health(index: &HotBufferIndex, ids: &[u64], label: &str) {
+    let ep = match index.entry_point() {
+        Some(ep) => ep,
+        None => {
+            assert!(
+                ids.is_empty(),
+                "{label}: non-empty data without entry point"
+            );
+            return;
+        }
+    };
+    let valid: std::collections::HashSet<u64> = ids.iter().copied().collect();
+    let mut seen = std::collections::HashSet::new();
+    seen.insert(ep);
+    let mut queue = std::collections::VecDeque::from([ep]);
+    while let Some(cur) = queue.pop_front() {
+        for n in index.neighbors_of(cur) {
+            if valid.contains(&n) && seen.insert(n) {
+                queue.push_back(n);
+            }
+        }
+    }
+    let reachable_min = (ids.len() as f64 * GRAPH_REACHABLE_MIN_RATIO).ceil() as usize;
+    assert!(
+        seen.len() >= reachable_min,
+        "{label}: level-0 reachability {}/{} < {reachable_min}",
+        seen.len(),
+        ids.len()
+    );
+    // 单节点图合法地只有一个入口点且有 0 条边：该不变量仅适用于多节点图。
+    // EN: A single-node graph legitimately has only the entry point and zero
+    // edges; this invariant applies to multi-node graphs only.
+    if ids.len() > 1 {
+        let zero_degree = ids
+            .iter()
+            .filter(|&&id| index.neighbors_of(id).is_empty())
+            .count();
+        assert_eq!(
+            zero_degree, 0,
+            "{label}: {zero_degree} live nodes have L0 degree 0 (unreachable islands)"
+        );
+    }
+}
 
 fn recall(pred: &[u64], truth: &[u64]) -> f32 {
     if truth.is_empty() {
@@ -424,6 +490,7 @@ async fn hnsw_random_recall_gate() {
         let index = hnsw_index(DIMS, 16, 200, 64);
         index.insert_batch(data.clone()).await.unwrap();
         drain(&index).await;
+        assert_graph_health_for_data(&index, &data, &format!("random_recall seed={seed}"));
 
         for q in 0..8u64 {
             let query = query_for(seed.wrapping_mul(31).wrapping_add(q));
@@ -447,6 +514,7 @@ async fn hnsw_recall_is_monotonic_in_ef() {
     let index = hnsw_index(DIMS, 16, 200, 16);
     index.insert_batch(data.clone()).await.unwrap();
     drain(&index).await;
+    assert_graph_health_for_data(&index, &data, "ef_monotonic");
 
     let queries: Vec<Vec<f32>> = (0..8u64).map(|q| query_for(1000 + q)).collect();
     let truth: Vec<Vec<u64>> = queries.iter().map(|q| brute_topk(&data, q, 10)).collect();
@@ -480,6 +548,7 @@ async fn hnsw_top_k_overlaps_top_2k() {
     let index = hnsw_index(DIMS, 16, 200, 64);
     index.insert_batch(data.clone()).await.unwrap();
     drain(&index).await;
+    assert_graph_health_for_data(&index, &data, "top_k_prefix");
 
     for q in 0..8u64 {
         let query = query_for(500 + q);
@@ -502,6 +571,7 @@ async fn hnsw_neighbors_stable_under_small_query_noise() {
     let index = hnsw_index(DIMS, 16, 200, 64);
     index.insert_batch(data.clone()).await.unwrap();
     drain(&index).await;
+    assert_graph_health_for_data(&index, &data, "noise_stability");
 
     let mut rng = Rng::new(4242);
     for q in 0..8u64 {
@@ -529,6 +599,7 @@ async fn far_insert_does_not_displace_top1() {
     let index = hnsw_index(DIMS, 16, 200, 64);
     index.insert_batch(data.clone()).await.unwrap();
     drain(&index).await;
+    assert_graph_health_for_data(&index, &data, "far_insert");
 
     let query = query_for(2024);
     let before = index.search(&query, 1, None).await;

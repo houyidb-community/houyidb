@@ -138,6 +138,30 @@ type CreateCollectionOptions struct {
 	// flat-clustered / hii-l0.
 	IndexType string
 	Hnsw      *HnswConfig
+	// VectorDtype 向量存储编码：f32（缺省）或 f16（仅 hnsw，省一半向量内存）。
+	// 创建后不可变；非 f32 与非 hnsw 组合由服务端拒绝（400）。
+	// EN: VectorDtype is the storage encoding: f32 (default) or f16 (hnsw only,
+	// halves vector memory). Immutable after creation; non-f32 with a non-hnsw
+	// backend is rejected by the server (400).
+	VectorDtype string
+	// Quantization 图侧量化：none（缺省）、int8 或 rabitq（仅 hnsw，压缩图内
+	// 距离工作集；主表保留原始向量并在检索时精确重排）。rabitq 为 1 bit/dim，
+	// 仅支持 metric l2|cosine（ip/l1 返回 400）。创建后不可变；非 none 与非
+	// hnsw 组合由服务端拒绝（400）。
+	// EN: Quantization is the graph-side compression: none (default), int8, or
+	// rabitq (hnsw only, shrinks the in-graph distance working set; the main
+	// store keeps raw vectors and reranks exactly at search time). rabitq packs
+	// 1 bit/dim and supports metric l2|cosine only (ip/l1 return 400). Immutable
+	// after creation; non-none with a non-hnsw backend is rejected by the server
+	// (400).
+	Quantization string
+	// Sparse 稀疏索引模式：none（缺省）或 bm25（仅 hnsw/flat 后端）。开启后集合
+	// 获得倒排稀疏索引并支持 FusionSearch；创建后不可变，隐式创建恒为 none。
+	// EN: Sparse is the sparse index mode: none (default) or bm25 (hnsw/flat
+	// backends only). When enabled the collection gains an inverted sparse
+	// index and supports FusionSearch; it is immutable after creation, and
+	// implicit creation is always none.
+	Sparse string
 }
 
 // CreateCollectionResult 建集合响应：服务端回显实际生效的参数。
@@ -149,6 +173,19 @@ type CreateCollectionResult struct {
 	Dims       int    `json:"dims"`
 	Metric     string `json:"metric"`
 	IndexType  string `json:"index_type"`
+	// VectorDtype 实际生效的存储编码（f32 | f16）；旧服务端不返回时为空串。
+	// EN: VectorDtype is the effective storage encoding (f32 | f16); empty from
+	// older servers.
+	VectorDtype string `json:"vector_dtype,omitempty"`
+	// Quantization 实际生效的图侧量化（none | int8 | rabitq）；旧服务端不返回
+	// 时为空串。
+	// EN: Quantization is the effective graph-side quantization (none | int8 |
+	// rabitq); empty from older servers.
+	Quantization string `json:"quantization,omitempty"`
+	// Sparse 实际生效的稀疏模式（none | bm25）；旧服务端不返回时为空串。
+	// EN: Sparse is the effective sparse mode (none | bm25); empty from older
+	// servers.
+	Sparse string `json:"sparse,omitempty"`
 	// Hnsw 仅 IndexType == "hnsw" 时存在。
 	// EN: Hnsw is present only when IndexType == "hnsw".
 	Hnsw *HnswConfig `json:"hnsw,omitempty"`
@@ -175,6 +212,15 @@ func (c *Client) CreateCollection(
 		}
 		if opts.IndexType != "" {
 			payload["index_type"] = opts.IndexType
+		}
+		if opts.VectorDtype != "" {
+			payload["vector_dtype"] = opts.VectorDtype
+		}
+		if opts.Quantization != "" {
+			payload["quantization"] = opts.Quantization
+		}
+		if opts.Sparse != "" {
+			payload["sparse"] = opts.Sparse
 		}
 		if opts.Hnsw != nil {
 			payload["hnsw_m"] = opts.Hnsw.M
@@ -357,6 +403,81 @@ func (c *Collection) HybridSearch(
 	var body searchResponse
 	err := c.client.post(ctx,
 		fmt.Sprintf("/v1/collections/%s/hybrid/search", c.quoted), req, &body)
+	if err != nil {
+		return nil, err
+	}
+	return body.toResult(), nil
+}
+
+// FusionSearchOptions 融合检索可选参数（nil 即全默认：rrf + rrf_k=60）。
+//
+// Fusion 取 rrf（缺省）或 weighted；RRFK 仅 rrf 模式参与计算，Alpha 仅
+// weighted 模式参与计算，但显式给出的值服务端一律严格校验（越界 400，
+// 即使当前模式不参与计算）。Alpha 用指针区分「未给」与合法的显式 0。
+// EN: FusionSearchOptions holds optional fusion parameters (nil means all
+// defaults: rrf + rrf_k=60). Fusion is rrf (default) or weighted; RRFK
+// scores only under rrf and Alpha only under weighted, yet explicitly given
+// values are strictly validated by the server (400 when out of range, even
+// under the inactive mode). Alpha is a pointer to distinguish "unset" from an
+// explicit, valid 0.
+type FusionSearchOptions struct {
+	Filters        []Filter
+	EFSearch       int
+	IncludePayload bool
+	Fusion         string
+	RRFK           uint32
+	Alpha          *float32
+}
+
+func (o *FusionSearchOptions) apply(req map[string]interface{}) {
+	if o == nil {
+		return
+	}
+	if len(o.Filters) > 0 {
+		req["filters"] = o.Filters
+	}
+	if o.EFSearch > 0 {
+		req["ef_search"] = o.EFSearch
+	}
+	if o.IncludePayload {
+		req["include_payload"] = true
+	}
+	if o.Fusion != "" {
+		req["fusion"] = o.Fusion
+	}
+	if o.RRFK > 0 {
+		req["rrf_k"] = o.RRFK
+	}
+	if o.Alpha != nil {
+		req["alpha"] = *o.Alpha
+	}
+}
+
+// FusionSearch 稠密 + 稀疏融合检索（仅 sparse=bm25 的集合；两路均需非空）。
+//
+// 两路各过取 4×k 后融合：fusion=rrf（缺省）按倒数排名相加；fusion=weighted
+// 在过滤后候选上各路 min-max 归一后按 alpha*dense + (1-alpha)*sparse 相加。
+// 稀疏查询每项为 {term_id, weight}，最多 64 个原始对；Filters 取交集，仅
+// hnsw/flat 后端支持。响应 Scores 只表达融合排序，DenseScore 才按集合度量
+// 换算、SparseScore 为 BM25 原始分。
+// EN: FusionSearch performs dense + sparse fusion search (only for sparse=bm25
+// collections; both modalities must be non-empty). Each path over-fetches 4x k
+// before fusing: fusion=rrf (default) sums reciprocal ranks; fusion=weighted
+// min-max normalizes each modality over the filtered candidates and sums
+// alpha*dense + (1-alpha)*sparse. Sparse query items are {term_id, weight}
+// with at most 64 raw pairs; Filters intersect and are supported on hnsw/flat
+// backends only. Response Scores only express fused ranking; only DenseScore
+// is converted under the collection metric, and SparseScore is the raw BM25
+// score.
+func (c *Collection) FusionSearch(
+	ctx context.Context, vector []float64, sparse []SparseTerm, k int,
+	opts *FusionSearchOptions,
+) (*FusionResult, error) {
+	req := map[string]interface{}{"vector": vector, "sparse": sparse, "k": k}
+	opts.apply(req)
+	var body fusionResponse
+	err := c.client.post(ctx,
+		fmt.Sprintf("/v1/collections/%s/fusion/search", c.quoted), req, &body)
 	if err != nil {
 		return nil, err
 	}

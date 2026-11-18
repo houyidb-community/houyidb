@@ -57,16 +57,82 @@ var created = await client.CreateCollectionAsync("docs", 768, new CreateCollecti
 {
     Metric = "ip",          // l2 / cosine / ip / l1
     IndexType = "hnsw",     // hnsw / flat / clustered / flat-clustered / pq-flat / hii-l0
+    VectorDtype = "f16",    // 可选：f32（缺省）/ f16（仅 hnsw，主表内存减半）
+    Quantization = "int8",  // 可选：none（缺省）/ int8 / rabitq（仅 hnsw，压缩图侧）
+    Sparse = "bm25",        // 可选：none（缺省）/ bm25（仅 hnsw/flat，创建后不可变）
     Hnsw = new HnswParams(M: 16, EfConstruction: 100, EfSearch: 64),
 });
-// created.Metric == "ip"；服务端回显实际生效参数
+// created.Metric == "ip"；created.VectorDtype/Quantization/Sparse 回显 f16/int8/bm25；
+// 服务端回显实际生效参数
 ```
 
 度量支持矩阵：`hnsw` / `flat` / `clustered` / `flat-clustered` 支持全部四种；
 `pq-flat` 仅 `l2`；`hii-l0` 仅 `cosine`。
 
+`VectorDtype` 仅 hnsw 后端可指定 `f16`，创建后不可变；查询向量仍为 f32，
+距离按 f16 舍入后的数据计算（非对称量化）。旧服务端不回显该字段时为 `null`，
+不要自行默认为 `f32`。
+
+`Quantization` 与 `VectorDtype` 相互独立：`int8`（1 B/dim）与 `rabitq`
+（1 bit/dim）只压缩 HNSW 图侧副本，主表仍保留原始向量，检索时先取图候选
+再精确重排，最终 top-k 精度不降。`rabitq` 仅支持 `Metric = l2 | cosine`
+（`ip`/`l1` 返回 400）。仅 hnsw 后端可用，创建后不可变；未设置时请求体
+不出现该键，旧服务端不回显时为 `null`。
+
 检索分数按度量换算（越大越相似）：`cosine` → `1 - distance` ∈ [-1, 1]；
 `l2` / `l1` → `1 - distance`（不截断）；`ip` → 点积本身。
+
+## 稀疏向量（BM25）与融合检索（P4）
+
+稀疏索引是**显式创建开关**：`Sparse = "bm25"` 仅 `hnsw` / `flat` 后端可用，
+创建后不可变；隐式创建的集合恒为 `none`，在 `sparse=none` 集合上写入
+`Sparse`（或创建时组合其他后端）一律 400。旧服务端创建响应不回显该字段时
+`created.Sparse` 为 `null`，按可选字段容忍。
+
+词项由客户端给定（无分词器）：`new SparseTerm(termId, weight)`，
+term ∈ [1, 2^24−1]，weight 有限且 > 0；每文档 ≤ 1024 个词项（重复 term
+服务端求和），融合查询 ≤ 64 个词项。
+
+```csharp
+// 稀疏写入与 dense 同批（整文档替换语义）：null = 不改，空列表 = 清空
+await col.UpsertAsync(new[]
+{
+    new Vector
+    {
+        Id = StableId.Of("doc-2"),
+        Values = embedding,
+        Sparse = new List<SparseTerm> { new(7, 1.0f), new(8, 0.8f) },
+    },
+});
+
+// 融合检索：dense 与 sparse 必须同时非空；k 上限与 Search 一致
+var fusionOptions = new FusionOptions
+{
+    Fusion = "rrf",        // rrf（缺省）/ weighted
+    RrfK = 60,             // 1..=1000，仅 rrf 生效
+    // Alpha = 0.5f,       // 0..=1，仅 weighted 生效（缺省 0.5）
+    IncludePayload = true,
+};
+fusionOptions.Filters.Add(new Filter("category", FilterOp.Eq, "fruit"));
+var fused = await col.FusionSearchAsync(
+    queryEmbedding, new[] { new SparseTerm(7, 1.0f), new SparseTerm(8, 0.8f) }, 10,
+    fusionOptions);
+foreach (var hit in fused.Hits)
+{
+    // hit.Score 仅表达融合排序；hit.DenseScore 按度量换算，hit.SparseScore 为 BM25 原始分
+    Console.WriteLine($"{hit.Id} {hit.Score} {hit.DenseScore} {hit.SparseScore}");
+}
+```
+
+融合两种模式：`rrf`（默认，`score = Σ 1/(rrf_k + rank)`）、`weighted`
+（两路各 min-max 归一化后 `alpha*dense + (1-alpha)*sparse`）。两路候选均按
+`4*k` 过取并按 Filters 过滤；未命中任一路的文档不入选。显式给出的
+`RrfK`/`Alpha` 服务端一律严格校验（越界 400，即使当前模式不参与计算）。
+`fused.Metric` 仅解释 `DenseScore` 口径；`fused.FusionMode` /
+`RrfK` / `Alpha` 回显生效参数。
+
+融合检索是纯读，不隐式建集合；`sparse=none` 集合返回 400；旧服务端没有该
+端点（404 原样透出）。稀疏**写入**仅 HTTP/SDK 提供（pgwire 仅支持融合查询）。
 
 ## 管理操作：删除整个 collection（不可逆）
 

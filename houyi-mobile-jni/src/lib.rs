@@ -1,0 +1,631 @@
+//! Android JNI 绑定：Kotlin `cc.houyidb.mobile.HouyiDB` 的 native 实现。
+//! Android JNI bridge for the Kotlin object `cc.houyidb.mobile.HouyiDB`.
+//!
+//! 所有入口都在 JNI 边界把错误转成返回码并写入线程安全的 lastError，
+//! 不把 Rust panic/字符串细节泄漏到 Java 层。
+//! EN: Every entry converts errors to return codes and stores them in a
+//! thread-safe last-error slot; no Rust panic or raw detail crosses into Java.
+
+use houyi_mobile::db::MobileDB;
+use houyi_vector::cluster::FlatStorageDtype;
+use houyi_vector::DistanceMetric;
+use jni::objects::{JFloatArray, JLongArray, JObject, JString};
+use jni::sys::{jint, jlong, jstring};
+use jni::JNIEnv;
+use std::cell::RefCell;
+use std::collections::HashSet;
+use std::sync::{LazyLock, Mutex};
+
+// 错误槽按调用线程隔离：Kotlin 同步调用后立即读 lastError，coroutine 在同一
+// 调用栈内不会切线程；共享全局槽会被其他线程的成功调用清空。
+// EN: The error slot is thread-local: Kotlin reads lastError synchronously
+// after the native call and a coroutine cannot switch threads within that
+// stack frame; a shared global slot would be cleared by another thread's
+// success.
+thread_local! {
+    static LAST_ERROR: RefCell<String> = const { RefCell::new(String::new()) };
+}
+
+// 活句柄表：拒绝重复 close / 已关闭句柄的后续调用（避免 double free/UAF）。
+// EN: Live-handle registry: reject double close and calls on closed handles
+// (avoiding double free/UAF).
+static HANDLES: LazyLock<Mutex<HashSet<usize>>> = LazyLock::new(|| Mutex::new(HashSet::new()));
+
+fn set_error(message: impl Into<String>) {
+    LAST_ERROR.with(|slot| *slot.borrow_mut() = message.into());
+}
+
+fn clear_error() {
+    LAST_ERROR.with(|slot| slot.borrow_mut().clear());
+}
+
+fn register_handle(value: jlong) {
+    if value != 0 {
+        if let Ok(mut handles) = HANDLES.lock() {
+            handles.insert(value as usize);
+        }
+    }
+}
+
+fn handle_from(value: jlong) -> Option<&'static MobileDB> {
+    if value == 0 {
+        return None;
+    }
+    let live = HANDLES
+        .lock()
+        .map(|handles| handles.contains(&(value as usize)))
+        .unwrap_or(false);
+    if !live {
+        return None;
+    }
+    Some(unsafe { &*(value as *const MobileDB) })
+}
+
+fn validate_name(name: &str) -> Result<(), String> {
+    if name.is_empty() || name.len() > 4096 {
+        return Err("invalid collection name".to_string());
+    }
+    Ok(())
+}
+
+fn string_arg(env: &mut JNIEnv<'_>, value: &JString<'_>) -> Result<String, String> {
+    env.get_string(value)
+        .map(|s| s.into())
+        .map_err(|e| format!("invalid string argument: {e}"))
+}
+
+fn metric_from(value: jint) -> Option<DistanceMetric> {
+    u8::try_from(value)
+        .ok()
+        .and_then(DistanceMetric::from_snapshot_byte)
+}
+
+fn dtype_from(value: jint) -> Option<FlatStorageDtype> {
+    u8::try_from(value)
+        .ok()
+        .and_then(FlatStorageDtype::from_snapshot_byte)
+}
+
+#[no_mangle]
+pub extern "system" fn Java_cc_houyidb_mobile_HouyiDB_nativeOpen(
+    _env: JNIEnv<'_>,
+    _this: JObject<'_>,
+) -> jlong {
+    clear_error();
+    let handle = Box::into_raw(Box::new(MobileDB::new())) as jlong;
+    register_handle(handle);
+    handle
+}
+
+#[no_mangle]
+pub extern "system" fn Java_cc_houyidb_mobile_HouyiDB_nativeClose(
+    _env: JNIEnv<'_>,
+    _this: JObject<'_>,
+    handle: jlong,
+) {
+    if handle == 0 {
+        return;
+    }
+    let removed = HANDLES
+        .lock()
+        .map(|mut handles| handles.remove(&(handle as usize)))
+        .unwrap_or(false);
+    if removed {
+        unsafe {
+            drop(Box::from_raw(handle as *mut MobileDB));
+        }
+    }
+}
+
+#[no_mangle]
+pub extern "system" fn Java_cc_houyidb_mobile_HouyiDB_nativeCreateCollectionLegacy(
+    mut env: JNIEnv<'_>,
+    _this: JObject<'_>,
+    handle: jlong,
+    name: JString<'_>,
+    dims: jint,
+    index_type: JString<'_>,
+) -> jint {
+    clear_error();
+    let Some(db) = handle_from(handle) else {
+        set_error("invalid database handle");
+        return -1;
+    };
+    let (Ok(name), Ok(index_type)) = (
+        string_arg(&mut env, &name),
+        string_arg(&mut env, &index_type),
+    ) else {
+        set_error("invalid string argument");
+        return -1;
+    };
+    if let Err(message) = validate_name(&name) {
+        set_error(message);
+        return -1;
+    }
+    if dims <= 0 || dims > 65_536 {
+        set_error("invalid dims");
+        return -1;
+    }
+    if !matches!(
+        index_type.as_str(),
+        "flat" | "flat-clustered" | "clustered-hnsw"
+    ) {
+        set_error("invalid index type");
+        return -1;
+    }
+    match db.get_or_create(&name, dims as usize, &index_type) {
+        Ok(_) => 0,
+        Err(message) => {
+            set_error(message);
+            -1
+        }
+    }
+}
+
+#[no_mangle]
+pub extern "system" fn Java_cc_houyidb_mobile_HouyiDB_nativeCreateCollection(
+    mut env: JNIEnv<'_>,
+    _this: JObject<'_>,
+    handle: jlong,
+    name: JString<'_>,
+    dims: jint,
+    index_type: JString<'_>,
+    metric: jint,
+    dtype: jint,
+) -> jint {
+    clear_error();
+    let Some(db) = handle_from(handle) else {
+        set_error("invalid database handle");
+        return -1;
+    };
+    let (Ok(name), Ok(index_type)) = (
+        string_arg(&mut env, &name),
+        string_arg(&mut env, &index_type),
+    ) else {
+        set_error("invalid string argument");
+        return -1;
+    };
+    if let Err(message) = validate_name(&name) {
+        set_error(message);
+        return -1;
+    }
+    if dims <= 0 || dims > 65_536 {
+        set_error("invalid dims");
+        return -1;
+    }
+    let (Some(metric), Some(dtype)) = (metric_from(metric), dtype_from(dtype)) else {
+        set_error("invalid metric/dtype code");
+        return -1;
+    };
+    match db.get_or_create_with_config(&name, dims as usize, &index_type, metric, dtype) {
+        Ok(_) => 0,
+        Err(message) => {
+            set_error(message);
+            -1
+        }
+    }
+}
+
+#[no_mangle]
+pub extern "system" fn Java_cc_houyidb_mobile_HouyiDB_nativeInsert(
+    mut env: JNIEnv<'_>,
+    _this: JObject<'_>,
+    handle: jlong,
+    name: JString<'_>,
+    id: jlong,
+    vector: JFloatArray<'_>,
+) -> jint {
+    clear_error();
+    let Some(db) = handle_from(handle) else {
+        set_error("invalid database handle");
+        return -1;
+    };
+    let Ok(name) = string_arg(&mut env, &name) else {
+        set_error("invalid collection name");
+        return -1;
+    };
+    let len = match env.get_array_length(&vector) {
+        Ok(value) => value as usize,
+        Err(_) => {
+            set_error("invalid vector array");
+            return -1;
+        }
+    };
+    let mut values = vec![0.0f32; len];
+    if env.get_float_array_region(&vector, 0, &mut values).is_err() {
+        set_error("invalid vector array");
+        return -1;
+    }
+    match db.insert(&name, id as u64, &values) {
+        Ok(()) => 0,
+        Err(message) => {
+            set_error(message);
+            -1
+        }
+    }
+}
+
+#[no_mangle]
+pub extern "system" fn Java_cc_houyidb_mobile_HouyiDB_nativeInsertBatch(
+    mut env: JNIEnv<'_>,
+    _this: JObject<'_>,
+    handle: jlong,
+    name: JString<'_>,
+    ids: JLongArray<'_>,
+    vectors: JFloatArray<'_>,
+    count: jint,
+    dims: jint,
+) -> jint {
+    clear_error();
+    let Some(db) = handle_from(handle) else {
+        set_error("invalid database handle");
+        return -1;
+    };
+    let Ok(name) = string_arg(&mut env, &name) else {
+        set_error("invalid collection name");
+        return -1;
+    };
+    let id_len = env.get_array_length(&ids).unwrap_or(0) as usize;
+    let vec_len = env.get_array_length(&vectors).unwrap_or(0) as usize;
+    if count < 0 || dims <= 0 {
+        set_error("batch count/dims exceed arrays");
+        return -1;
+    }
+    let count = count as usize;
+    if count > id_len || dims <= 0 {
+        set_error("batch count/dims exceed arrays");
+        return -1;
+    }
+    let expected = match count.checked_mul(dims as usize) {
+        Some(value) if value <= vec_len => value,
+        _ => {
+            set_error("batch vectors shorter than count*dims");
+            return -1;
+        }
+    };
+    let mut id_values = vec![0i64; count];
+    if env.get_long_array_region(&ids, 0, &mut id_values).is_err() {
+        set_error("invalid id array");
+        return -1;
+    }
+    let mut vec_values = vec![0.0f32; expected];
+    if env
+        .get_float_array_region(&vectors, 0, &mut vec_values)
+        .is_err()
+    {
+        set_error("invalid vector array");
+        return -1;
+    }
+    let ids_u64: Vec<u64> = id_values.into_iter().map(|v| v as u64).collect();
+    match db.insert_batch(&name, &ids_u64, &vec_values, dims as usize) {
+        Ok(()) => 0,
+        Err(message) => {
+            set_error(message);
+            -1
+        }
+    }
+}
+
+#[no_mangle]
+pub extern "system" fn Java_cc_houyidb_mobile_HouyiDB_nativeBuild(
+    mut env: JNIEnv<'_>,
+    _this: JObject<'_>,
+    handle: jlong,
+    name: JString<'_>,
+) -> jint {
+    clear_error();
+    let Some(db) = handle_from(handle) else {
+        set_error("invalid database handle");
+        return -1;
+    };
+    let Ok(name) = string_arg(&mut env, &name) else {
+        set_error("invalid collection name");
+        return -1;
+    };
+    match db.build(&name) {
+        Ok(count) => count as jint,
+        Err(message) => {
+            set_error(message);
+            -1
+        }
+    }
+}
+
+#[no_mangle]
+pub extern "system" fn Java_cc_houyidb_mobile_HouyiDB_nativeInsertScalarsWithId(
+    mut env: JNIEnv<'_>,
+    _this: JObject<'_>,
+    handle: jlong,
+    name: JString<'_>,
+    id: jlong,
+    tags_json: JString<'_>,
+) -> jint {
+    clear_error();
+    let Some(db) = handle_from(handle) else {
+        set_error("invalid database handle");
+        return -1;
+    };
+    let (Ok(name), Ok(tags_json)) = (
+        string_arg(&mut env, &name),
+        string_arg(&mut env, &tags_json),
+    ) else {
+        set_error("invalid string argument");
+        return -1;
+    };
+    let owned = match houyi_mobile::parse_tag_pairs(&tags_json) {
+        Ok(value) => value,
+        Err(message) => {
+            set_error(message);
+            return -1;
+        }
+    };
+    let refs: Vec<(&str, &str)> = owned
+        .iter()
+        .map(|(col, val)| (col.as_str(), val.as_str()))
+        .collect();
+    match db.insert_scalars_with_id(&name, id as u64, &refs) {
+        Ok(()) => 0,
+        Err(message) => {
+            set_error(message);
+            -1
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+#[no_mangle]
+pub extern "system" fn Java_cc_houyidb_mobile_HouyiDB_nativeSearchHybridU64(
+    mut env: JNIEnv<'_>,
+    _this: JObject<'_>,
+    handle: jlong,
+    name: JString<'_>,
+    query: JFloatArray<'_>,
+    k: jint,
+    filters_json: JString<'_>,
+    out_ids: JLongArray<'_>,
+    out_scores: JFloatArray<'_>,
+) -> jint {
+    clear_error();
+    let Some(db) = handle_from(handle) else {
+        set_error("invalid database handle");
+        return -1;
+    };
+    let (Ok(name), Ok(filters_json)) = (
+        string_arg(&mut env, &name),
+        string_arg(&mut env, &filters_json),
+    ) else {
+        set_error("invalid string argument");
+        return -1;
+    };
+    if k < 0 {
+        set_error("invalid k");
+        return -1;
+    }
+    let query_len = match env.get_array_length(&query) {
+        Ok(value) => value as usize,
+        Err(_) => {
+            set_error("invalid query array");
+            return -1;
+        }
+    };
+    let mut q = vec![0.0f32; query_len];
+    if env.get_float_array_region(&query, 0, &mut q).is_err() {
+        set_error("invalid query array");
+        return -1;
+    }
+    // 与 C ABI 共用同一“空串=无过滤”策略，避免两套 FFI 语义漂移。
+    // EN: Use the same empty-means-no-filter helper as the C ABI so the two
+    // FFI surfaces cannot drift.
+    let filters = match houyi_mobile::parse_filter_ops_allow_empty(&filters_json) {
+        Ok(value) => value,
+        Err(message) => {
+            set_error(message);
+            return -1;
+        }
+    };
+    let found = match db.search_hybrid(&name, &q, k as usize, &filters) {
+        Ok(value) => value,
+        Err(message) => {
+            set_error(message);
+            return -1;
+        }
+    };
+    let out_len = match (
+        env.get_array_length(&out_ids),
+        env.get_array_length(&out_scores),
+    ) {
+        (Ok(ids), Ok(scores)) => ids.min(scores) as usize,
+        _ => {
+            set_error("invalid result arrays");
+            return -1;
+        }
+    };
+    let n = found.len().min(out_len);
+    let mut ids = vec![0i64; n];
+    let mut scores = vec![0.0f32; n];
+    for (i, (id, score)) in found.iter().take(n).enumerate() {
+        ids[i] = *id as i64;
+        scores[i] = *score;
+    }
+    if env.set_long_array_region(&out_ids, 0, &ids).is_err()
+        || env.set_float_array_region(&out_scores, 0, &scores).is_err()
+    {
+        set_error("failed to write result arrays");
+        return -1;
+    }
+    n as jint
+}
+
+#[no_mangle]
+pub extern "system" fn Java_cc_houyidb_mobile_HouyiDB_nativeSetSearchTarget(
+    mut env: JNIEnv<'_>,
+    _this: JObject<'_>,
+    handle: jlong,
+    name: JString<'_>,
+    per_k: jint,
+) -> jint {
+    clear_error();
+    let Some(db) = handle_from(handle) else {
+        set_error("invalid database handle");
+        return -1;
+    };
+    let Ok(name) = string_arg(&mut env, &name) else {
+        set_error("invalid collection name");
+        return -1;
+    };
+    if per_k <= 0 {
+        set_error("invalid search target per k");
+        return -1;
+    }
+    match db.set_search_target(&name, per_k as usize) {
+        Ok(()) => 0,
+        Err(message) => {
+            set_error(message);
+            -1
+        }
+    }
+}
+
+#[no_mangle]
+pub extern "system" fn Java_cc_houyidb_mobile_HouyiDB_nativeCount(
+    mut env: JNIEnv<'_>,
+    _this: JObject<'_>,
+    handle: jlong,
+    name: JString<'_>,
+) -> jint {
+    clear_error();
+    let Some(db) = handle_from(handle) else {
+        set_error("invalid database handle");
+        return -1;
+    };
+    let Ok(name) = string_arg(&mut env, &name) else {
+        set_error("invalid collection name");
+        return -1;
+    };
+    match db.count(&name) {
+        Ok(count) => count as jint,
+        Err(message) => {
+            set_error(message);
+            -1
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+#[no_mangle]
+pub extern "system" fn Java_cc_houyidb_mobile_HouyiDB_nativeSearch(
+    mut env: JNIEnv<'_>,
+    _this: JObject<'_>,
+    handle: jlong,
+    name: JString<'_>,
+    query: JFloatArray<'_>,
+    k: jint,
+    out_ids: JLongArray<'_>,
+    out_scores: JFloatArray<'_>,
+) -> jint {
+    clear_error();
+    let Some(db) = handle_from(handle) else {
+        set_error("invalid database handle");
+        return -1;
+    };
+    let Ok(name) = string_arg(&mut env, &name) else {
+        set_error("invalid collection name");
+        return -1;
+    };
+    let query_len = env.get_array_length(&query).unwrap_or(0) as usize;
+    let mut values = vec![0.0f32; query_len];
+    if env.get_float_array_region(&query, 0, &mut values).is_err() {
+        set_error("invalid query array");
+        return -1;
+    }
+    if k < 0 {
+        set_error("invalid k");
+        return -1;
+    }
+    let found = match db.search(&name, &values, k as usize) {
+        Ok(values) => values,
+        Err(message) => {
+            set_error(message);
+            return -1;
+        }
+    };
+    let out_len = env
+        .get_array_length(&out_ids)
+        .unwrap_or(0)
+        .min(env.get_array_length(&out_scores).unwrap_or(0)) as usize;
+    let n = found.len().min(out_len);
+    let mut ids = vec![0i64; n];
+    let mut scores = vec![0.0f32; n];
+    for (i, (id, score)) in found.iter().take(n).enumerate() {
+        ids[i] = *id as i64;
+        scores[i] = *score;
+    }
+    if env.set_long_array_region(&out_ids, 0, &ids).is_err()
+        || env.set_float_array_region(&out_scores, 0, &scores).is_err()
+    {
+        set_error("failed to write result arrays");
+        return -1;
+    }
+    n as jint
+}
+
+#[no_mangle]
+pub extern "system" fn Java_cc_houyidb_mobile_HouyiDB_nativeSave(
+    mut env: JNIEnv<'_>,
+    _this: JObject<'_>,
+    handle: jlong,
+    path: JString<'_>,
+) -> jint {
+    clear_error();
+    let Some(db) = handle_from(handle) else {
+        set_error("invalid database handle");
+        return -1;
+    };
+    let Ok(path) = string_arg(&mut env, &path) else {
+        set_error("invalid path");
+        return -1;
+    };
+    match db.save_to(&path) {
+        Ok(()) => 0,
+        Err(message) => {
+            set_error(message);
+            -1
+        }
+    }
+}
+
+#[no_mangle]
+pub extern "system" fn Java_cc_houyidb_mobile_HouyiDB_nativeLoad(
+    mut env: JNIEnv<'_>,
+    _this: JObject<'_>,
+    path: JString<'_>,
+) -> jlong {
+    clear_error();
+    let Ok(path) = string_arg(&mut env, &path) else {
+        set_error("invalid path");
+        return 0;
+    };
+    match MobileDB::load_from(&path) {
+        Ok(db) => {
+            let handle = Box::into_raw(Box::new(db)) as jlong;
+            register_handle(handle);
+            handle
+        }
+        Err(message) => {
+            set_error(message);
+            0
+        }
+    }
+}
+
+#[no_mangle]
+pub extern "system" fn Java_cc_houyidb_mobile_HouyiDB_nativeLastError(
+    env: JNIEnv<'_>,
+    _this: JObject<'_>,
+) -> jstring {
+    let message = LAST_ERROR.with(|slot| slot.borrow().clone());
+    match env.new_string(message) {
+        Ok(value) => value.into_raw(),
+        Err(_) => std::ptr::null_mut(),
+    }
+}

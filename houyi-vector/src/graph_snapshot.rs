@@ -22,6 +22,11 @@
 //!   flags: bit0 = HAS_ENTRY_POINT —— entry_point 是否存在靠 flag 表达而非
 //!   u64::MAX 哨兵：VectorId 是普通 u64，u64::MAX 是合法 id，哨兵会与其碰撞
 //!   （OCR ae8d7e3 HIGH）。
+//!   bit1 = VECTOR_F16：仅 version≥2 允许。f32 快照写 version=1（旧二进制可读），
+//!   f16 写 version=2（旧二进制以 UnsupportedVersion 明确拒绝，不做静默降级）。
+//!   EN: bit1 = VECTOR_F16, allowed only when version>=2. f32 snapshots are
+//!   EN: written as version=1 (readable by older binaries); f16 writes version=2
+//!   EN: (older binaries reject with UnsupportedVersion instead of downgrading).
 //! [nodes]      node_count × {id u64, link_base u64, max_layer u8, layer_len [u16;16]}
 //! [link_arena] arena_len × u64
 //! [link_free]  pair_count × {slots u64, base u64}   ← AHashMap<usize,Vec<usize>> 拍平
@@ -39,7 +44,10 @@
 //! - 邻接 id 的引用完整性（邻居必须存在于节点集）不在解码期校验——信封 CRC32
 //!   已覆盖损坏场景，搜索路径另有悬空链接防御性跳过兜底。
 
-use crate::hnsw_graph::{HnswGraph, HnswNode, SnapshotGraphParts, MAX_HNSW_LAYERS};
+use crate::hnsw_graph::{GraphVector, HnswGraph, HnswNode, SnapshotGraphParts, MAX_HNSW_LAYERS};
+use crate::quantization::{Int8Vector, Quantization};
+use crate::rabitq::{self, RaBitQVector};
+use crate::stored_vector::{StoredVector, VectorDtype, VectorRef};
 use crate::{DistanceMetric, VectorId};
 use std::fmt;
 use std::sync::Arc;
@@ -48,8 +56,45 @@ use ahash::AHashMap;
 
 /// 快照 payload 魔数。 / EN: Payload magic.
 pub(crate) const SNAPSHOT_MAGIC: &[u8; 8] = b"HNSWGRPH";
-/// 当前格式版本。 / EN: Current format version.
-pub(crate) const SNAPSHOT_VERSION: u32 = 1;
+/// f32 快照写出的版本：保持旧二进制冷启动可读（快照只是建图加速，不是真相源）。
+/// 解码 v1 时 flags 只允许 bit0，携带 f16 位即拒绝。
+/// EN: Version written for f32 snapshots so older binaries can still cold-start
+/// (a snapshot only accelerates graph construction; the WAL is the source of
+/// truth). When decoding v1, only flags bit0 is allowed; carrying the f16 bit
+/// is rejected.
+pub(crate) const SNAPSHOT_VERSION_F32: u32 = 1;
+/// dtype 标记版快照（f16 起使用）：旧二进制只认 v1，遇到 v2 会以
+/// `UnsupportedVersion` 干净拒绝并回退全量 WAL 重放，而不是把 f16 图静默
+/// 恢复成 f32、再在下次快照时固化降级。
+/// EN: dtype-tagged snapshot version (used from f16 onward): old binaries only
+/// accept v1 and cleanly reject v2 with `UnsupportedVersion`, falling back to
+/// full WAL replay — instead of silently restoring an f16 graph as f32 and
+/// then persisting that downgrade on the next snapshot.
+pub(crate) const SNAPSHOT_VERSION_DTYPE: u32 = 2;
+/// int8 图侧量化快照版本（P2）。v3 的 vectors 段为 `[id][scale][bias][i8 codes][f32 source]`：
+/// codes 原样还原图侧距离行为，source 还原主表原始值（重启后精确 rescore 的
+/// 依据）。旧二进制只认 v1/v2，遇到 v3 以 `UnsupportedVersion` 干净拒绝并回退
+/// 全量 WAL 重放，而不是把 int8 图静默恢复成未量化并固化降级。
+/// EN: int8 graph-quantization snapshot version (P2). The v3 vectors section is
+/// `[id][scale][bias][i8 codes][f32 source]`: codes restore in-graph distance
+/// behavior verbatim, source restores raw main-store values (the basis for
+/// exact rescoring after restart). Old binaries only know v1/v2 and cleanly
+/// reject v3 with `UnsupportedVersion`, falling back to full WAL replay instead
+/// of silently restoring an int8 graph as unquantized and persisting that
+/// downgrade.
+pub(crate) const SNAPSHOT_VERSION_INT8: u32 = 3;
+/// RaBitQ 图侧量化快照版本（P3）。v4 的 vectors 段为
+/// `[id][norm f32][alpha f32][packed codes ceil(D/64)·u64][dims×f32 source]`：
+/// codes/alpha/norm 原样还原图侧距离行为，source 还原主表原始值（精确 rescore
+/// 的依据）。旧二进制只认 v1–v3，遇到 v4 以 `UnsupportedVersion` 干净拒绝并
+/// 回退全量 WAL 重放，而不是把 RaBitQ 图静默恢复成未量化或 int8 并固化降级。
+/// EN: RaBitQ graph-quantization snapshot version (P3). The v4 vectors section is
+/// `[id][norm f32][alpha f32][packed codes ceil(D/64)·u64][dims×f32 source]`:
+/// codes/alpha/norm restore in-graph distance behavior verbatim, source restores
+/// raw main-store values (the basis for exact rescoring). Old binaries only know
+/// v1–v3 and cleanly reject v4 with `UnsupportedVersion`, falling back to full
+/// WAL replay instead of silently restoring a RaBitQ graph as unquantized/int8.
+pub(crate) const SNAPSHOT_VERSION_RABITQ: u32 = 4;
 /// 定长头字节数（见模块文档布局图）。 / EN: Fixed header length.
 pub(crate) const HEADER_LEN: usize = 108;
 /// 单节点记录字节数：id u64 + link_base u64 + max_layer u8 + layer_len 16×u16。
@@ -57,6 +102,68 @@ pub(crate) const HEADER_LEN: usize = 108;
 pub(crate) const NODE_RECORD_LEN: usize = 8 + 8 + 1 + 2 * MAX_HNSW_LAYERS;
 /// flags bit0：entry_point 字段存在。 / EN: flags bit0 — entry_point present.
 const FLAG_HAS_ENTRY_POINT: u8 = 0x01;
+/// flags bit1：向量存储为 f16（vectors 段仍按 f32 字节落盘，解码时下转）。
+/// 仅 v2（`SNAPSHOT_VERSION_DTYPE`）允许该位；v1 携带该位即拒绝，避免把
+/// 带 dtype 语义的快照按无 dtype 语义解释。该位缺席即 f32。
+/// EN: flags bit1 — vectors are stored as f16 (the vectors section still writes
+/// f32 bytes and down-converts on decode). Only v2 (`SNAPSHOT_VERSION_DTYPE`)
+/// may carry it; v1 with this bit set is rejected so a dtype-bearing snapshot
+/// is never interpreted under dtype-free semantics. Absent means f32.
+const FLAG_VECTOR_F16: u8 = 0x02;
+/// flags bit2：图侧 int8 量化。仅 v3 允许且**必须**置位（v3 只因 int8 存在）；
+/// v3 可与 f16 位并存（主表编码与图侧量化正交）。
+/// EN: flags bit2 — graph-side int8 quantization. Only v3 allows it, and v3
+/// **requires** it (v3 exists solely for int8); it may coexist with the f16
+/// bit since main-store encoding and graph-side quantization are orthogonal.
+const FLAG_VECTOR_INT8: u8 = 0x04;
+/// flags bit3：图侧 RaBitQ 量化。仅 v4 允许且**必须**置位；v4 可与 f16 位并存，
+/// 但**禁止** int8 位（同一张图不可能同时采用两种图侧量化）。
+/// EN: flags bit3 — graph-side RaBitQ quantization. Only v4 allows it, and v4
+/// **requires** it; it may coexist with the f16 bit but must never carry the
+/// int8 bit (one graph cannot use two graph-side quantization schemes).
+const FLAG_VECTOR_RABITQ: u8 = 0x08;
+
+/// 解码可接受的版本：v1（仅 f32）、v2（允许 dtype 位）、v3（int8）、v4（RaBitQ）。
+/// EN: Versions accepted by the decoder: v1 (f32 only), v2 (dtype bit
+/// allowed), v3 (int8), v4 (RaBitQ).
+fn is_supported_version(version: u32) -> bool {
+    (SNAPSHOT_VERSION_F32..=SNAPSHOT_VERSION_RABITQ).contains(&version)
+}
+
+/// 按版本校验 flags：v1 只认识 bit0，v2 加 f16 位，v3 再加 int8 位，v4 换成
+/// rabitq 位（bit3 必置、int8 位禁置，可与 f16 位并存）；其余位一律拒绝
+/// （未知位代表未来格式或损坏，不得静默忽略）。v3 必须携带 int8 位——v3 只因
+/// int8 存在；v4 必须携带 rabitq 位——v4 只因 rabitq 存在，缺少对应位说明
+/// 版本/标志被伪造。
+/// EN: Validate flags per version: v1 knows bit0, v2 adds the f16 bit, v3 adds
+/// the int8 bit, and v4 swaps to the rabitq bit (bit3 mandatory, int8 bit
+/// forbidden, may coexist with the f16 bit); every other bit is rejected
+/// (unknown bits mean a future format or corruption and must not be silently
+/// ignored). v3 must carry the int8 bit — v3 exists solely for int8; v4 must
+/// carry the rabitq bit — v4 exists solely for rabitq, so a missing bit means
+/// the version/flags pair was forged.
+fn validate_flags(version: u32, flags: u8) -> Result<(), GraphSnapshotError> {
+    let allowed = match version {
+        SNAPSHOT_VERSION_F32 => FLAG_HAS_ENTRY_POINT,
+        SNAPSHOT_VERSION_DTYPE => FLAG_HAS_ENTRY_POINT | FLAG_VECTOR_F16,
+        SNAPSHOT_VERSION_INT8 => FLAG_HAS_ENTRY_POINT | FLAG_VECTOR_F16 | FLAG_VECTOR_INT8,
+        // v4 的 int8 位缺席即拒绝（不在 allowed 里）；rabitq 位必置。
+        // EN: The v4 int8 bit is absent from `allowed` (rejected if set); the
+        // rabitq bit is mandatory.
+        SNAPSHOT_VERSION_RABITQ => FLAG_HAS_ENTRY_POINT | FLAG_VECTOR_F16 | FLAG_VECTOR_RABITQ,
+        _ => return Err(GraphSnapshotError::InvalidStructure("flags")),
+    };
+    if flags & !allowed != 0 {
+        return Err(GraphSnapshotError::InvalidStructure("flags"));
+    }
+    if version == SNAPSHOT_VERSION_INT8 && flags & FLAG_VECTOR_INT8 == 0 {
+        return Err(GraphSnapshotError::InvalidStructure("flags"));
+    }
+    if version == SNAPSHOT_VERSION_RABITQ && flags & FLAG_VECTOR_RABITQ == 0 {
+        return Err(GraphSnapshotError::InvalidStructure("flags"));
+    }
+    Ok(())
+}
 
 /// 恢复期的结构性匹配期望：任一不符即拒绝快照（调用方退化为全量重放）。
 /// EN: Structural expectations for restore; any mismatch rejects the snapshot
@@ -67,6 +174,13 @@ const FLAG_HAS_ENTRY_POINT: u8 = 0x01;
 pub(crate) struct SnapshotExpectations {
     pub dims: usize,
     pub metric: DistanceMetric,
+    /// 目标图的向量 dtype；快照 flags 必须与其一致。
+    /// EN: Target graph vector dtype; the snapshot flags must agree.
+    pub dtype: VectorDtype,
+    /// 目标图的图侧量化方式；快照 flags 必须与其一致（int8 不可静默降级为 none）。
+    /// EN: Target graph quantization; the snapshot flags must agree (int8 must
+    /// never downgrade silently to none).
+    pub quantization: crate::quantization::Quantization,
     pub num_layers: usize,
     pub l0_mult: f64,
     pub upper_mult: f64,
@@ -81,6 +195,8 @@ impl SnapshotExpectations {
         Self {
             dims: g.dims,
             metric: g.metric,
+            dtype: g.dtype(),
+            quantization: g.quantization(),
             num_layers: g.num_layers,
             l0_mult,
             upper_mult,
@@ -235,6 +351,32 @@ impl<'a> Reader<'a> {
 pub fn peek_graph_snapshot_dims_metric(
     payload: &[u8],
 ) -> Result<(usize, DistanceMetric), GraphSnapshotError> {
+    let (dims, metric, _dtype) = peek_graph_snapshot_dims_metric_dtype(payload)?;
+    Ok((dims, metric))
+}
+
+/// 只读头部 peek：返回 `(dims, metric, dtype)`，供恢复侧按写入侧同一 dtype
+/// 构造后端；旧 `peek_graph_snapshot_dims_metric` 保留为忽略 dtype 的兼容入口。
+/// EN: Header-only peek returning `(dims, metric, dtype)` so restore can build the
+/// backend with the same dtype as the writer; the old dims/metric peek remains as
+/// a compatibility entry that ignores dtype.
+pub fn peek_graph_snapshot_dims_metric_dtype(
+    payload: &[u8],
+) -> Result<(usize, DistanceMetric, VectorDtype), GraphSnapshotError> {
+    let (dims, metric, dtype, _quantization) =
+        peek_graph_snapshot_dims_metric_dtype_quantization(payload)?;
+    Ok((dims, metric, dtype))
+}
+
+/// 只读头部 peek：返回 `(dims, metric, dtype, quantization)`，供恢复侧按写入侧
+/// 同一 dtype + 量化方式构造后端（int8 集合必须显式建 int8 图，缺失即静默分叉）。
+/// EN: Header-only peek returning `(dims, metric, dtype, quantization)` so
+/// restore can build the backend with the writer's dtype and quantization
+/// (an int8 collection must construct an int8 graph; a missing value would
+/// silently diverge).
+pub fn peek_graph_snapshot_dims_metric_dtype_quantization(
+    payload: &[u8],
+) -> Result<(usize, DistanceMetric, VectorDtype, Quantization), GraphSnapshotError> {
     let mut r = Reader::new(payload);
     // 短于 magic 的输入判 BadMagic 而非 Truncated：peek 的职责是识别文件类型，
     // 连魔数都凑不齐的文件按「不是本格式」归类，调用方日志更准确。
@@ -244,14 +386,49 @@ pub fn peek_graph_snapshot_dims_metric(
         return Err(GraphSnapshotError::BadMagic);
     }
     let version = r.u32()?;
-    if version != SNAPSHOT_VERSION {
+    if !is_supported_version(version) {
         return Err(GraphSnapshotError::UnsupportedVersion(version));
     }
     let dims = r.u32()? as usize;
     let metric_byte = r.u8()?;
     let metric = DistanceMetric::from_snapshot_byte(metric_byte)
         .ok_or(GraphSnapshotError::InvalidMetric(metric_byte))?;
-    Ok((dims, metric))
+    let flags = r.u8()?;
+    validate_flags(version, flags)?;
+    let dtype = if flags & FLAG_VECTOR_F16 != 0 {
+        VectorDtype::F16
+    } else {
+        VectorDtype::F32
+    };
+    let quantization = quantization_from_flags(flags);
+    Ok((dims, metric, dtype, quantization))
+}
+
+/// 单条向量记录的字节宽度（编码端估算容量与解码端预分配对账共用）。
+/// EN: Byte width of one vector record, shared by encode capacity estimation
+/// and decode prealloc reconciliation.
+fn vector_record_len(quantization: Quantization, dims: usize) -> usize {
+    match quantization {
+        // id + norm + alpha + ceil(D/64) 个 u64 码字 + dims×f32 source。
+        // EN: id + norm + alpha + ceil(D/64) u64 code words + dims×f32 source.
+        Quantization::RaBitQ => 16 + 8 * rabitq::words_for_dims(dims) + 4 * dims,
+        Quantization::Int8 => 16 + 5 * dims,
+        Quantization::None => 8 + 4 * dims,
+    }
+}
+
+/// 由 flags 的量化位推导图侧量化方式（bit2 int8 / bit3 rabitq；互斥已由
+/// `validate_flags` 按版本钉死）。
+/// EN: Derive graph quantization from the flags bits (bit2 int8 / bit3 rabitq;
+/// mutual exclusion is pinned per version by `validate_flags`).
+fn quantization_from_flags(flags: u8) -> Quantization {
+    if flags & FLAG_VECTOR_RABITQ != 0 {
+        Quantization::RaBitQ
+    } else if flags & FLAG_VECTOR_INT8 != 0 {
+        Quantization::Int8
+    } else {
+        Quantization::None
+    }
 }
 
 impl HnswGraph {
@@ -262,25 +439,58 @@ impl HnswGraph {
     pub(crate) fn encode_snapshot(&self) -> Vec<u8> {
         let (l0_mult, upper_mult) = crate::hnsw_graph::effective_layer_multipliers();
         let link_free_pairs: usize = self.link_free.values().map(Vec::len).sum();
+        // 每条向量记录：v1/v2 为 id + dims×f32；v3 再加 scale/bias + dims×i8；
+        // v4 为 norm/alpha + ceil(D/64) 个符号码字 + dims×f32 source。
+        // EN: Per-vector record: v1/v2 = id + dims×f32; v3 adds scale/bias and
+        // dims×i8; v4 carries norm/alpha + ceil(D/64) sign words + dims×f32 source.
+        let vector_record_len = vector_record_len(self.quantization, self.dims);
         let est = HEADER_LEN
             + self.nodes.len() * NODE_RECORD_LEN
             + self.link_arena.len() * 8
             + link_free_pairs * 16
-            + self.vectors.len() * (8 + self.dims * 4);
+            + self.vectors.len() * vector_record_len;
         let mut w = Writer::with_capacity(est);
+
+        // 版本随图侧量化与 dtype 决定：int8 写 v3、rabitq 写 v4（旧二进制对
+        // 两者都必须显式拒绝）；未量化时 f32 写 v1（旧二进制可冷启动读图）、
+        // f16 写 v2。新增量化方式或 dtype 必须在此扩展显式分支，编译器会强制
+        // 同步版本/标志语义。
+        // EN: The version follows graph quantization and dtype: int8 writes v3
+        // and rabitq writes v4 (older binaries must reject both explicitly);
+        // unquantized f32 writes v1 (older binaries can still cold-start) and
+        // f16 writes v2. A new quantization or dtype must extend this explicit
+        // branch, forcing version/flag semantics to be updated together.
+        let version = match (self.quantization, self.dtype) {
+            (Quantization::RaBitQ, _) => SNAPSHOT_VERSION_RABITQ,
+            (Quantization::Int8, _) => SNAPSHOT_VERSION_INT8,
+            (Quantization::None, VectorDtype::F32) => SNAPSHOT_VERSION_F32,
+            (Quantization::None, VectorDtype::F16) => SNAPSHOT_VERSION_DTYPE,
+        };
 
         // Header
         w.raw(SNAPSHOT_MAGIC);
-        w.u32(SNAPSHOT_VERSION);
+        w.u32(version);
         w.u32(self.dims as u32);
         w.u8(self.metric.to_snapshot_byte());
-        // entry_point 存在性进 flags：u64::MAX 是合法 VectorId，不能当哨兵。
-        // EN: entry_point presence goes into flags: u64::MAX is a valid VectorId, not a sentinel.
-        w.u8(if self.entry_point.is_some() {
-            FLAG_HAS_ENTRY_POINT
-        } else {
-            0
-        });
+        // entry_point 存在性进 flags：u64::MAX 是合法 VectorId，不能当哨兵；
+        // bit1 记录向量 dtype（vectors 段始终写 f32 字节，解码时按该位下转）。
+        // EN: entry_point presence goes into flags: u64::MAX is a valid VectorId, not a sentinel;
+        // EN: bit1 records the vector dtype (the vectors section always writes f32 bytes and
+        // EN: down-converts according to this bit on decode).
+        let mut flags = 0u8;
+        if self.entry_point.is_some() {
+            flags |= FLAG_HAS_ENTRY_POINT;
+        }
+        if self.dtype == VectorDtype::F16 {
+            flags |= FLAG_VECTOR_F16;
+        }
+        if self.quantization.is_int8() {
+            flags |= FLAG_VECTOR_INT8;
+        }
+        if self.quantization.is_rabitq() {
+            flags |= FLAG_VECTOR_RABITQ;
+        }
+        w.u8(flags);
         w.u16(0); // reserved
         w.u32(self.m as u32);
         w.u32(self.ef_construction as u32);
@@ -323,13 +533,73 @@ impl HnswGraph {
             }
         }
 
-        // Vectors（存的是归一化后的存储值，原样落盘原样恢复）
-        // EN: Vectors (normalized stored values; written and restored verbatim).
+        // Vectors。v1/v2 存归一化后的存储值（payload 统一写 f32 字节，f16 在此
+        // 提升回 f32）。v3 额外前置 scale/bias 与 i8 codes，并追加**原始** source
+        // （非反量化近似值）——重启后的精确 rescore 必须基于原始主表值。
+        // EN: Vectors. v1/v2 hold normalized stored values (the payload always
+        // writes f32 bytes; f16 is lifted here). v3 prepends scale/bias and the
+        // i8 codes, then appends the **raw** source (not the dequantized
+        // approximation) — exact rescoring after restart needs raw main-store
+        // values.
         for (id, vec) in &self.vectors {
             w.u64(*id);
-            debug_assert_eq!(vec.len(), self.dims);
-            for x in vec.iter() {
-                w.f32_bits(*x);
+            debug_assert_eq!(vec.dims(), self.dims);
+            match vec {
+                GraphVector::Full(stored) => match stored.as_view() {
+                    VectorRef::F32(v) => {
+                        for x in v {
+                            w.f32_bits(*x);
+                        }
+                    }
+                    VectorRef::F16(v) => {
+                        for x in v {
+                            w.f32_bits(x.to_f32());
+                        }
+                    }
+                },
+                GraphVector::Int8 { codes, source } => {
+                    w.f32_bits(codes.scale);
+                    w.f32_bits(codes.bias);
+                    for &c in &codes.codes {
+                        w.u8(c as u8);
+                    }
+                    match source.as_view() {
+                        VectorRef::F32(v) => {
+                            for x in v {
+                                w.f32_bits(*x);
+                            }
+                        }
+                        VectorRef::F16(v) => {
+                            for x in v {
+                                w.f32_bits(x.to_f32());
+                            }
+                        }
+                    }
+                }
+                GraphVector::RabitQ { codes, source } => {
+                    debug_assert_eq!(
+                        codes.codes.len(),
+                        rabitq::words_for_dims(self.dims),
+                        "rabitq code words must match ceil(D/64)"
+                    );
+                    w.f32_bits(codes.norm);
+                    w.f32_bits(codes.alpha);
+                    for &word in &codes.codes {
+                        w.u64(word);
+                    }
+                    match source.as_view() {
+                        VectorRef::F32(v) => {
+                            for x in v {
+                                w.f32_bits(*x);
+                            }
+                        }
+                        VectorRef::F16(v) => {
+                            for x in v {
+                                w.f32_bits(x.to_f32());
+                            }
+                        }
+                    }
+                }
             }
         }
 
@@ -351,7 +621,7 @@ impl HnswGraph {
             return Err(GraphSnapshotError::BadMagic);
         }
         let version = r.u32()?;
-        if version != SNAPSHOT_VERSION {
+        if !is_supported_version(version) {
             return Err(GraphSnapshotError::UnsupportedVersion(version));
         }
         let dims = r.u32()? as usize;
@@ -359,7 +629,21 @@ impl HnswGraph {
         let metric = DistanceMetric::from_snapshot_byte(metric_byte)
             .ok_or(GraphSnapshotError::InvalidMetric(metric_byte))?;
         let flags = r.u8()?;
+        validate_flags(version, flags)?;
         let _reserved = r.u16()?;
+        // dtype 由 flags bit1 表达；缺席即 f32，旧快照天然落在 f32。
+        // EN: dtype comes from flags bit1; absent means f32, which old snapshots
+        // naturally satisfy.
+        let dtype = if flags & FLAG_VECTOR_F16 != 0 {
+            VectorDtype::F16
+        } else {
+            VectorDtype::F32
+        };
+        // 图侧量化同样由 flags 表达；v3 必有 int8 位、v4 必有 rabitq 位
+        // （validate_flags 已钉死）。
+        // EN: Graph quantization is also expressed by flags; v3 always carries
+        // the int8 bit and v4 the rabitq bit (validate_flags pins both).
+        let quantization = quantization_from_flags(flags);
         let m = r.u32()? as usize;
         let ef_construction = r.u32()? as usize;
         let ef_search = r.u32()? as usize;
@@ -382,6 +666,12 @@ impl HnswGraph {
         }
         if metric != expected.metric {
             return Err(GraphSnapshotError::Mismatch("metric"));
+        }
+        if dtype != expected.dtype {
+            return Err(GraphSnapshotError::Mismatch("vector_dtype"));
+        }
+        if quantization != expected.quantization {
+            return Err(GraphSnapshotError::Mismatch("quantization"));
         }
         if num_layers != expected.num_layers {
             return Err(GraphSnapshotError::Mismatch("num_layers"));
@@ -420,6 +710,12 @@ impl HnswGraph {
         // EN: otherwise forged giant counts turn with_capacity into OOM/abort instead of a clean
         // EN: Truncated rejection (OCR ae8d7e3). remaining may be larger (the wrapper appends a
         // EN: tombstone trailer), so only the lower bound is checked.
+        // 记录宽度由图侧量化决定（v1/v2 无量化、v3 int8、v4 RaBitQ）；
+        // header 的 dims 反算出 D = next_power_of_two，再得码字数。
+        // EN: The record width follows graph quantization (v1/v2 plain, v3 int8,
+        // v4 RaBitQ); D = next_power_of_two(dims) from the header yields the
+        // word count.
+        let vector_record_len = vector_record_len(quantization, dims);
         let declared = node_count
             .checked_mul(NODE_RECORD_LEN)
             .and_then(|n| arena_len.checked_mul(8).and_then(|a| n.checked_add(a)))
@@ -430,7 +726,7 @@ impl HnswGraph {
             })
             .and_then(|n| {
                 vector_count
-                    .checked_mul(8 + 4 * dims)
+                    .checked_mul(vector_record_len)
                     .and_then(|v| n.checked_add(v))
             });
         if declared.is_none_or(|need| need > r.remaining()) {
@@ -512,22 +808,84 @@ impl HnswGraph {
             link_free.entry(slots).or_default().push(base);
         }
 
-        // Vectors
-        let mut vectors: AHashMap<VectorId, Arc<Vec<f32>>> = AHashMap::with_capacity(vector_count);
+        // Vectors：v1/v2 的 f32 字节按 flags 记录的 dtype 一次性下转；v3 还原
+        // int8 codes + 原始 source（source 同样按 dtype 下转）。
+        // EN: Vectors: v1/v2 f32 bytes are down-converted once to the dtype in
+        // flags; v3 restores int8 codes plus the raw source (also down-converted
+        // to dtype).
+        let mut vectors: AHashMap<VectorId, GraphVector> = AHashMap::with_capacity(vector_count);
         for _ in 0..vector_count {
             let id = r.u64()?;
             if !nodes.contains_key(&id) {
                 return Err(GraphSnapshotError::InvalidStructure("vector.orphan"));
             }
-            let mut v = Vec::with_capacity(dims);
-            for _ in 0..dims {
-                v.push(r.f32_bits()?);
-            }
+            let entry = match quantization {
+                Quantization::RaBitQ => {
+                    let norm = r.f32_bits()?;
+                    let alpha = r.f32_bits()?;
+                    // 非有限的 norm/alpha 会让图内距离产出 NaN 并污染堆序；
+                    // alpha ≤ 0 会让 `est_cos = b / alpha` 反向或爆炸。合法编码器
+                    // （`RaBitQVector::from_rotated_unit` / 零范数哨兵）不可能产出，
+                    // 按伪造拒绝。
+                    // EN: Non-finite norm/alpha make in-graph distances NaN and
+                    // corrupt heap ordering; alpha <= 0 flips or blows up
+                    // `est_cos = b / alpha`. A valid encoder
+                    // (`RaBitQVector::from_rotated_unit` / zero-norm sentinel)
+                    // never produces them, so reject as forged.
+                    if !norm.is_finite() || norm < 0.0 || !alpha.is_finite() || alpha <= 0.0 {
+                        return Err(GraphSnapshotError::InvalidStructure("vector.quantization"));
+                    }
+                    let words = rabitq::words_for_dims(dims);
+                    let mut codes = Vec::with_capacity(words);
+                    for _ in 0..words {
+                        codes.push(r.u64()?);
+                    }
+                    let mut source = Vec::with_capacity(dims);
+                    for _ in 0..dims {
+                        source.push(r.f32_bits()?);
+                    }
+                    GraphVector::RabitQ {
+                        codes: Arc::new(RaBitQVector { codes, alpha, norm }),
+                        source: Arc::new(StoredVector::from_f32(source, dtype)),
+                    }
+                }
+                Quantization::Int8 => {
+                    let scale = r.f32_bits()?;
+                    let bias = r.f32_bits()?;
+                    // 非有限的 scale/bias 会让图内距离产出 NaN 并污染堆序，
+                    // 合法编码器（`Int8Vector::quantize`）不可能产出，按伪造拒绝。
+                    // EN: Non-finite scale/bias make in-graph distances NaN and
+                    // corrupt heap ordering; a valid encoder
+                    // (`Int8Vector::quantize`) never produces them, so reject as forged.
+                    if !scale.is_finite() || !bias.is_finite() {
+                        return Err(GraphSnapshotError::InvalidStructure("vector.quantization"));
+                    }
+                    let mut codes = Vec::with_capacity(dims);
+                    for _ in 0..dims {
+                        codes.push(r.u8()? as i8);
+                    }
+                    let mut source = Vec::with_capacity(dims);
+                    for _ in 0..dims {
+                        source.push(r.f32_bits()?);
+                    }
+                    GraphVector::Int8 {
+                        codes: Arc::new(Int8Vector { codes, scale, bias }),
+                        source: Arc::new(StoredVector::from_f32(source, dtype)),
+                    }
+                }
+                Quantization::None => {
+                    let mut v = Vec::with_capacity(dims);
+                    for _ in 0..dims {
+                        v.push(r.f32_bits()?);
+                    }
+                    GraphVector::Full(Arc::new(StoredVector::from_f32(v, dtype)))
+                }
+            };
             // 重复 id 会静默覆盖并破坏 node/vector 双射（漏检的节点从 main_index
             // 缺席、被搜索静默跳过），与 nodes 段同纪律拒绝（OCR ae8d7e3）。
             // EN: Duplicate ids would silently overwrite and break the node/vector bijection (missing
             // EN: nodes are absent from main_index and skipped by search); rejected like the nodes section.
-            if vectors.insert(id, Arc::new(v)).is_some() {
+            if vectors.insert(id, entry).is_some() {
                 return Err(GraphSnapshotError::InvalidStructure("vector.duplicate"));
             }
         }
@@ -553,6 +911,8 @@ impl HnswGraph {
         let graph = Self::restore_from_snapshot(SnapshotGraphParts {
             dims,
             metric,
+            dtype,
+            quantization,
             m,
             ef_construction,
             ef_search,
@@ -688,9 +1048,14 @@ impl HotBufferIndex {
         self.hnsw_ef_search
             .store(graph.ef_search, Ordering::Release);
 
+        // 主表重建必须用原始 source（int8 图侧只是 codes，主表要精确 rescore
+        // 原始值）；未量化图 source 即图向量本身，`Arc` 共享关系不变。
+        // EN: The main map must rebuild from the raw source (an int8 graph only
+        // holds codes while rescoring needs raw values); for unquantized graphs
+        // source is the graph vector itself, so `Arc` sharing is unchanged.
         main.clear();
         for (id, v) in &graph.vectors {
-            main.insert(*id, Arc::clone(v));
+            main.insert(*id, v.source_arc());
         }
         *ts = tombstones;
         *slot = graph;
@@ -733,7 +1098,14 @@ mod tests {
         assert_eq!(av.len(), bv.len(), "vector count");
         for ((aid, avec), (bid, bvec)) in av.iter().zip(bv.iter()) {
             assert_eq!(aid, bid);
-            assert_eq!(avec.as_slice(), bvec.as_slice(), "vector bits for {aid}");
+            // 快照按 f32 字节往返，f16 图两侧提升后应逐位一致。
+            // EN: Snapshots roundtrip f32 bytes; lifting both sides of an f16 graph
+            // must match bit-for-bit.
+            assert_eq!(
+                avec.to_f32_vec(),
+                bvec.to_f32_vec(),
+                "vector bits for {aid}"
+            );
             let level = a.node_level(*aid).expect("node level");
             assert_eq!(Some(level), b.node_level(*bid), "node level for {aid}");
             for layer in 0..=level {
@@ -772,6 +1144,118 @@ mod tests {
             HnswGraph::decode_snapshot(&bytes, &expectations_for(&g)).expect("decode");
         assert_eq!(consumed, bytes.len());
         assert_graphs_equivalent(&g, &restored);
+    }
+
+    /// f16 图快照（P1.4）：flags bit1 置位、peek 返回 f16、f32 线格式往返后
+    /// 两侧提升值逐位一致（f16 值在 f32 中可精确表示）。
+    /// EN: f16 graph snapshot (P1.4): flags bit1 is set, peek reports f16, and the
+    /// f32 wire format roundtrips with bit-identical lifted values.
+    #[test]
+    fn roundtrip_f16_graph_preserves_dtype_and_vectors() {
+        let dims = 8;
+        let mut g =
+            HnswGraph::new_with_dtype(dims, DistanceMetric::L2, VectorDtype::F16, 4, 32, 16, 42, 8);
+        for i in 0..120u64 {
+            g.insert(i + 1, gen_vector(dims, i + 1));
+        }
+        let bytes = g.encode_snapshot();
+        // f16 快照写 v2（旧二进制必须显式拒绝）；flags 位于头偏移 17，bit1 = f16。
+        // EN: f16 snapshots are written as v2 (older binaries must reject
+        // explicitly); flags live at header offset 17, bit1 means f16.
+        assert_eq!(
+            u32::from_be_bytes(bytes[8..12].try_into().unwrap()),
+            SNAPSHOT_VERSION_DTYPE
+        );
+        assert_eq!(bytes[17] & FLAG_VECTOR_F16, FLAG_VECTOR_F16);
+        assert_eq!(
+            peek_graph_snapshot_dims_metric_dtype(&bytes).expect("peek"),
+            (dims, DistanceMetric::L2, VectorDtype::F16)
+        );
+        let (restored, consumed) =
+            HnswGraph::decode_snapshot(&bytes, &expectations_for(&g)).expect("decode");
+        assert_eq!(consumed, bytes.len());
+        assert_eq!(restored.dtype(), VectorDtype::F16);
+        assert_graphs_equivalent(&g, &restored);
+    }
+
+    /// 默认 f32 快照不受 f16 位影响；peek 明确报告 f32（旧快照兼容口径）。
+    /// EN: Default f32 snapshots are untouched by the f16 bit; peek reports f32
+    /// explicitly (the old-snapshot compatibility contract).
+    #[test]
+    fn f32_snapshot_peek_reports_f32() {
+        let g = build_graph(32, 8, 4, 8);
+        let bytes = g.encode_snapshot();
+        // f32 保持 v1，旧二进制仍能冷启动读图。
+        // EN: f32 stays v1 so older binaries can still cold-start from the graph.
+        assert_eq!(
+            u32::from_be_bytes(bytes[8..12].try_into().unwrap()),
+            SNAPSHOT_VERSION_F32
+        );
+        assert_eq!(bytes[17] & FLAG_VECTOR_F16, 0);
+        assert_eq!(
+            peek_graph_snapshot_dims_metric_dtype(&bytes).expect("peek"),
+            (8, DistanceMetric::L2, VectorDtype::F32)
+        );
+    }
+
+    /// 版本/标志门禁：v1 携带 f16 位与任意未知 flag 位都必须 fail-fast
+    /// （decode 与 peek 口径一致），不得静默按无 dtype 语义降级。
+    /// EN: Version/flag gates: v1 carrying the f16 bit and any unknown flag bit
+    /// must fail fast (decode and peek agree), never silently downgrade to
+    /// dtype-free semantics.
+    #[test]
+    fn version_and_flag_gates_reject_downgrade_and_unknown_bits() {
+        let g32 = build_graph(8, 8, 4, 8);
+        let mut g16 =
+            HnswGraph::new_with_dtype(8, DistanceMetric::L2, VectorDtype::F16, 4, 32, 16, 42, 8);
+        g16.insert(1, gen_vector(8, 1));
+        let bytes16 = g16.encode_snapshot();
+
+        // 把 v2 头改回 v1：f16 位在 v1 下无定义，必须拒绝。
+        // EN: Rewrite the v2 header as v1: the f16 bit is undefined under v1
+        // and must be rejected.
+        let mut forged_v1 = bytes16.clone();
+        forged_v1[8..12].copy_from_slice(&SNAPSHOT_VERSION_F32.to_be_bytes());
+        assert_eq!(
+            HnswGraph::decode_snapshot(&forged_v1, &expectations_for(&g32)).err(),
+            Some(GraphSnapshotError::InvalidStructure("flags"))
+        );
+        assert_eq!(
+            peek_graph_snapshot_dims_metric_dtype(&forged_v1).err(),
+            Some(GraphSnapshotError::InvalidStructure("flags"))
+        );
+
+        // v2 的未知位（bit2）同样拒绝。
+        // EN: Unknown bits (bit2) are rejected on v2 as well.
+        let mut unknown_bit = bytes16.clone();
+        unknown_bit[17] |= 0x04;
+        assert_eq!(
+            HnswGraph::decode_snapshot(&unknown_bit, &expectations_for(&g16)).err(),
+            Some(GraphSnapshotError::InvalidStructure("flags"))
+        );
+        assert_eq!(
+            peek_graph_snapshot_dims_metric_dtype(&unknown_bit).err(),
+            Some(GraphSnapshotError::InvalidStructure("flags"))
+        );
+    }
+
+    /// dtype 是恢复的硬期望：f16 快照不得写入 f32 目标（否则静默按错误精度
+    /// 解释向量，后续检索与快照改写都会漂移）。
+    /// EN: dtype is a hard restore expectation: an f16 snapshot must not land in
+    /// an f32 target, which would silently reinterpret vectors at the wrong
+    /// precision and drift both search and later re-encoded snapshots.
+    #[test]
+    fn decode_rejects_vector_dtype_mismatch() {
+        let dims = 8;
+        let mut g =
+            HnswGraph::new_with_dtype(dims, DistanceMetric::L2, VectorDtype::F16, 4, 32, 16, 42, 8);
+        g.insert(1, gen_vector(dims, 1));
+        let bytes = g.encode_snapshot();
+        let f32_graph = HnswGraph::new(dims, DistanceMetric::L2, 4, 32, 16, 42, 8);
+        assert_eq!(
+            HnswGraph::decode_snapshot(&bytes, &expectations_for(&f32_graph)).err(),
+            Some(GraphSnapshotError::Mismatch("vector_dtype"))
+        );
     }
 
     #[test]
@@ -1144,6 +1628,63 @@ mod tests {
         }
     }
 
+    /// f16 HotBuffer 快照往返（P1.4）：dtype 经 flags 传递，恢复后检索排序一致，
+    /// 导出边界提升为 f32（快照线格式与逻辑备份均为 f32）。
+    /// EN: f16 HotBuffer snapshot roundtrip (P1.4): dtype travels via flags, search
+    /// ranking matches after restore, and exports lift to f32 at the boundary (both
+    /// the snapshot wire format and logical backup are f32).
+    #[tokio::test]
+    async fn hotbuffer_f16_snapshot_roundtrip_and_search_equivalence() {
+        let dims = 16;
+        let src =
+            HotBufferIndex::new_with_metric_and_dtype(dims, DistanceMetric::L2, VectorDtype::F16);
+        let batch: Vec<_> = (0..200u64)
+            .map(|i| (i + 1, hb_vector(dims, i + 1)))
+            .collect();
+        src.insert_batch(batch).await.expect("insert_batch");
+        drain_all(&src).await;
+        let bytes = src.encode_graph_snapshot().await;
+
+        let dst =
+            HotBufferIndex::new_with_metric_and_dtype(dims, DistanceMetric::L2, VectorDtype::F16);
+        dst.restore_graph_snapshot(&bytes).await.expect("restore");
+        assert_eq!(dst.vector_dtype(), VectorDtype::F16);
+
+        for q in [1u64, 77, 190] {
+            let query = hb_vector(dims, q);
+            let a = src
+                .search_scored_with_ef_override(&query, 10, None, None)
+                .await;
+            let b = dst
+                .search_scored_with_ef_override(&query, 10, None, None)
+                .await;
+            assert_eq!(a, b, "f16 scored top-10 for query seed {q}");
+        }
+        let exported = dst.export_snapshot_vectors().await.expect("export");
+        assert_eq!(exported.len(), 200);
+        assert_eq!(exported[0].1.len(), dims);
+    }
+
+    /// f32 目标拒绝 f16 快照（dtype 不匹配必须显式失败，不得静默降精度）。
+    /// EN: An f32 target rejects an f16 snapshot — dtype mismatch must fail
+    /// loudly instead of silently dropping precision.
+    #[tokio::test]
+    async fn hotbuffer_restore_rejects_vector_dtype_mismatch() {
+        let dims = 8;
+        let src =
+            HotBufferIndex::new_with_metric_and_dtype(dims, DistanceMetric::L2, VectorDtype::F16);
+        src.insert_batch(vec![(1, hb_vector(dims, 1))])
+            .await
+            .expect("insert_batch");
+        drain_all(&src).await;
+        let bytes = src.encode_graph_snapshot().await;
+        let dst = HotBufferIndex::new(dims);
+        assert_eq!(
+            dst.restore_graph_snapshot(&bytes).await.err(),
+            Some(GraphSnapshotError::Mismatch("vector_dtype"))
+        );
+    }
+
     #[tokio::test]
     async fn hotbuffer_tombstones_preserved_and_resurrection_works() {
         let dims = 8;
@@ -1204,7 +1745,13 @@ mod tests {
         assert!(!main.contains_key(&9));
         for (id, v) in graph.vectors.iter() {
             let mv = main.get(id).expect("main contains graph id");
-            assert!(Arc::ptr_eq(mv, v), "main must Arc-share graph vectors");
+            // 主表与图共享 source 句柄（未量化图 source 即图向量本身）。
+            // EN: The main map shares the source handle with the graph (for an
+            // unquantized graph, source is the graph vector itself).
+            assert!(
+                Arc::ptr_eq(mv, &v.source_arc()),
+                "main must Arc-share the graph source"
+            );
         }
     }
 
@@ -1302,5 +1849,576 @@ mod tests {
             HnswGraph::decode_snapshot(&bytes, &expectations_for(&g)).expect("decode");
         assert_eq!(consumed, bytes.len());
         assert_graphs_equivalent(&g, &restored);
+    }
+
+    // ── P2：图快照 v3（int8 codes + 原始 source） ────────────────
+    // ── EN: P2: graph snapshot v3 (int8 codes + raw source) ──────
+
+    fn build_int8_graph(
+        n: usize,
+        dims: usize,
+        metric: DistanceMetric,
+        dtype: VectorDtype,
+    ) -> HnswGraph {
+        let mut g = HnswGraph::new_with_dtype_and_quantization(
+            dims,
+            metric,
+            dtype,
+            Quantization::Int8,
+            4,
+            32,
+            16,
+            42,
+            8,
+        );
+        for i in 0..n {
+            let id = i as u64 + 1;
+            g.insert(id, gen_vector(dims, id));
+        }
+        g
+    }
+
+    /// v3 往返：codes / scale / bias 位级一致，source 是**原始**主表值（不是
+    /// 反量化近似值）——重启后的精确 rescore 依赖它。
+    /// EN: v3 roundtrip: codes/scale/bias are bit-identical and `source` holds the
+    /// **raw** main-store values (not the dequantized approximation) — exact
+    /// rescoring after restart relies on it.
+    #[test]
+    fn roundtrip_int8_graph_preserves_codes_and_raw_source() {
+        let g = build_int8_graph(64, 8, DistanceMetric::Cosine, VectorDtype::F32);
+        let bytes = g.encode_snapshot();
+        assert_eq!(
+            u32::from_be_bytes(bytes[8..12].try_into().unwrap()),
+            SNAPSHOT_VERSION_INT8
+        );
+        let (restored, consumed) =
+            HnswGraph::decode_snapshot(&bytes, &expectations_for(&g)).expect("decode");
+        assert_eq!(consumed, bytes.len());
+        assert_eq!(restored.quantization(), Quantization::Int8);
+        assert_graphs_equivalent(&g, &restored);
+        for id in 1..=64u64 {
+            let pick = |graph: &HnswGraph| {
+                let gv = graph.graph_vector(id).expect("vector");
+                match gv {
+                    GraphVector::Int8 { codes, source } => (
+                        codes.codes.clone(),
+                        codes.scale.to_bits(),
+                        codes.bias.to_bits(),
+                        source.to_f32_vec(),
+                    ),
+                    GraphVector::Full(_) | GraphVector::RabitQ { .. } => {
+                        panic!("int8 snapshot must restore GraphVector::Int8")
+                    }
+                }
+            };
+            let (ca, sa, ba, src_a) = pick(&g);
+            let (cb, sb, bb, src_b) = pick(&restored);
+            assert_eq!(ca, cb, "codes for {id}");
+            assert_eq!((sa, ba), (sb, bb), "scale/bias bits for {id}");
+            assert_eq!(src_a, src_b, "raw source for {id}");
+        }
+    }
+
+    /// v3 与 f16 主表组合：两个 flag 位并存，source 按 f16 精确往返。
+    /// EN: v3 combined with an f16 main store: both flag bits coexist and the
+    /// f16 source roundtrips exactly.
+    #[test]
+    fn roundtrip_int8_f16_graph_combination() {
+        let g = build_int8_graph(32, 8, DistanceMetric::Cosine, VectorDtype::F16);
+        let bytes = g.encode_snapshot();
+        assert_eq!(
+            u32::from_be_bytes(bytes[8..12].try_into().unwrap()),
+            SNAPSHOT_VERSION_INT8
+        );
+        assert_eq!(bytes[17] & FLAG_VECTOR_INT8, FLAG_VECTOR_INT8, "int8 flag");
+        assert_eq!(bytes[17] & FLAG_VECTOR_F16, FLAG_VECTOR_F16, "f16 flag");
+        let (restored, _) =
+            HnswGraph::decode_snapshot(&bytes, &expectations_for(&g)).expect("decode");
+        assert_eq!(restored.dtype(), VectorDtype::F16);
+        assert_eq!(restored.quantization(), Quantization::Int8);
+        assert_graphs_equivalent(&g, &restored);
+    }
+
+    /// 标志位门禁：v3 必须置 int8 位；int8 位不得出现在 v1 头上。
+    /// EN: Flag gates: v3 must set the int8 bit, and the int8 bit must not
+    /// appear on a v1 header.
+    #[test]
+    fn decode_rejects_int8_flag_and_version_mismatch() {
+        let int8 = build_int8_graph(8, 8, DistanceMetric::L2, VectorDtype::F32);
+        let mut bytes = int8.encode_snapshot();
+        bytes[17] &= !FLAG_VECTOR_INT8;
+        assert_eq!(
+            HnswGraph::decode_snapshot(&bytes, &expectations_for(&int8)).err(),
+            Some(GraphSnapshotError::InvalidStructure("flags"))
+        );
+
+        let plain = build_graph(8, 8, 4, 8);
+        let mut bytes = plain.encode_snapshot();
+        bytes[17] |= FLAG_VECTOR_INT8;
+        assert_eq!(
+            HnswGraph::decode_snapshot(&bytes, &expectations_for(&plain)).err(),
+            Some(GraphSnapshotError::InvalidStructure("flags"))
+        );
+    }
+
+    /// 双向量化期望校验：未量化目标拒绝 int8 快照（codes 会被当成 f32 主表值），
+    /// int8 目标拒绝未量化快照（静默降级成未量化图）。
+    /// EN: Bidirectional quantization expectations: an unquantized target rejects
+    /// an int8 snapshot (codes would be read as f32 main-store values), and an
+    /// int8 target rejects an unquantized snapshot (silent downgrade).
+    #[test]
+    fn decode_rejects_quantization_mismatch_in_both_directions() {
+        let int8 = build_int8_graph(8, 8, DistanceMetric::L2, VectorDtype::F32);
+        let plain = HnswGraph::new(8, DistanceMetric::L2, 4, 32, 16, 42, 8);
+        let bytes = int8.encode_snapshot();
+        assert_eq!(
+            HnswGraph::decode_snapshot(&bytes, &expectations_for(&plain)).err(),
+            Some(GraphSnapshotError::Mismatch("quantization"))
+        );
+        let plain_g = build_graph(8, 8, 4, 8);
+        let bytes = plain_g.encode_snapshot();
+        assert_eq!(
+            HnswGraph::decode_snapshot(&bytes, &expectations_for(&int8)).err(),
+            Some(GraphSnapshotError::Mismatch("quantization"))
+        );
+    }
+
+    /// peek 四元组返回量化方式；旧 dtype/dims peek 行为不变。
+    /// EN: The quartet peek reports quantization; legacy dtype/dims peeks are unchanged.
+    #[test]
+    fn peek_reports_quantization_and_keeps_legacy_entries() {
+        let int8 = build_int8_graph(4, 8, DistanceMetric::Cosine, VectorDtype::F16);
+        let bytes = int8.encode_snapshot();
+        assert_eq!(
+            peek_graph_snapshot_dims_metric_dtype_quantization(&bytes),
+            Ok((
+                8,
+                DistanceMetric::Cosine,
+                VectorDtype::F16,
+                Quantization::Int8
+            ))
+        );
+        assert_eq!(
+            peek_graph_snapshot_dims_metric_dtype(&bytes),
+            Ok((8, DistanceMetric::Cosine, VectorDtype::F16))
+        );
+        assert_eq!(
+            peek_graph_snapshot_dims_metric(&bytes),
+            Ok((8, DistanceMetric::Cosine))
+        );
+        let plain = build_graph(4, 8, 4, 8);
+        let bytes = plain.encode_snapshot();
+        assert_eq!(
+            peek_graph_snapshot_dims_metric_dtype_quantization(&bytes),
+            Ok((8, DistanceMetric::L2, VectorDtype::F32, Quantization::None))
+        );
+    }
+
+    /// v3 段长对账：伪造巨型 count 必须是干净的 Truncated（按 v3 记录宽度）。
+    /// EN: v3 section-length reconcile: forged giant counts must be a clean
+    /// Truncated under the v3 record width.
+    #[test]
+    fn decode_rejects_oversized_declared_counts_for_v3() {
+        let g = build_int8_graph(4, 8, DistanceMetric::L2, VectorDtype::F32);
+        let mut bytes = g.encode_snapshot();
+        bytes[60..68].copy_from_slice(&u64::MAX.to_be_bytes()); // node_count
+        bytes[84..92].copy_from_slice(&u64::MAX.to_be_bytes()); // vector_count（保持相等）
+        let err = HnswGraph::decode_snapshot(&bytes, &expectations_for(&g)).err();
+        assert!(
+            matches!(err, Some(GraphSnapshotError::Truncated { .. })),
+            "giant declared counts must be a clean Truncated, got {err:?}"
+        );
+    }
+
+    /// v3 双射与有限性守卫：重复 id 拒绝；非有限 scale/bias 拒绝（否则图内距离
+    /// 产出 NaN 污染堆序）。
+    /// EN: v3 bijection and finiteness guards: duplicate ids are rejected; non-finite
+    /// scale/bias are rejected (they would NaN out in-graph distances and corrupt heap order).
+    #[test]
+    fn decode_rejects_duplicate_and_non_finite_v3_vector_records() {
+        let g = build_int8_graph(4, 8, DistanceMetric::L2, VectorDtype::F32);
+        let bytes = g.encode_snapshot();
+        let node_count = u64::from_be_bytes(bytes[60..68].try_into().unwrap()) as usize;
+        let arena_len = u64::from_be_bytes(bytes[68..76].try_into().unwrap()) as usize;
+        let lf_pairs = u64::from_be_bytes(bytes[76..84].try_into().unwrap()) as usize;
+        let voff = HEADER_LEN + node_count * NODE_RECORD_LEN + arena_len * 8 + lf_pairs * 16;
+        let rec = 16 + 5 * 8; // id u64 + scale/bias f32 + dims×i8 + dims×f32 source
+
+        let mut dup = bytes.clone();
+        let first_id: [u8; 8] = dup[voff..voff + 8].try_into().unwrap();
+        dup[voff + rec..voff + rec + 8].copy_from_slice(&first_id);
+        assert_eq!(
+            HnswGraph::decode_snapshot(&dup, &expectations_for(&g)).err(),
+            Some(GraphSnapshotError::InvalidStructure("vector.duplicate"))
+        );
+
+        // scale 非有限（换为 NaN 位型）按伪造拒绝。
+        // EN: non-finite scale (NaN bit pattern) is rejected as forged.
+        let mut bad = bytes;
+        bad[voff + 8..voff + 12].copy_from_slice(&f32::NAN.to_bits().to_be_bytes());
+        assert_eq!(
+            HnswGraph::decode_snapshot(&bad, &expectations_for(&g)).err(),
+            Some(GraphSnapshotError::InvalidStructure("vector.quantization"))
+        );
+    }
+
+    /// int8 HotBuffer 快照往返：恢复后主表必须是**原始**向量且与图 source 共享
+    /// `Arc`，检索排序与源索引一致。
+    /// EN: int8 HotBuffer snapshot roundtrip: the restored main store keeps raw
+    /// vectors and Arc-shares them with the graph source; search ranking matches
+    /// the source index.
+    #[tokio::test]
+    async fn hotbuffer_int8_snapshot_roundtrip_restores_raw_source() {
+        let dims = 16;
+        let mk = || {
+            HotBufferIndex::new_with_metric_and_config_and_dtype_and_quantization(
+                dims,
+                DistanceMetric::L2,
+                VectorDtype::F32,
+                Quantization::Int8,
+                &houyi_core::config::VectorConfig::default(),
+                &houyi_core::config::HnswConfig::default(),
+            )
+        };
+        let src = mk();
+        let batch: Vec<_> = (0..64u64)
+            .map(|i| (i + 1, hb_vector(dims, i + 1)))
+            .collect();
+        let expected: Vec<(u64, Vec<f32>)> = batch.clone();
+        src.insert_batch(batch).await.expect("insert_batch");
+        drain_all(&src).await;
+        assert_eq!(src.vector_quantization(), Quantization::Int8);
+        let bytes = src.encode_graph_snapshot().await;
+
+        let dst = mk();
+        dst.restore_graph_snapshot(&bytes).await.expect("restore");
+        assert_eq!(dst.vector_quantization(), Quantization::Int8);
+
+        for (id, raw) in &expected {
+            let main = dst.main_index.read().await;
+            let stored = main.get(id).expect("restored row must reach the main map");
+            assert_eq!(stored.to_f32_vec(), *raw, "main keeps raw value for {id}");
+        }
+        for (id, _) in &expected {
+            let main_arc = {
+                let main = dst.main_index.read().await;
+                Arc::clone(main.get(id).expect("restored row"))
+            };
+            let g = crate::hnsw_read_guard(&dst.hnsw);
+            let gv = g.graph_vector(*id).expect("restored graph vector");
+            assert!(
+                matches!(gv, GraphVector::Int8 { .. }),
+                "restored graph must stay int8"
+            );
+            assert!(
+                Arc::ptr_eq(&main_arc, &gv.source_arc()),
+                "main store and int8 source must share one Arc"
+            );
+        }
+
+        for q in [1u64, 17, 42] {
+            let query = hb_vector(dims, q);
+            let a = src
+                .search_scored_with_ef_override(&query, 10, None, None)
+                .await;
+            let b = dst
+                .search_scored_with_ef_override(&query, 10, None, None)
+                .await;
+            assert_eq!(a, b, "int8 scored top-10 for query seed {q}");
+        }
+    }
+
+    // ── P3：图快照 v4（RaBitQ codes + 原始 source） ────────────────
+    // ── EN: P3: graph snapshot v4 (RaBitQ codes + raw source) ────
+
+    fn build_rabitq_graph(
+        n: usize,
+        dims: usize,
+        metric: DistanceMetric,
+        dtype: VectorDtype,
+    ) -> HnswGraph {
+        let mut g = HnswGraph::new_with_dtype_and_quantization(
+            dims,
+            metric,
+            dtype,
+            Quantization::RaBitQ,
+            4,
+            32,
+            16,
+            42,
+            8,
+        );
+        for i in 0..n {
+            let id = i as u64 + 1;
+            g.insert(id, gen_vector(dims, id));
+        }
+        g
+    }
+
+    /// v4 往返：codes/alpha/norm 位级一致，source 是**原始**主表值——重启后的
+    /// 精确 rescore 依赖它。版本号与 bit3 标志必须同时出现。
+    /// EN: v4 roundtrip: codes/alpha/norm are bit-identical and `source` holds
+    /// **raw** main-store values (exact rescoring after restart depends on it).
+    /// The version number and the bit3 flag must appear together.
+    #[test]
+    fn roundtrip_rabitq_graph_preserves_codes_and_raw_source() {
+        let g = build_rabitq_graph(64, 8, DistanceMetric::Cosine, VectorDtype::F32);
+        let bytes = g.encode_snapshot();
+        assert_eq!(
+            u32::from_be_bytes(bytes[8..12].try_into().unwrap()),
+            SNAPSHOT_VERSION_RABITQ
+        );
+        assert_eq!(
+            bytes[17] & FLAG_VECTOR_RABITQ,
+            FLAG_VECTOR_RABITQ,
+            "v4 must set the rabitq flag"
+        );
+        assert_eq!(bytes[17] & FLAG_VECTOR_INT8, 0, "v4 must not set int8");
+        let (restored, consumed) =
+            HnswGraph::decode_snapshot(&bytes, &expectations_for(&g)).expect("decode");
+        assert_eq!(consumed, bytes.len());
+        assert_eq!(restored.quantization(), Quantization::RaBitQ);
+        assert_graphs_equivalent(&g, &restored);
+        for id in 1..=64u64 {
+            let pick = |graph: &HnswGraph| {
+                let gv = graph.graph_vector(id).expect("vector");
+                match gv {
+                    GraphVector::RabitQ { codes, source } => (
+                        codes.codes.clone(),
+                        codes.alpha.to_bits(),
+                        codes.norm.to_bits(),
+                        source.to_f32_vec(),
+                    ),
+                    GraphVector::Full(_) | GraphVector::Int8 { .. } => {
+                        panic!("rabitq snapshot must restore GraphVector::RabitQ")
+                    }
+                }
+            };
+            let (ca, aa, na, src_a) = pick(&g);
+            let (cb, ab, nb, src_b) = pick(&restored);
+            assert_eq!(ca, cb, "codes for {id}");
+            assert_eq!((aa, na), (ab, nb), "alpha/norm bits for {id}");
+            assert_eq!(src_a, src_b, "raw source for {id}");
+        }
+    }
+
+    /// v4 与 f16 主表组合：bit3 与 bit1 并存，source 按 f16 精确往返。
+    /// EN: v4 combined with an f16 main store: bit3 and bit1 coexist and the
+    /// f16 source roundtrips exactly.
+    #[test]
+    fn roundtrip_rabitq_f16_graph_combination() {
+        let g = build_rabitq_graph(32, 8, DistanceMetric::Cosine, VectorDtype::F16);
+        let bytes = g.encode_snapshot();
+        assert_eq!(
+            u32::from_be_bytes(bytes[8..12].try_into().unwrap()),
+            SNAPSHOT_VERSION_RABITQ
+        );
+        assert_eq!(
+            bytes[17] & FLAG_VECTOR_RABITQ,
+            FLAG_VECTOR_RABITQ,
+            "rabitq flag"
+        );
+        assert_eq!(bytes[17] & FLAG_VECTOR_F16, FLAG_VECTOR_F16, "f16 flag");
+        let (restored, _) =
+            HnswGraph::decode_snapshot(&bytes, &expectations_for(&g)).expect("decode");
+        assert_eq!(restored.dtype(), VectorDtype::F16);
+        assert_eq!(restored.quantization(), Quantization::RaBitQ);
+        assert_graphs_equivalent(&g, &restored);
+    }
+
+    /// 标志位门禁：v4 必须置 bit3；bit3 不得出现在 v1 头上；v4 携带 int8 位
+    /// （bit2）拒绝（一张图不可能同时采用两种图侧量化）。
+    /// EN: Flag gates: v4 must set bit3; bit3 must not appear on a v1 header;
+    /// v4 carrying the int8 bit (bit2) is rejected (one graph cannot use two
+    /// graph-side quantization schemes).
+    #[test]
+    fn decode_rejects_rabitq_flag_and_version_mismatch() {
+        let rabitq = build_rabitq_graph(8, 8, DistanceMetric::L2, VectorDtype::F32);
+        let mut bytes = rabitq.encode_snapshot();
+        bytes[17] &= !FLAG_VECTOR_RABITQ;
+        assert_eq!(
+            HnswGraph::decode_snapshot(&bytes, &expectations_for(&rabitq)).err(),
+            Some(GraphSnapshotError::InvalidStructure("flags"))
+        );
+
+        let plain = build_graph(8, 8, 4, 8);
+        let mut bytes = plain.encode_snapshot();
+        bytes[17] |= FLAG_VECTOR_RABITQ;
+        assert_eq!(
+            HnswGraph::decode_snapshot(&bytes, &expectations_for(&plain)).err(),
+            Some(GraphSnapshotError::InvalidStructure("flags"))
+        );
+
+        let mut bytes = rabitq.encode_snapshot();
+        bytes[17] |= FLAG_VECTOR_INT8;
+        assert_eq!(
+            HnswGraph::decode_snapshot(&bytes, &expectations_for(&rabitq)).err(),
+            Some(GraphSnapshotError::InvalidStructure("flags"))
+        );
+    }
+
+    /// 量化期望双向拒绝：未量化/int8 目标拒绝 RaBitQ 快照，RaBitQ 目标拒绝
+    /// 未量化快照——绝不允许静默改变图侧距离语义。
+    /// EN: Bidirectional quantization expectations: unquantized/int8 targets
+    /// reject a RaBitQ snapshot and a RaBitQ target rejects an unquantized
+    /// snapshot — in-graph distance semantics never change silently.
+    #[test]
+    fn decode_rejects_rabitq_quantization_mismatch_in_both_directions() {
+        let rabitq = build_rabitq_graph(8, 8, DistanceMetric::L2, VectorDtype::F32);
+        let plain = HnswGraph::new(8, DistanceMetric::L2, 4, 32, 16, 42, 8);
+        let int8 = build_int8_graph(8, 8, DistanceMetric::L2, VectorDtype::F32);
+        let bytes = rabitq.encode_snapshot();
+        assert_eq!(
+            HnswGraph::decode_snapshot(&bytes, &expectations_for(&plain)).err(),
+            Some(GraphSnapshotError::Mismatch("quantization"))
+        );
+        assert_eq!(
+            HnswGraph::decode_snapshot(&bytes, &expectations_for(&int8)).err(),
+            Some(GraphSnapshotError::Mismatch("quantization"))
+        );
+        let plain_bytes = build_graph(8, 8, 4, 8).encode_snapshot();
+        assert_eq!(
+            HnswGraph::decode_snapshot(&plain_bytes, &expectations_for(&rabitq)).err(),
+            Some(GraphSnapshotError::Mismatch("quantization"))
+        );
+    }
+
+    /// peek 四元组返回 RaBitQ；旧 peek 入口行为不变。
+    /// EN: The quartet peek reports RaBitQ; legacy peek entries are unchanged.
+    #[test]
+    fn peek_reports_rabitq_and_keeps_legacy_entries() {
+        let rabitq = build_rabitq_graph(4, 8, DistanceMetric::Cosine, VectorDtype::F16);
+        let bytes = rabitq.encode_snapshot();
+        assert_eq!(
+            peek_graph_snapshot_dims_metric_dtype_quantization(&bytes),
+            Ok((
+                8,
+                DistanceMetric::Cosine,
+                VectorDtype::F16,
+                Quantization::RaBitQ
+            ))
+        );
+        assert_eq!(
+            peek_graph_snapshot_dims_metric_dtype(&bytes),
+            Ok((8, DistanceMetric::Cosine, VectorDtype::F16))
+        );
+    }
+
+    /// v4 标量守卫：非法 alpha（非有限 / ≤0）与非法 norm（非有限 / <0）按伪造
+    /// 拒绝（否则图内距离 NaN 污染堆序或反向爆炸）。
+    /// EN: v4 scalar guards: invalid alpha (non-finite / <= 0) and invalid norm
+    /// (non-finite / < 0) are rejected as forged (otherwise in-graph distances
+    /// become NaN or blow up backwards).
+    #[test]
+    fn decode_rejects_invalid_rabitq_scalars() {
+        let g = build_rabitq_graph(4, 8, DistanceMetric::L2, VectorDtype::F32);
+        let bytes = g.encode_snapshot();
+        let node_count = u64::from_be_bytes(bytes[60..68].try_into().unwrap()) as usize;
+        let arena_len = u64::from_be_bytes(bytes[68..76].try_into().unwrap()) as usize;
+        let lf_pairs = u64::from_be_bytes(bytes[76..84].try_into().unwrap()) as usize;
+        let voff = HEADER_LEN + node_count * NODE_RECORD_LEN + arena_len * 8 + lf_pairs * 16;
+        // 记录布局：id(8) | norm(4) | alpha(4) | codes(ceil(D/64)×8) | source(dims×4)。
+        // EN: Record layout: id(8) | norm(4) | alpha(4) | codes(ceil(D/64)×8) | source(dims×4).
+        let norm_at = voff + 8;
+        let alpha_at = voff + 12;
+        let cases: [(&str, usize, f32); 4] = [
+            ("alpha NaN", alpha_at, f32::NAN),
+            ("alpha zero", alpha_at, 0.0),
+            ("norm NaN", norm_at, f32::NAN),
+            ("norm negative", norm_at, -1.0),
+        ];
+        for (what, offset, value) in cases {
+            let mut bad = bytes.clone();
+            bad[offset..offset + 4].copy_from_slice(&value.to_bits().to_be_bytes());
+            assert_eq!(
+                HnswGraph::decode_snapshot(&bad, &expectations_for(&g)).err(),
+                Some(GraphSnapshotError::InvalidStructure("vector.quantization")),
+                "{what} must be rejected"
+            );
+        }
+    }
+
+    /// v4 段长对账：伪造巨型 count 必须是干净的 Truncated（按 v4 记录宽度）。
+    /// EN: v4 section-length reconcile: forged giant counts must be a clean
+    /// Truncated under the v4 record width.
+    #[test]
+    fn decode_rejects_oversized_declared_counts_for_v4() {
+        let g = build_rabitq_graph(4, 8, DistanceMetric::L2, VectorDtype::F32);
+        let mut bytes = g.encode_snapshot();
+        bytes[60..68].copy_from_slice(&u64::MAX.to_be_bytes()); // node_count
+        bytes[84..92].copy_from_slice(&u64::MAX.to_be_bytes()); // vector_count（保持相等）
+        let err = HnswGraph::decode_snapshot(&bytes, &expectations_for(&g)).err();
+        assert!(
+            matches!(err, Some(GraphSnapshotError::Truncated { .. })),
+            "giant declared counts must be a clean Truncated, got {err:?}"
+        );
+    }
+
+    /// RaBitQ HotBuffer 快照往返：恢复后主表是**原始**向量且与图 source 共享
+    /// `Arc`；检索排序与源索引一致（图内估计只用于取候选，最终打分在主表精确
+    /// 计算）。
+    /// EN: RaBitQ HotBuffer snapshot roundtrip: the restored main store keeps raw
+    /// vectors and Arc-shares them with the graph source; search ranking matches
+    /// the source index (in-graph estimates only propose candidates while final
+    /// scores are computed exactly on the main store).
+    #[tokio::test]
+    async fn hotbuffer_rabitq_snapshot_roundtrip_restores_raw_source() {
+        let dims = 16;
+        let mk = || {
+            HotBufferIndex::new_with_metric_and_config_and_dtype_and_quantization(
+                dims,
+                DistanceMetric::L2,
+                VectorDtype::F32,
+                Quantization::RaBitQ,
+                &houyi_core::config::VectorConfig::default(),
+                &houyi_core::config::HnswConfig::default(),
+            )
+        };
+        let src = mk();
+        let batch: Vec<_> = (0..64u64)
+            .map(|i| (i + 1, hb_vector(dims, i + 1)))
+            .collect();
+        let expected: Vec<(u64, Vec<f32>)> = batch.clone();
+        src.insert_batch(batch).await.expect("insert_batch");
+        drain_all(&src).await;
+        assert_eq!(src.vector_quantization(), Quantization::RaBitQ);
+        let bytes = src.encode_graph_snapshot().await;
+
+        let dst = mk();
+        dst.restore_graph_snapshot(&bytes).await.expect("restore");
+        assert_eq!(dst.vector_quantization(), Quantization::RaBitQ);
+
+        for (id, raw) in &expected {
+            let main = dst.main_index.read().await;
+            let stored = main.get(id).expect("restored row must reach the main map");
+            assert_eq!(stored.to_f32_vec(), *raw, "main keeps raw value for {id}");
+        }
+        for (id, _) in &expected {
+            let main_arc = {
+                let main = dst.main_index.read().await;
+                Arc::clone(main.get(id).expect("restored row"))
+            };
+            let g = crate::hnsw_read_guard(&dst.hnsw);
+            let gv = g.graph_vector(*id).expect("restored graph vector");
+            assert!(
+                matches!(gv, GraphVector::RabitQ { .. }),
+                "restored graph must stay rabitq"
+            );
+            assert!(
+                Arc::ptr_eq(&main_arc, &gv.source_arc()),
+                "main store and rabitq source must share one Arc"
+            );
+        }
+
+        for q in [1u64, 17, 42] {
+            let query = hb_vector(dims, q);
+            let a = src
+                .search_scored_with_ef_override(&query, 10, None, None)
+                .await;
+            let b = dst
+                .search_scored_with_ef_override(&query, 10, None, None)
+                .await;
+            assert_eq!(a, b, "rabitq scored top-10 for query seed {q}");
+        }
     }
 }
