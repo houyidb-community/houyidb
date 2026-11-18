@@ -8,9 +8,9 @@ target/
 .DS_Store
 .playwright-mcp/
 
-# 官网静态站；全局 gitignore 默认忽略 site/，本仓库需要跟踪
-!site/
-!site/**
+# 官网静态站仅留在内部历史，CE 公共快照不导出
+# EN: Site assets stay in internal history only; the CE public snapshot excludes them.
+site/
 
 # 知识产权材料与开发日志：不入公开仓库（前缀通配，防未来新文件漏网）
 dev-log.md
@@ -28,11 +28,9 @@ obj/
 .gradle/
 build/
 
-# 演练脚本共享库；全局 gitignore 默认忽略 lib/（Python 习惯），本仓库需要跟踪。
-# EN: Shared drill-script library; the global gitignore ignores lib/ (a Python
-# EN: convention), but this repository needs to track scripts/lib.
-!scripts/lib/
-!scripts/lib/**
+# 演练脚本共享库仅内部使用，CE 公共快照不导出
+# EN: Shared drill-script library is internal-only and excluded from CE snapshots.
+scripts/lib/
 
 # 本地推广/汇报材料与内部整理文档：不入库，防误提交。
 # EN: Local promotion/reporting material and internal working docs: never commit.
