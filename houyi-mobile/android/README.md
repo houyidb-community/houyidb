@@ -64,6 +64,10 @@ HouyiDB.close(db)
 - `saveBytes` / `loadBytes` 与文件 API 共用同一格式与校验（magic/版本/
   长度/CRC32）；坏字节会抛 `IllegalStateException`。C 侧对应
   `houyi_mobile_db_save_buffer` / `houyi_mobile_db_load_buffer`。
+- 召回/延迟预设：`setSearchPreset(db, name, SearchPreset.HIGH_RECALL)`；
+  也可用 `setSearchOptions(perK, nprobe, efSearch)` 逐项调参（0 = 不变），
+  `setBuildNprobe` 控制下次 build 的 nprobe。真机数据见
+  `docs/HOUYIDB_MOBILE_BENCH.md`。
 
 - 显式 metric/dtype：
   `createCollection(db, "l1", 4, "flat", HouyiDB.Metric.L1, HouyiDB.Dtype.F32)`；
