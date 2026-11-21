@@ -1468,6 +1468,77 @@ mod tests {
         let _ = std::fs::remove_file(&bad_crc_path);
     }
 
+    /// clustered-hnsw 构建态持久化：保存的是图而非原始行，加载不重建，
+    /// 检索结果与保存前一致；同时验证文件与内存快照两条路径。
+    /// EN: Clustered-hnsw persists its built graphs (not raw rows); loading does
+    /// not rebuild and search results match. Covers both file and buffer paths.
+    #[test]
+    fn test_clustered_hnsw_built_state_persistence() {
+        use rand::Rng;
+        use rand::SeedableRng;
+        let dims = 8usize;
+        let n = 300usize;
+        let mut rng = rand::rngs::StdRng::seed_from_u64(31337);
+        let db = db::MobileDB::new();
+        db.get_or_create_with_config(
+            "ch",
+            dims,
+            "clustered-hnsw",
+            DistanceMetric::Cosine,
+            FlatStorageDtype::F32,
+        )
+        .unwrap();
+        let mut data = Vec::with_capacity(n * dims);
+        for _ in 0..n {
+            for _ in 0..dims {
+                data.push(rng.gen::<f32>() * 2.0 - 1.0);
+            }
+        }
+        for i in 0..n {
+            db.insert("ch", i as u64, &data[i * dims..(i + 1) * dims])
+                .unwrap();
+        }
+        db.build("ch").unwrap();
+        let q = &data[..dims];
+        let before: Vec<(u64, f32)> = db.search("ch", q, 5).unwrap();
+        assert_eq!(before.len(), 5);
+
+        let bytes = db.encode().unwrap();
+        let loaded = db::MobileDB::decode(&bytes).unwrap();
+        assert_eq!(loaded.count("ch").unwrap(), n);
+        let after = loaded.search("ch", q, 5).unwrap();
+        assert_eq!(after.len(), before.len());
+        for (a, b) in before.iter().zip(&after) {
+            assert_eq!(a.0, b.0);
+            assert!((a.1 - b.1).abs() < 1.0e-5);
+        }
+
+        // 文件路径同样走构建态。
+        // EN: The file path uses the built state as well.
+        let path =
+            std::env::temp_dir().join(format!("houyi-mobile-ch-state-{}.bin", std::process::id()));
+        db.save_to(&path).unwrap();
+        let from_file = db::MobileDB::load_from(&path).unwrap();
+        assert_eq!(from_file.count("ch").unwrap(), n);
+        assert_eq!(from_file.search("ch", q, 5).unwrap()[0].0, before[0].0);
+        let _ = std::fs::remove_file(&path);
+
+        // 坏字节拒绝。
+        // EN: Corrupt bytes are rejected.
+        let mut corrupt = bytes.clone();
+        corrupt[0] ^= 0xFF;
+        assert!(db::MobileDB::decode(&corrupt).is_err());
+
+        // v3 快照仍可读：把版本字节改回 3（头部不参与 CRC），解码必须成功。
+        // EN: v3 snapshots stay readable: rewrite the version bytes to 3 (the
+        // header is outside the CRC) and decoding must still succeed.
+        let mut v3 = bytes.clone();
+        v3[8..12].copy_from_slice(&3u32.to_le_bytes());
+        let from_v3 = db::MobileDB::decode(&v3).expect("v3 snapshot must load");
+        assert_eq!(from_v3.count("ch").unwrap(), n);
+        assert_eq!(from_v3.search("ch", q, 5).unwrap()[0].0, before[0].0);
+    }
+
     /// 检索预设与 nprobe 覆盖：构建期 nprobe=1 时随机查询召回很低，
     /// high_recall 预设（全簇路由）必须显著提升；非法参数必须拒绝。
     /// EN: Presets and nprobe overrides: with a build-time nprobe of 1, random

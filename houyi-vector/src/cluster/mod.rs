@@ -14,10 +14,10 @@ pub use flat_clustered::{FlatClustered, FlatStorageDtype, DEFAULT_SEARCH_TARGET_
 pub use pq_flat::PqFlatClustered;
 
 use crate::hnsw_graph::HnswGraph;
-use crate::{DistanceMetric, VectorId};
+use crate::{DistanceMetric, VectorDtype, VectorId};
 use parking_lot::RwLock;
 use rayon::prelude::*;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 /// 聚类分治配置。
 /// EN: Cluster-partitioning configuration.
@@ -193,6 +193,137 @@ impl ClusteredHnsw {
             total_indexed: AtomicUsize::new(total),
             next_id: std::sync::atomic::AtomicU64::new(max_id + 1),
         }
+    }
+
+    /// 序列化整个聚类 HNSW 构建态（质心 + 每簇图 + 边界复制信息）。
+    ///
+    /// 复用单图 `graph_snapshot` 的编码：每簇写一份图 payload，恢复时直接
+    /// 反序列化，不再逐点重建（100k 冷加载从数秒降到百毫秒级）。乘数（l0/upper）
+    /// 与 dtype/量化随图快照写入，环境不一致会在解码时显式拒绝，而不是静默
+    /// 得到不同的图语义。
+    /// EN: Serialize the whole clustered-HNSW built state (centroids + every
+    /// cluster graph + boundary replication). Each cluster reuses the single
+    /// graph snapshot encoding so restore decodes instead of re-inserting points
+    /// (100k cold load drops from seconds to sub-second). Layer multipliers and
+    /// dtype/quantization travel with each graph, so a mismatched environment is
+    /// rejected explicitly instead of silently changing graph semantics.
+    pub fn encode_state(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(CH_STATE_MAGIC);
+        out.extend_from_slice(&CH_STATE_VERSION.to_le_bytes());
+        out.extend_from_slice(&(self.dims as u32).to_le_bytes());
+        out.push(self.metric.to_snapshot_byte());
+        out.extend_from_slice(&(self.num_clusters as u32).to_le_bytes());
+        out.extend_from_slice(&(self.nprobe as u32).to_le_bytes());
+        out.extend_from_slice(&self.boundary_alpha.to_le_bytes());
+        out.extend_from_slice(&(self.total_vectors() as u64).to_le_bytes());
+        for &c in &self.centroids {
+            out.extend_from_slice(&c.to_le_bytes());
+        }
+        for cluster in &self.clusters {
+            let guard = cluster.read();
+            out.extend_from_slice(&(guard.vector_ids.len() as u32).to_le_bytes());
+            for &id in &guard.vector_ids {
+                out.extend_from_slice(&id.to_le_bytes());
+            }
+            out.extend_from_slice(&(guard.split_threshold as u64).to_le_bytes());
+            out.extend_from_slice(&(guard.graph.num_layers as u32).to_le_bytes());
+            let payload = guard.graph.encode_snapshot();
+            out.extend_from_slice(&(payload.len() as u64).to_le_bytes());
+            out.extend_from_slice(&payload);
+        }
+        out
+    }
+
+    /// 从构建态字节恢复聚类 HNSW；magic/版本/长度/图 payload 任一不一致即拒绝。
+    /// EN: Restore a clustered HNSW from state bytes; bad magic/version/length or
+    /// a bad graph payload is rejected.
+    pub fn decode_state(bytes: &[u8]) -> Result<Self, String> {
+        use crate::graph_snapshot::SnapshotExpectations;
+        let mut r = StateReader::new(bytes);
+        if r.take(CH_STATE_MAGIC.len())? != CH_STATE_MAGIC {
+            return Err("clustered-hnsw state: bad magic".to_string());
+        }
+        let version = r.u32()?;
+        if version != CH_STATE_VERSION {
+            return Err(format!(
+                "clustered-hnsw state: unsupported version {version}"
+            ));
+        }
+        let dims = r.u32()? as usize;
+        let metric_byte = r.u8()?;
+        let metric = DistanceMetric::from_snapshot_byte(metric_byte)
+            .ok_or_else(|| format!("clustered-hnsw state: bad metric {metric_byte}"))?;
+        let num_clusters = r.u32()? as usize;
+        let nprobe = r.u32()? as usize;
+        let boundary_alpha = r.f32()?;
+        let _total = r.u64()?;
+        if dims == 0 || dims > 65_536 || num_clusters == 0 || num_clusters > 65_536 {
+            return Err("clustered-hnsw state: dims/clusters out of range".to_string());
+        }
+        if !boundary_alpha.is_finite() {
+            return Err("clustered-hnsw state: non-finite boundary alpha".to_string());
+        }
+        let mut centroids = Vec::with_capacity(num_clusters * dims);
+        for _ in 0..num_clusters * dims {
+            centroids.push(r.f32()?);
+        }
+        let (l0_mult, upper_mult) = crate::hnsw_graph::effective_layer_multipliers();
+        let mut clusters = Vec::with_capacity(num_clusters);
+        for _ in 0..num_clusters {
+            let id_count = r.u32()? as usize;
+            if id_count > r.remaining() / 8 {
+                return Err("clustered-hnsw state: id count exceeds payload".to_string());
+            }
+            let mut vector_ids = Vec::with_capacity(id_count);
+            for _ in 0..id_count {
+                vector_ids.push(r.u64()?);
+            }
+            let split_threshold = r.u64()? as usize;
+            let num_layers = r.u32()? as usize;
+            let payload_len = usize::try_from(r.u64()?)
+                .map_err(|_| "clustered-hnsw state: payload too large".to_string())?;
+            if payload_len == 0 || payload_len > r.remaining() {
+                return Err("clustered-hnsw state: graph payload out of bounds".to_string());
+            }
+            let payload = r.take(payload_len)?;
+            let expectations = SnapshotExpectations {
+                dims,
+                metric,
+                dtype: VectorDtype::F32,
+                quantization: crate::quantization::Quantization::None,
+                num_layers,
+                l0_mult,
+                upper_mult,
+            };
+            let (graph, consumed) = HnswGraph::decode_snapshot(payload, &expectations)
+                .map_err(|e| format!("clustered-hnsw state: {e:?}"))?;
+            if consumed != payload.len() {
+                return Err("clustered-hnsw state: trailing bytes in graph payload".to_string());
+            }
+            clusters.push(RwLock::new(ClusterGraph {
+                id: clusters.len(),
+                vector_ids,
+                graph,
+                split_threshold,
+            }));
+        }
+        if r.remaining() != 0 {
+            return Err("clustered-hnsw state: trailing bytes".to_string());
+        }
+        let total: usize = clusters.iter().map(|c| c.read().vector_ids.len()).sum();
+        Ok(ClusteredHnsw {
+            dims,
+            metric,
+            num_clusters,
+            nprobe: nprobe.min(num_clusters),
+            boundary_alpha,
+            centroids,
+            clusters,
+            search_nprobe: AtomicUsize::new(0),
+            total_indexed: AtomicUsize::new(total),
+            next_id: AtomicU64::new(0),
+        })
     }
 
     /// 检索 top-k（自适应 nprobe：固定候选预算，不随数据规模膨胀）。
@@ -375,6 +506,18 @@ impl ClusteredHnsw {
         self.nprobe
     }
 
+    /// 向量维度（构建态校验用）。
+    /// EN: Vector dimensionality (for built-state validation).
+    pub fn dims(&self) -> usize {
+        self.dims
+    }
+
+    /// 距离度量（构建态校验用）。
+    /// EN: Distance metric (for built-state validation).
+    pub fn metric(&self) -> DistanceMetric {
+        self.metric
+    }
+
     pub fn total_vectors(&self) -> usize {
         self.total_indexed.load(Ordering::Relaxed)
     }
@@ -412,6 +555,54 @@ impl ClusteredHnsw {
             .map(|c| c.read().vector_ids.len())
             .sum();
         (unique_ids as f64 - self.total_vectors() as f64).max(0.0) / self.total_vectors() as f64
+    }
+}
+
+/// 聚类 HNSW 构建态容器格式（每簇图 payload 复用 `graph_snapshot` 的格式）。
+/// EN: Clustered-HNSW state container (each cluster payload reuses the
+/// `graph_snapshot` format).
+const CH_STATE_MAGIC: &[u8; 8] = b"HOUYICH1";
+const CH_STATE_VERSION: u32 = 1;
+
+/// 构建态解码的边界安全读取器（越界一律返回 Err，不做无界分配）。
+/// EN: Bounds-checked reader for state decoding (out-of-range input returns Err
+/// instead of allocating unbounded memory).
+struct StateReader<'a> {
+    bytes: &'a [u8],
+    pos: usize,
+}
+
+impl<'a> StateReader<'a> {
+    fn new(bytes: &'a [u8]) -> Self {
+        Self { bytes, pos: 0 }
+    }
+    fn remaining(&self) -> usize {
+        self.bytes.len().saturating_sub(self.pos)
+    }
+    fn take(&mut self, n: usize) -> Result<&'a [u8], String> {
+        if n > self.remaining() {
+            return Err("clustered-hnsw state: truncated payload".to_string());
+        }
+        let out = &self.bytes[self.pos..self.pos + n];
+        self.pos += n;
+        Ok(out)
+    }
+    fn u8(&mut self) -> Result<u8, String> {
+        Ok(self.take(1)?[0])
+    }
+    fn u32(&mut self) -> Result<u32, String> {
+        let b = self.take(4)?;
+        Ok(u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+    }
+    fn u64(&mut self) -> Result<u64, String> {
+        let b = self.take(8)?;
+        Ok(u64::from_le_bytes([
+            b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7],
+        ]))
+    }
+    fn f32(&mut self) -> Result<f32, String> {
+        let b = self.take(4)?;
+        Ok(f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
     }
 }
 
@@ -457,6 +648,51 @@ mod tests {
             assert_eq!(*id, ids[i]);
             assert_eq!(v.as_slice(), &vectors[i * dims..(i + 1) * dims]);
         }
+    }
+
+    /// 构建态往返：同查询的 top-k 必须逐项一致（id 与距离），坏 magic/截断拒绝。
+    /// EN: Built-state roundtrip: top-k for the same query must match item for
+    /// item (ids and distances); bad magic/truncation are rejected.
+    #[test]
+    fn test_clustered_state_roundtrip_and_rejection() {
+        let dims = 8;
+        let n = 400usize;
+        let mut rng = rand::rngs::StdRng::seed_from_u64(2024);
+        let mut vectors = Vec::with_capacity(n * dims);
+        let ids: Vec<u64> = (0..n as u64).collect();
+        for _ in 0..n {
+            for _ in 0..dims {
+                vectors.push(rng.gen::<f32>() * 2.0 - 1.0);
+            }
+        }
+        let cfg = ClusterConfig::infer(n, dims);
+        let ch = ClusteredHnsw::build(&vectors, &ids, dims, DistanceMetric::Cosine, &cfg);
+        let q = &vectors[..dims];
+        let before = ch.search(q, 10);
+        assert_eq!(before.len(), 10);
+
+        let state = ch.encode_state();
+        let restored = ClusteredHnsw::decode_state(&state).expect("state must decode");
+        assert_eq!(restored.total_vectors(), ch.total_vectors());
+        assert_eq!(restored.dims(), dims);
+        assert_eq!(restored.metric(), DistanceMetric::Cosine);
+        let after = restored.search(q, 10);
+        assert_eq!(after.len(), before.len());
+        for (a, b) in before.iter().zip(&after) {
+            assert_eq!(a.0, b.0, "ids must match");
+            assert!(
+                (a.1 - b.1).abs() < 1.0e-6,
+                "distances must match: {} vs {}",
+                a.1,
+                b.1
+            );
+        }
+
+        let mut bad_magic = state.clone();
+        bad_magic[0] ^= 0xFF;
+        assert!(ClusteredHnsw::decode_state(&bad_magic).is_err());
+        assert!(ClusteredHnsw::decode_state(&state[..state.len() - 1]).is_err());
+        assert!(ClusteredHnsw::decode_state(&state[..16]).is_err());
     }
 
     #[test]

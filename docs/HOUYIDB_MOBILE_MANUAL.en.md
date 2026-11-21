@@ -156,9 +156,14 @@ void*   houyi_mobile_db_load(const char* path);            // NULL on failure
 - Saves the whole `MobileDB` (collections + scalar pages) by writing a sibling temp
   file, fsyncing, then renaming over the target. The file carries magic, version,
   body length, and CRC32; corrupt, truncated, or wrong-version files are rejected.
-- `flat-clustered` persists its **f16 built state** (centroids + per-cluster ids/
-  vectors) and loads **without rebuilding**; `flat` persists raw rows;
-  `clustered-hnsw` persists raw rows and rebuilds on load.
+- `flat-clustered` persists its **f16/i8 built state** (centroids + per-cluster
+  ids/vectors) and loads **without rebuilding**; `clustered-hnsw` (snapshot v4)
+  persists its **built state** (centroids + every cluster graph + boundary
+  replication) and also loads without rebuilding (100k cold load drops from
+  10.6 s to sub-second); `flat` persists raw rows.
+- Snapshot v4 only adds the clustered-hnsw built-state tag on top of v3; older
+  binaries reject v4 cleanly, while this build still reads v1–v3 (v3
+  clustered-hnsw raw rows keep the old rebuild-on-load path).
 - No WAL: the caller owns the save point. Save at batch boundaries, off the UI thread.
 - Measured on host (100k×192 f16): file 37.6 MB, save 0.10 s, load 0.064 s;
   real 7.3k×512: 7.3 MB, 0.023 s, 0.012 s. Verify on device.

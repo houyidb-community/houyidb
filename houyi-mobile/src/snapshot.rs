@@ -28,7 +28,10 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 
 const MAGIC: &[u8; 8] = b"HOUYIMB1";
-const VERSION: u32 = 3;
+/// 快照版本：4 = v3 + clustered-hnsw 构建态标签（旧二进制对 v4 干净拒绝）。
+/// EN: Snapshot version: 4 = v3 plus the clustered-hnsw built-state tag (older
+/// binaries reject v4 cleanly).
+const VERSION: u32 = 4;
 const HEADER_LEN: usize = 8 + 4 + 8 + 4;
 const MAX_NAME_BYTES: usize = 4096;
 const MAX_COLLECTIONS: usize = 4096;
@@ -227,6 +230,14 @@ fn encode_body_into(w: &mut Writer, db: &MobileDB) -> Result<(), String> {
                 w.u8(if built { 4 } else { 3 });
                 encode_rows(w, &rows, snap.dims)?;
             }
+            BackendSnapshot::ClusteredHnswBuilt(state) => {
+                w.u8(5);
+                w.u64(
+                    u64::try_from(state.len())
+                        .map_err(|_| "snapshot: state length overflow".to_string())?,
+                );
+                w.bytes(&state);
+            }
         }
         encode_scalars(w, &snap.scalars)?;
     }
@@ -376,12 +387,18 @@ fn decode_body(body: &[u8], version: u32) -> Result<Vec<CollectionSnapshot>, Str
                 let len = r.u64()? as usize;
                 BackendSnapshot::FlatClusteredBuilt(r.take(len)?.to_vec())
             }
+            5 => {
+                // clustered-hnsw 构建态：magic/版本等由 ClusteredHnsw::decode_state 校验。
+                // EN: Clustered-hnsw built state; decode_state validates magic etc.
+                let len = r.u64()? as usize;
+                BackendSnapshot::ClusteredHnswBuilt(r.take(len)?.to_vec())
+            }
             other => return Err(format!("snapshot: bad backend tag {other}")),
         };
         let index_type = match (index_code, tag) {
             (0, 0) => "flat",
             (1, 1 | 2) => "flat-clustered",
-            (2, 3 | 4) => "clustered-hnsw",
+            (2, 3..=5) => "clustered-hnsw",
             _ => return Err("snapshot: index type/backend tag mismatch".to_string()),
         };
         let scalars = decode_scalars(&mut r, version)?;

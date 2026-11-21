@@ -150,8 +150,11 @@ void*   houyi_mobile_db_load(const char* path);            // NULL 表示失败
 
 - 保存整个 `MobileDB`（多 collection + 标量页）：先写同目录临时文件并 `fsync`，再
   `rename` 覆盖目标；文件含 magic/版本/长度/CRC32，损坏、截断、错版本一律拒绝。
-- `flat-clustered` 保存 **f16 构建态**（质心 + 分簇 id/向量），加载**不重建**；
-  `flat` 保存原始行；`clustered-hnsw` 保存原始行并在加载时重建。
+- `flat-clustered` 保存 **f16/i8 构建态**（质心 + 分簇 id/向量），加载**不重建**；
+  `clustered-hnsw` 自 v4 起保存**构建态**（质心 + 每簇图 + 边界复制），加载同样
+  不重建（100k 冷加载从 10.6 s 降到亚秒级）；`flat` 保存原始行。
+- 快照版本 v4 在 v3 基础上只新增 clustered-hnsw 构建态标签；旧二进制对 v4
+  干净拒绝，新二进制仍可读取 v1–v3（v3 的 clustered-hnsw 原始行按旧逻辑重建）。
 - 不引入 WAL：保存点由调用方控制；建议在写批次结束时调用，避开 UI 线程。
 - 实测（host，100k×192 f16）：文件 37.6 MB，save 0.10 s，load 0.064 s；
   真实 7.3k×512：文件 7.3 MB，save 0.023 s，load 0.012 s。真机数值以实测为准。

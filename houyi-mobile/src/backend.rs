@@ -149,6 +149,10 @@ pub(crate) enum BackendSnapshot {
         rows: Vec<(u64, Vec<f32>)>,
         built: bool,
     },
+    /// clustered-hnsw 构建态（质心 + 每簇图），加载不重建。
+    /// EN: Clustered-hnsw built state (centroids + per-cluster graphs); loading
+    /// does not rebuild.
+    ClusteredHnswBuilt(Vec<u8>),
 }
 
 impl Backend {
@@ -627,10 +631,7 @@ impl Backend {
                 }
             }
             BackendKind::ClusteredHnsw(LazyIndex::Built { index, .. }) => {
-                BackendSnapshot::ClusteredHnsw {
-                    rows: index.export_vectors(),
-                    built: true,
-                }
+                BackendSnapshot::ClusteredHnswBuilt(index.encode_state())
             }
         })
     }
@@ -653,6 +654,7 @@ impl Backend {
             BackendSnapshot::FlatClusteredPending(_) | BackendSnapshot::FlatClusteredBuilt(_) => {
                 "flat-clustered"
             }
+            BackendSnapshot::ClusteredHnswBuilt(_) => "clustered-hnsw",
             BackendSnapshot::ClusteredHnsw { .. } => "clustered-hnsw",
         };
         if index_type != expected_type {
@@ -694,6 +696,28 @@ impl Backend {
                     search_nprobe: NprobeSetting::Default,
                     search_ef_search: None,
                     kind: BackendKind::FlatClustered(LazyIndex::Built {
+                        index,
+                        known_ids: None,
+                    }),
+                })
+            }
+            BackendSnapshot::ClusteredHnswBuilt(state) => {
+                let index = ClusteredHnsw::decode_state(&state)?;
+                if index.dims() != dims || index.metric() != metric {
+                    return Err(
+                        "clustered-hnsw state dims/metric mismatch with collection config"
+                            .to_string(),
+                    );
+                }
+                Ok(Backend {
+                    dims,
+                    metric,
+                    dtype,
+                    search_target_per_k: DEFAULT_SEARCH_TARGET_PER_K,
+                    build_nprobe: None,
+                    search_nprobe: NprobeSetting::Default,
+                    search_ef_search: None,
+                    kind: BackendKind::ClusteredHnsw(LazyIndex::Built {
                         index,
                         known_ids: None,
                     }),
