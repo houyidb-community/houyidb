@@ -618,6 +618,68 @@ pub extern "system" fn Java_cc_houyidb_mobile_HouyiDB_nativeLoad(
     }
 }
 
+/// 把整个数据库编码成 Java byte[]（不落任何临时文件，供 Vault 加密后保存）。
+/// 失败返回 null 并写入 lastError。
+/// EN: Encode the whole database into a Java byte[] (no temp file, so the
+/// caller's Vault can encrypt it in place). Returns null on failure.
+#[no_mangle]
+pub extern "system" fn Java_cc_houyidb_mobile_HouyiDB_nativeSaveBytes(
+    env: JNIEnv<'_>,
+    _this: JObject<'_>,
+    handle: jlong,
+) -> jni::sys::jbyteArray {
+    clear_error();
+    let Some(db) = handle_from(handle) else {
+        set_error("invalid database handle");
+        return std::ptr::null_mut();
+    };
+    let bytes = match db.encode() {
+        Ok(value) => value,
+        Err(message) => {
+            set_error(message);
+            return std::ptr::null_mut();
+        }
+    };
+    match env.byte_array_from_slice(&bytes) {
+        Ok(array) => array.into_raw(),
+        Err(e) => {
+            set_error(format!("cannot allocate byte array: {e}"));
+            std::ptr::null_mut()
+        }
+    }
+}
+
+/// 从 Java byte[] 恢复数据库；失败返回 0 并写入 lastError。
+/// 入参字节只在本调用内读取，Kotlin 侧随后可加密/清零。
+/// EN: Restore a database from a Java byte[]; returns 0 on failure. The bytes
+/// are read only during this call, so Kotlin may encrypt/wipe them afterwards.
+#[no_mangle]
+pub extern "system" fn Java_cc_houyidb_mobile_HouyiDB_nativeLoadBytes(
+    env: JNIEnv<'_>,
+    _this: JObject<'_>,
+    bytes: jni::objects::JByteArray<'_>,
+) -> jlong {
+    clear_error();
+    let data = match env.convert_byte_array(&bytes) {
+        Ok(value) => value,
+        Err(e) => {
+            set_error(format!("invalid byte array: {e}"));
+            return 0;
+        }
+    };
+    match MobileDB::decode(&data) {
+        Ok(db) => {
+            let handle = Box::into_raw(Box::new(db)) as jlong;
+            register_handle(handle);
+            handle
+        }
+        Err(message) => {
+            set_error(message);
+            0
+        }
+    }
+}
+
 #[no_mangle]
 pub extern "system" fn Java_cc_houyidb_mobile_HouyiDB_nativeLastError(
     env: JNIEnv<'_>,

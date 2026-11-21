@@ -33,6 +33,26 @@ public class JniSmoke {
         if (again.size() != 1 || again.get(0).getId() != 42L) throw new AssertionError("loaded search");
         List<HouyiDB.SearchHit> bigAfter = api.search(loaded, "faces", new float[]{1f, 0f, 0f, 0f}, 1);
         if (bigAfter.size() != 1 || bigAfter.get(0).getId() != big) throw new AssertionError("u64 id lost after load");
+        // 内存快照：saveBytes/loadBytes 往返（Vault 加密路径），坏字节必须拒绝。
+        // EN: In-memory snapshot: saveBytes/loadBytes roundtrip (the Vault
+        // encryption path); corrupt bytes must be rejected.
+        byte[] snapshot = api.saveBytes(db);
+        if (snapshot.length == 0) throw new AssertionError("saveBytes returned empty");
+        long fromBytes = api.loadBytes(snapshot);
+        if (api.count(fromBytes, "faces") != 2) throw new AssertionError("count after loadBytes");
+        List<HouyiDB.SearchHit> bytesHits = api.search(fromBytes, "faces", new float[]{1f, 0f, 0f, 0f}, 1);
+        if (bytesHits.size() != 1 || bytesHits.get(0).getId() != big) throw new AssertionError("loadBytes search");
+        api.close(fromBytes);
+        byte[] corrupt = snapshot.clone();
+        corrupt[0] ^= 0x7F;
+        boolean rejected = false;
+        try {
+            api.loadBytes(corrupt);
+        } catch (IllegalStateException expected) {
+            rejected = true;
+            if (api.lastError().isEmpty()) throw new AssertionError("corrupt snapshot error message missing");
+        }
+        if (!rejected) throw new AssertionError("corrupt bytes must be rejected");
         api.close(loaded);
         api.close(loaded); // 幂等：重复 close 不得崩溃
         api.close(db);

@@ -40,17 +40,75 @@ const MAX_SCALAR_ROWS: usize = 10_000_000;
 /// metadata before reading so a corrupt file cannot force an unbounded read.
 const MAX_SNAPSHOT_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 
+/// 把数据库编码成完整快照字节（magic + 版本 + 长度 + CRC32 + body）。
+///
+/// 先在缓冲区预留头部再把 body 直接追加进去，最后回填头部：整个编码过程只有
+/// 一份 body 所在的大缓冲，不会为「头部 + body」再复制一次（大集合的峰值内存）。
+/// EN: Encode the database into complete snapshot bytes (magic | version | length
+/// | CRC32 | body). The header is reserved first and filled in after the body is
+/// appended, so the encoding holds exactly one large buffer instead of copying
+/// the body a second time (peak memory on large collections).
+pub(crate) fn encode_snapshot(db: &MobileDB) -> Result<Vec<u8>, String> {
+    let mut w = Writer::with_prefix(HEADER_LEN);
+    encode_body_into(&mut w, db)?;
+    let mut bytes = w.finish();
+    let body_len = bytes.len() - HEADER_LEN;
+    let crc = crc32fast::hash(&bytes[HEADER_LEN..]);
+    let body_len =
+        u64::try_from(body_len).map_err(|_| "snapshot: body length overflows u64".to_string())?;
+    bytes[..8].copy_from_slice(MAGIC);
+    bytes[8..12].copy_from_slice(&VERSION.to_le_bytes());
+    bytes[12..20].copy_from_slice(&body_len.to_le_bytes());
+    bytes[20..24].copy_from_slice(&crc.to_le_bytes());
+    Ok(bytes)
+}
+
+/// 解码并校验快照字节；坏 magic/版本/CRC/截断/尾随字节一律拒绝。
+/// EN: Decode and validate snapshot bytes; bad magic/version/CRC, truncation,
+/// and trailing bytes are all rejected.
+pub(crate) fn decode_snapshot(bytes: &[u8]) -> Result<MobileDB, String> {
+    let size = u64::try_from(bytes.len()).map_err(|_| "snapshot: buffer too large".to_string())?;
+    if size > MAX_SNAPSHOT_BYTES {
+        return Err(format!("snapshot: buffer too large ({size} bytes)"));
+    }
+    if bytes.len() < HEADER_LEN {
+        return Err("snapshot: truncated header".to_string());
+    }
+    if &bytes[..8] != MAGIC {
+        return Err("snapshot: bad magic".to_string());
+    }
+    let version = u32::from_le_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]);
+    if !(1..=VERSION).contains(&version) {
+        return Err(format!("snapshot: unsupported version {version}"));
+    }
+    let body_len_u64 = u64::from_le_bytes([
+        bytes[12], bytes[13], bytes[14], bytes[15], bytes[16], bytes[17], bytes[18], bytes[19],
+    ]);
+    let body_len = usize::try_from(body_len_u64)
+        .map_err(|_| "snapshot: body length exceeds address space".to_string())?;
+    let crc = u32::from_le_bytes([bytes[20], bytes[21], bytes[22], bytes[23]]);
+    if body_len != bytes.len() - HEADER_LEN {
+        return Err("snapshot: body length mismatch".to_string());
+    }
+    let body = &bytes[HEADER_LEN..];
+    if crc32fast::hash(body) != crc {
+        return Err("snapshot: crc mismatch".to_string());
+    }
+    let snapshots = decode_body(body, version)?;
+    MobileDB::from_snapshots(snapshots)
+}
+
 /// 将数据库原子写入 `path`。
 /// EN: Atomically write the database to `path`.
 pub(crate) fn save_to(db: &MobileDB, path: &Path) -> Result<(), String> {
-    let body = encode_body(db)?;
-    let crc = crc32fast::hash(&body);
-    let body_len =
-        u64::try_from(body.len()).map_err(|_| "snapshot: body length overflows u64".to_string())?;
+    let bytes = encode_snapshot(db)?;
+    write_snapshot_bytes(path, &bytes)
+}
 
-    // 头与 body 分开写：避免把整个 body 再复制一份（大集合的峰值内存）。
-    // EN: Write the header and body separately so the whole body is not copied
-    // once more (peak memory on large collections).
+/// 原子写入已编码的快照字节：同目录临时文件 + fsync + rename。
+/// EN: Atomically write already-encoded snapshot bytes: sibling temp file,
+/// fsync, then rename.
+fn write_snapshot_bytes(path: &Path, bytes: &[u8]) -> Result<(), String> {
     let tmp = temp_path(path);
     let result = (|| {
         let mut file = OpenOptions::new()
@@ -58,14 +116,7 @@ pub(crate) fn save_to(db: &MobileDB, path: &Path) -> Result<(), String> {
             .create_new(true)
             .open(&tmp)
             .map_err(|e| format!("snapshot: create temp {}: {e}", tmp.display()))?;
-        let mut header = Vec::with_capacity(HEADER_LEN);
-        header.extend_from_slice(MAGIC);
-        header.extend_from_slice(&VERSION.to_le_bytes());
-        header.extend_from_slice(&body_len.to_le_bytes());
-        header.extend_from_slice(&crc.to_le_bytes());
-        file.write_all(&header)
-            .map_err(|e| format!("snapshot: write header {}: {e}", tmp.display()))?;
-        file.write_all(&body)
+        file.write_all(bytes)
             .map_err(|e| format!("snapshot: write temp {}: {e}", tmp.display()))?;
         file.sync_all()
             .map_err(|e| format!("snapshot: fsync temp {}: {e}", tmp.display()))?;
@@ -104,31 +155,7 @@ pub(crate) fn load_from(path: &Path) -> Result<MobileDB, String> {
     }
     let bytes =
         std::fs::read(path).map_err(|e| format!("snapshot: read {}: {e}", path.display()))?;
-    if bytes.len() < HEADER_LEN {
-        return Err("snapshot: truncated header".to_string());
-    }
-    if &bytes[..8] != MAGIC {
-        return Err("snapshot: bad magic".to_string());
-    }
-    let version = u32::from_le_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]);
-    if !(1..=VERSION).contains(&version) {
-        return Err(format!("snapshot: unsupported version {version}"));
-    }
-    let body_len_u64 = u64::from_le_bytes([
-        bytes[12], bytes[13], bytes[14], bytes[15], bytes[16], bytes[17], bytes[18], bytes[19],
-    ]);
-    let body_len = usize::try_from(body_len_u64)
-        .map_err(|_| "snapshot: body length exceeds address space".to_string())?;
-    let crc = u32::from_le_bytes([bytes[20], bytes[21], bytes[22], bytes[23]]);
-    if body_len != bytes.len() - HEADER_LEN {
-        return Err("snapshot: body length mismatch".to_string());
-    }
-    let body = &bytes[HEADER_LEN..];
-    if crc32fast::hash(body) != crc {
-        return Err("snapshot: crc mismatch".to_string());
-    }
-    let snapshots = decode_body(body, version)?;
-    MobileDB::from_snapshots(snapshots)
+    decode_snapshot(&bytes)
 }
 
 fn temp_path(path: &Path) -> PathBuf {
@@ -149,12 +176,11 @@ fn temp_path(path: &Path) -> PathBuf {
     ))
 }
 
-fn encode_body(db: &MobileDB) -> Result<Vec<u8>, String> {
+fn encode_body_into(w: &mut Writer, db: &MobileDB) -> Result<(), String> {
     let snapshots = db.snapshot_collections()?;
     if snapshots.len() > MAX_COLLECTIONS {
         return Err("snapshot: too many collections".to_string());
     }
-    let mut w = Writer::new();
     w.u32(snapshots.len() as u32);
     for snap in snapshots {
         validate_name(&snap.name)?;
@@ -183,11 +209,11 @@ fn encode_body(db: &MobileDB) -> Result<Vec<u8>, String> {
         match snap.backend {
             BackendSnapshot::Flat(rows) => {
                 w.u8(0);
-                encode_rows(&mut w, &rows, snap.dims)?;
+                encode_rows(w, &rows, snap.dims)?;
             }
             BackendSnapshot::FlatClusteredPending(rows) => {
                 w.u8(1);
-                encode_rows(&mut w, &rows, snap.dims)?;
+                encode_rows(w, &rows, snap.dims)?;
             }
             BackendSnapshot::FlatClusteredBuilt(state) => {
                 w.u8(2);
@@ -199,12 +225,12 @@ fn encode_body(db: &MobileDB) -> Result<Vec<u8>, String> {
             }
             BackendSnapshot::ClusteredHnsw { rows, built } => {
                 w.u8(if built { 4 } else { 3 });
-                encode_rows(&mut w, &rows, snap.dims)?;
+                encode_rows(w, &rows, snap.dims)?;
             }
         }
-        encode_scalars(&mut w, &snap.scalars)?;
+        encode_scalars(w, &snap.scalars)?;
     }
-    Ok(w.finish())
+    Ok(())
 }
 
 fn encode_rows(w: &mut Writer, rows: &[(u64, Vec<f32>)], dims: usize) -> Result<(), String> {
@@ -466,8 +492,17 @@ struct Writer {
 }
 
 impl Writer {
+    #[cfg(test)]
     fn new() -> Self {
         Writer { bytes: Vec::new() }
+    }
+    /// 预留 `prefix` 字节（快照头部）后再追加内容，避免二次复制 body。
+    /// EN: Reserve `prefix` bytes (snapshot header) before appending content so
+    /// the body is never copied twice.
+    fn with_prefix(prefix: usize) -> Self {
+        Writer {
+            bytes: vec![0u8; prefix],
+        }
     }
     fn finish(self) -> Vec<u8> {
         self.bytes
@@ -578,6 +613,20 @@ impl MobileDB {
     /// EN: Save to `path` (atomic write).
     pub fn save_to(&self, path: impl AsRef<Path>) -> Result<(), String> {
         save_to(self, path.as_ref())
+    }
+
+    /// 编码成内存快照字节（加密/上传由调用方负责；不产生临时文件）。
+    /// EN: Encode into in-memory snapshot bytes (encryption/upload is the
+    /// caller's job; no temp file is created).
+    pub fn encode(&self) -> Result<Vec<u8>, String> {
+        encode_snapshot(self)
+    }
+
+    /// 从内存快照字节恢复数据库（同样执行 magic/版本/长度/CRC 校验）。
+    /// EN: Restore a database from in-memory snapshot bytes (same magic/
+    /// version/length/CRC validation as the file path).
+    pub fn decode(bytes: &[u8]) -> Result<MobileDB, String> {
+        decode_snapshot(bytes)
     }
 
     /// 从 `path` 加载数据库（新句柄）。

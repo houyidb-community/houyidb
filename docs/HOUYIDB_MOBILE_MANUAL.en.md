@@ -163,6 +163,23 @@ void*   houyi_mobile_db_load(const char* path);            // NULL on failure
 - Measured on host (100k×192 f16): file 37.6 MB, save 0.10 s, load 0.064 s;
   real 7.3k×512: 7.3 MB, 0.023 s, 0.012 s. Verify on device.
 
+**In-memory snapshot (no temp files, ready for a Vault)**:
+
+```c
+int32_t houyi_mobile_db_save_buffer(void* db, uint8_t* out, size_t capacity, size_t* written);
+void*   houyi_mobile_db_load_buffer(const uint8_t* bytes, size_t len);
+```
+
+- Shares the file format and validation (magic/version/length/CRC32); corrupt
+  bytes return NULL.
+- Returns `0` on success, `-1` for invalid args (NULL db/written), `-2` when the
+  buffer is too small. `*written` is the byte count on success and the required
+  capacity on `-2`; query it with `save_buffer(db, NULL, 0, &written)`.
+- The buffer stays caller-owned; nothing is allocated, freed, or retained.
+  `bytes` is read only during `load_buffer`, so the caller may encrypt or wipe
+  it immediately afterwards.
+- Kotlin: `HouyiDB.saveBytes(handle): ByteArray` / `HouyiDB.loadBytes(bytes): Long`.
+
 ### 2.9 Search-budget tuning (flat-clustered cosine)
 
 ```c
@@ -211,9 +228,12 @@ bridge:
 
 Kotlin `cc.houyidb.mobile.HouyiDB` exposes `open/close/createCollection/
 createCollection(metric,dtype)/insert/insertBatch/build/count/search/save/load/
-insertScalarsWithId/searchHybrid/setSearchBudget/lastError`; `search` returns `SearchHit(id: Long, score: Float)`, eliminating
+saveBytes/loadBytes/insertScalarsWithId/searchHybrid/setSearchBudget/lastError`; `search` returns `SearchHit(id: Long, score: Float)`, eliminating
 the f32-id precision limit. The AAR currently contains arm64-v8a only. Build
-requirements: SDK 34, NDK >= 26, Gradle 8.9 (wrapper included), Java 17.
+requirements: SDK 34, NDK >= 26, Gradle 8.9 (wrapper included), Java 17. The
+native library is **16 KB page aligned** (`-Wl,-z,max-page-size=16384`; the
+build script asserts `Align=0x4000` for every LOAD segment via `llvm-readelf
+-l`), as required by Android 15+ 16 KB-page devices.
 
 
 ### 3.1 Swift (iOS)

@@ -156,6 +156,21 @@ void*   houyi_mobile_db_load(const char* path);            // NULL 表示失败
 - 实测（host，100k×192 f16）：文件 37.6 MB，save 0.10 s，load 0.064 s；
   真实 7.3k×512：文件 7.3 MB，save 0.023 s，load 0.012 s。真机数值以实测为准。
 
+**内存快照（不落临时文件，供 Vault 加密）**：
+
+```c
+int32_t houyi_mobile_db_save_buffer(void* db, uint8_t* out, size_t capacity, size_t* written);
+void*   houyi_mobile_db_load_buffer(const uint8_t* bytes, size_t len);
+```
+
+- 与文件路径共用同一格式与校验（magic/版本/长度/CRC32）；坏字节返回 NULL。
+- 返回码：`0` 成功、`-1` 参数非法（db/written 为 NULL）、`-2` 缓冲区不足。
+  `*written` 成功时为字节数，`-2` 时为所需容量；用
+  `save_buffer(db, NULL, 0, &written)` 查询容量。
+- 缓冲区始终归调用方；本函数不分配/释放内存，也不保留引用。`bytes` 只在
+  `load_buffer` 调用期间被读取，返回后可立即加密或清零。
+- Kotlin：`HouyiDB.saveBytes(handle): ByteArray` / `HouyiDB.loadBytes(bytes): Long`。
+
 ### 2.9 检索预算调优（flat-clustered 余弦）
 
 ```c
@@ -199,9 +214,11 @@ int32_t houyi_mobile_db_set_search_target(void* db, const char* name, uint32_t p
 
 Kotlin `cc.houyidb.mobile.HouyiDB` 提供 `open/close/createCollection/
 createCollection(metric,dtype)/insert/insertBatch/build/count/search/save/load/
-insertScalarsWithId/searchHybrid/setSearchBudget/lastError`；`search` 返回 `SearchHit(id: Long, score: Float)`，不再有 f32 id
+saveBytes/loadBytes/insertScalarsWithId/searchHybrid/setSearchBudget/lastError`；`search` 返回 `SearchHit(id: Long, score: Float)`，不再有 f32 id
 精度问题。AAR 当前仅含 arm64-v8a。构建需要 SDK 34 / NDK ≥26 / Gradle 8.9
-（wrapper 已入库）/ Java 17。
+（wrapper 已入库）/ Java 17。native 库按 **16 KB 页**对齐
+（`-Wl,-z,max-page-size=16384`，构建脚本用 `llvm-readelf -l` 断言 LOAD
+`Align=0x4000`），满足 Android 15+ 的 16 KB 页设备要求。
 
 
 ### 3.1 Swift (iOS)

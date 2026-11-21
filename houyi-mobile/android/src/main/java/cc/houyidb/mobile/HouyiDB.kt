@@ -55,6 +55,8 @@ object HouyiDB {
     ): Int
     @JvmStatic external fun nativeSave(handle: Long, path: String): Int
     @JvmStatic external fun nativeLoad(path: String): Long
+    @JvmStatic external fun nativeSaveBytes(handle: Long): ByteArray?
+    @JvmStatic external fun nativeLoadBytes(bytes: ByteArray): Long
     @JvmStatic external fun nativeLastError(): String
 
     fun open(): Long = nativeOpen()
@@ -170,6 +172,30 @@ object HouyiDB {
         val handle = nativeLoad(path)
         if (handle == 0L) {
             throw IllegalStateException("HouyiDB load failed: ${lastError()}")
+        }
+        return handle
+    }
+
+    /**
+     * 把整个数据库编码成内存字节：不落临时文件，便于交给 Vault 加密后再持久化。
+     * EN: Encode the whole database into memory bytes: no temp file, so the
+     * caller can hand them to a Vault for encryption before persisting.
+     */
+    fun saveBytes(handle: Long): ByteArray {
+        return nativeSaveBytes(handle)
+            ?: throw IllegalStateException("HouyiDB saveBytes failed: ${lastError()}")
+    }
+
+    /**
+     * 从内存字节恢复数据库；字节只在 native 调用期间被读取，之后可立即清零。
+     * EN: Restore a database from memory bytes; the bytes are read only during
+     * the native call and may be wiped immediately afterwards.
+     */
+    fun loadBytes(bytes: ByteArray): Long {
+        require(bytes.isNotEmpty()) { "bytes must not be empty" }
+        val handle = nativeLoadBytes(bytes)
+        if (handle == 0L) {
+            throw IllegalStateException("HouyiDB loadBytes failed: ${lastError()}")
         }
         return handle
     }

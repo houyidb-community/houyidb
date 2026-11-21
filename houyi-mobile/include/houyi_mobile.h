@@ -103,6 +103,25 @@ uint32_t houyi_mobile_db_search_hybrid_u64(void* db, const char* name, const flo
                                            uint32_t max_results);
 int32_t houyi_mobile_db_save(void* db, const char* path);
 void* houyi_mobile_db_load(const char* path);
+// 内存快照：把整个数据库编码进调用方缓冲区，**不写任何临时文件**（加密/上传由
+// 调用方负责）。返回 0 成功、-1 参数非法（db/written 为 NULL）、-2 缓冲区不足。
+// *written：成功时为实际字节数；返回 -2 时为所需容量，调用方可扩容后重试。
+// 查询所需容量：传 out=NULL、capacity=0 会返回 -2 并写入 *written。
+// 缓冲区始终归调用方所有；本函数不分配也不释放内存，字节在调用返回后不再被引用。
+// EN: In-memory snapshot: encode the whole database into a caller-provided
+// buffer and write **no temp file** (encryption/upload is the caller's job).
+// Returns 0 on success, -1 for invalid args (NULL db/written), -2 when the
+// buffer is too small. `*written` gets the byte count on success and the
+// required capacity on -2; query the size with out=NULL, capacity=0. The
+// buffer stays caller-owned; this call allocates/frees nothing and retains no
+// reference to it afterwards.
+int32_t houyi_mobile_db_save_buffer(void* db, uint8_t* out, size_t capacity, size_t* written);
+// 从内存字节恢复数据库；失败返回 NULL（坏 magic/CRC/版本/截断/尾随字节）。
+// bytes 只在本调用期间读取，返回后即可加密/清零；返回值用 houyi_mobile_db_close 释放。
+// EN: Restore from memory bytes; NULL on failure (bad magic/CRC/version/
+// truncation/trailing bytes). `bytes` is read only during this call and may be
+// encrypted/wiped afterwards; release the result with houyi_mobile_db_close.
+void* houyi_mobile_db_load_buffer(const uint8_t* bytes, size_t len);
 void houyi_mobile_db_close(void* db);
 
 #ifdef __cplusplus

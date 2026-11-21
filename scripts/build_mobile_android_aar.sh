@@ -42,6 +42,15 @@ esac
 API_LEVEL="${API_LEVEL:-26}"
 export CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER="${ANDROID_NDK_HOME}/toolchains/llvm/prebuilt/${NDK_HOST_TAG}/bin/aarch64-linux-android${API_LEVEL}-clang"
 
+# Android 15 起设备页大小可能是 16 KB；bionic 要求所有 LOAD 段按 16 KB 对齐，
+# 否则 16 KB 内核机型上加载 .so 直接失败。这里显式抬高 max-page-size（4 KB 设备
+# 仍然兼容 16 KB 对齐），并在构建后校验。
+# EN: Android 15+ devices may use 16 KB pages; bionic requires every LOAD segment
+# to be 16 KB aligned or the .so fails to load on such kernels. Raise
+# max-page-size explicitly (4 KB devices remain compatible) and verify below.
+ALIGN_FLAG="-C link-arg=-Wl,-z,max-page-size=16384"
+export RUSTFLAGS="${RUSTFLAGS:+$RUSTFLAGS }$ALIGN_FLAG"
+
 # Rust 构建（mobile profile：opt-level=s + LTO + strip）。锚定到仓库根，
 # 并尊重 CARGO_TARGET_DIR。
 # EN: Rust build with the size-optimized mobile profile, anchored at the repo
@@ -68,6 +77,21 @@ if [[ -x "$STRIP" ]]; then
   "$STRIP" --strip-unneeded "$JNI_DIR/libhouyi_mobile.so"
 fi
 ls -lh "$JNI_DIR/libhouyi_mobile.so"
+
+# 校验 16 KB 页对齐：读 ELF program headers 的 LOAD 段 Align。
+# EN: Verify 16 KB page alignment by reading LOAD segment alignment from the
+# ELF program headers.
+READELF="${ANDROID_NDK_HOME}/toolchains/llvm/prebuilt/${NDK_HOST_TAG}/bin/llvm-readelf"
+if [[ -x "$READELF" ]]; then
+  load_aligns="$("$READELF" -l "$JNI_DIR/libhouyi_mobile.so" | awk '/^ *LOAD/ {print $NF}')"
+  echo "LOAD align: $(echo "$load_aligns" | tr '\n' ' ')"
+  if ! echo "$load_aligns" | grep -qx "0x4000"; then
+    echo "16 KB page alignment check failed: expected every LOAD segment align 0x4000" >&2
+    exit 1
+  fi
+else
+  echo "llvm-readelf not found; skipping 16 KB page alignment check" >&2
+fi
 
 cd "$ANDROID_DIR"
 ./gradlew :assembleRelease "$@"

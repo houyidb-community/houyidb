@@ -658,6 +658,62 @@ pub extern "C" fn houyi_mobile_db_load(path: *const std::ffi::c_char) -> *mut db
     }
 }
 
+/// 把数据库编码进调用方缓冲区（不写任何临时文件）。
+///
+/// 返回 0 成功、-1 参数非法（db 或 written 为空）、-2 缓冲区不足。
+/// `*written`：成功时为写入字节数；返回 -2 时为所需容量，调用方可据此扩容
+/// 重试。查询所需容量：传 `out=NULL, capacity=0` 会返回 -2 并写 `*written`。
+/// 缓冲区所有权始终属于调用方；本函数不分配、不释放内存。
+/// EN: Encode the database into a caller-provided buffer (no temp files).
+/// Returns 0 on success, -1 for invalid arguments (null db/written), -2 when
+/// the buffer is too small. `*written` receives the byte count on success and
+/// the required capacity on -2; query the size with `out=NULL, capacity=0`.
+/// The buffer stays owned by the caller; this function allocates/frees nothing.
+#[no_mangle]
+pub extern "C" fn houyi_mobile_db_save_buffer(
+    db_handle: *mut db::MobileDB,
+    out: *mut u8,
+    capacity: usize,
+    written: *mut usize,
+) -> i32 {
+    if db_handle.is_null() || written.is_null() {
+        return -1;
+    }
+    let db = unsafe { &*db_handle };
+    let bytes = match db.encode() {
+        Ok(value) => value,
+        Err(_) => return -1,
+    };
+    let required = bytes.len();
+    unsafe { *written = required };
+    if out.is_null() || capacity < required {
+        return -2;
+    }
+    unsafe {
+        std::ptr::copy_nonoverlapping(bytes.as_ptr(), out, required);
+    }
+    0
+}
+
+/// 从内存字节恢复数据库；失败返回 NULL（坏 magic/CRC/版本/截断/尾随字节）。
+/// 返回的指针必须用 `houyi_mobile_db_close` 释放。
+/// `bytes` 仅在本调用期间被读取，不会被保存；调用方可立即加密/清零。
+/// EN: Restore a database from in-memory bytes; returns NULL on failure (bad
+/// magic/CRC/version/truncation/trailing bytes). Release the returned pointer
+/// with `houyi_mobile_db_close`. `bytes` is read only during this call and is
+/// never retained, so the caller may encrypt/wipe it immediately.
+#[no_mangle]
+pub extern "C" fn houyi_mobile_db_load_buffer(bytes: *const u8, len: usize) -> *mut db::MobileDB {
+    if bytes.is_null() || len == 0 {
+        return std::ptr::null_mut();
+    }
+    let slice = unsafe { std::slice::from_raw_parts(bytes, len) };
+    match db::MobileDB::decode(slice) {
+        Ok(db) => Box::into_raw(Box::new(db)),
+        Err(_) => std::ptr::null_mut(),
+    }
+}
+
 /// 向 Collection 批量插入（ABI v2）；失败前的行已生效。
 /// EN: Batch insert into a collection (ABI v2); rows before the failure remain
 /// applied.
@@ -1331,6 +1387,148 @@ mod tests {
         let _ = std::fs::remove_file(&truncated);
         let _ = std::fs::remove_file(&bad_magic_path);
         let _ = std::fs::remove_file(&bad_crc_path);
+    }
+
+    /// 内存快照：encode/decode 往返、空库、坏 magic/CRC/截断拒绝，以及
+    /// C ABI buffer 入口（查询容量 / 缓冲区不足 / 空指针 / 坏字节）。
+    /// EN: In-memory snapshot: encode/decode roundtrip, empty DB, bad magic/CRC/
+    /// truncation rejection, and the C ABI buffer entry points (size query,
+    /// too-small buffer, null pointers, corrupt bytes).
+    #[test]
+    fn test_snapshot_buffer_roundtrip_and_rejection() {
+        use rand::Rng;
+        use rand::SeedableRng;
+        // 空库也要能往返。
+        // EN: An empty database must roundtrip too.
+        let empty = db::MobileDB::new();
+        let empty_bytes = empty.encode().unwrap();
+        let restored = db::MobileDB::decode(&empty_bytes).unwrap();
+        assert!(restored.list().is_empty());
+
+        let db = db::MobileDB::new();
+        let dims = 6usize;
+        db.get_or_create("faces", dims, "flat-clustered").unwrap();
+        db.get_or_create("raw", dims, "flat").unwrap();
+        let mut rng = rand::rngs::StdRng::seed_from_u64(77);
+        let mut probes = Vec::new();
+        for i in 0..64u64 {
+            let v: Vec<f32> = (0..dims).map(|_| rng.gen::<f32>()).collect();
+            db.insert("faces", i, &v).unwrap();
+            db.insert("raw", i, &v).unwrap();
+            probes.push(v);
+        }
+        assert!(db.build("faces").unwrap() > 0);
+        db.insert_scalars_with_id("faces", 3, &[("tag", "text:keep")])
+            .unwrap();
+
+        let bytes = db.encode().unwrap();
+        let loaded = db::MobileDB::decode(&bytes).unwrap();
+        assert_eq!(loaded.count("faces").unwrap(), 64);
+        assert_eq!(loaded.count("raw").unwrap(), 64);
+        let found = loaded.search("faces", &probes[3], 5).unwrap();
+        assert!(
+            found.iter().take(1).any(|(id, _)| *id == 3),
+            "top-1 must survive encode/decode"
+        );
+        assert!(!loaded.search("raw", &probes[9], 3).unwrap().is_empty());
+
+        // 坏 magic / 坏 CRC / 截断都必须拒绝。
+        // EN: Bad magic/CRC/truncation must all be rejected.
+        let mut bad_magic = bytes.clone();
+        bad_magic[0] ^= 0xFF;
+        assert!(db::MobileDB::decode(&bad_magic).is_err());
+        let mut bad_crc = bytes.clone();
+        let last = bad_crc.len() - 1;
+        bad_crc[last] ^= 0xFF;
+        assert!(db::MobileDB::decode(&bad_crc).is_err());
+        assert!(db::MobileDB::decode(&bytes[..bytes.len() - 1]).is_err());
+        assert!(db::MobileDB::decode(&bytes[..8]).is_err());
+
+        // C ABI buffer：容量查询 → 缓冲区不足 → 成功 → 加载。
+        // EN: C ABI buffer: size query -> too small -> success -> load.
+        let abi_db = houyi_mobile_db_open();
+        assert!(!abi_db.is_null());
+        let name = CString::new("buf").unwrap();
+        let ty = CString::new("flat-clustered").unwrap();
+        assert_eq!(
+            houyi_mobile_db_collection_v2(abi_db, name.as_ptr(), 4, ty.as_ptr(), 1, 1),
+            0
+        );
+        let ids = [1u64, 2, 3];
+        let vectors: Vec<f32> = vec![
+            1.0, 0.0, 0.0, 0.0, //
+            0.0, 1.0, 0.0, 0.0, //
+            0.0, 0.0, 1.0, 0.0,
+        ];
+        assert_eq!(
+            houyi_mobile_db_insert_batch(
+                abi_db,
+                name.as_ptr(),
+                ids.as_ptr(),
+                vectors.as_ptr(),
+                3,
+                4
+            ),
+            0
+        );
+        assert!(houyi_mobile_db_build(abi_db, name.as_ptr()) > 0);
+
+        let mut required = 0usize;
+        assert_eq!(
+            houyi_mobile_db_save_buffer(abi_db, std::ptr::null_mut(), 0, &mut required),
+            -2
+        );
+        assert!(required > 0, "size query must report required bytes");
+        let mut small = vec![0u8; required - 1];
+        let mut written = 0usize;
+        assert_eq!(
+            houyi_mobile_db_save_buffer(abi_db, small.as_mut_ptr(), small.len(), &mut written),
+            -2
+        );
+        assert_eq!(written, required, "short buffer must report required size");
+        let mut buffer = vec![0u8; required];
+        assert_eq!(
+            houyi_mobile_db_save_buffer(abi_db, buffer.as_mut_ptr(), buffer.len(), &mut written),
+            0
+        );
+        assert_eq!(written, required);
+
+        let loaded_abi = houyi_mobile_db_load_buffer(buffer.as_ptr(), buffer.len());
+        assert!(!loaded_abi.is_null());
+        assert_eq!(
+            houyi_mobile_db_count(loaded_abi, name.as_ptr()),
+            3,
+            "buffer roundtrip must keep the vector count"
+        );
+        houyi_mobile_db_close(loaded_abi);
+
+        // 非法参数与坏字节。
+        // EN: Invalid arguments and corrupt bytes.
+        let mut sink = 0usize;
+        assert_eq!(
+            houyi_mobile_db_save_buffer(
+                std::ptr::null_mut(),
+                buffer.as_mut_ptr(),
+                buffer.len(),
+                &mut sink
+            ),
+            -1
+        );
+        assert_eq!(
+            houyi_mobile_db_save_buffer(
+                abi_db,
+                buffer.as_mut_ptr(),
+                buffer.len(),
+                std::ptr::null_mut()
+            ),
+            -1
+        );
+        assert!(houyi_mobile_db_load_buffer(std::ptr::null(), 10).is_null());
+        assert!(houyi_mobile_db_load_buffer(buffer.as_ptr(), 0).is_null());
+        let mut corrupted = buffer.clone();
+        corrupted[0] ^= 0xFF;
+        assert!(houyi_mobile_db_load_buffer(corrupted.as_ptr(), corrupted.len()).is_null());
+        houyi_mobile_db_close(abi_db);
     }
 
     /// ABI v2：批量插入与 u64 结果（>2^24 的 id 不再丢精度），DB 路径同样覆盖。
