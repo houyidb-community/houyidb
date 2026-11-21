@@ -11,6 +11,6 @@ description = "HouyiDB Mobile Android JNI bridge"
 crate-type = ["cdylib"]
 
 [dependencies]
-houyi-mobile = { path = "../houyi-mobile", version = "0.2.0-beta.8" }
-houyi-vector = { path = "../houyi-vector", version = "0.2.0-beta.8", default-features = false, features = ["portable", "simd-neon"] }
+houyi-mobile = { path = "../houyi-mobile", version = "0.2.0-beta.9" }
+houyi-vector = { path = "../houyi-vector", version = "0.2.0-beta.9", default-features = false, features = ["portable", "simd-neon"] }
 jni = "0.21"

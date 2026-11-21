@@ -8,7 +8,7 @@ The official Java client for the HouyiDB vector database (collections HTTP API).
 
 ```groovy
 dependencies {
-    implementation 'top.houyidb:houyidb-client:0.2.0-beta.8'
+    implementation 'top.houyidb:houyidb-client:0.2.0-beta.9'
 }
 ```
 

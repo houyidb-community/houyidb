@@ -2,7 +2,7 @@
 
 > [English](DEPLOYMENT_GUIDE.en.md)
 
-> 适用版本：v0.2.0-beta.8。HouyiDB 是**单机、内存优先**的向量数据库；
+> 适用版本：v0.2.0-beta.9。HouyiDB 是**单机、内存优先**的向量数据库；
 > 高可用为 leader/follower 手动 promote，不做自动选主。beta 阶段建议先用于
 > 功能验证与非关键业务。
 >
@@ -157,7 +157,7 @@ helm install houyi ./deploy/helm/houyidb -n houyidb --create-namespace \
   --set persistence.size=100Gi
 ```
 
-默认镜像为 `ghcr.io/houyidb-community/houyidb:v0.2.0-beta.8`；自建镜像时
+默认镜像为 `ghcr.io/houyidb-community/houyidb:v0.2.0-beta.9`；自建镜像时
 覆盖 `image.repository` / `image.tag`。
 
 主备是**两个 release**（v1 无自动选主，`replicaCount` 调大只会得到多个独立

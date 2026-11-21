@@ -1,4 +1,4 @@
-# HouyiDB 试用手册（v0.2.0-beta.8）
+# HouyiDB 试用手册（v0.2.0-beta.9）
 
 > [English](USER_MANUAL.en.md)
 
@@ -17,8 +17,8 @@
 预编译包（macOS；Apple Silicon 与 Intel 各一份）：
 
 ```
-houyidb-0.2.0-beta.8-<date>-darwin-arm64/     # Apple Silicon (M1/M2/M3/M4)
-houyidb-0.2.0-beta.8-<date>-darwin-x86_64/    # Intel Mac
+houyidb-0.2.0-beta.9-<date>-darwin-arm64/     # Apple Silicon (M1/M2/M3/M4)
+houyidb-0.2.0-beta.9-<date>-darwin-x86_64/    # Intel Mac
 ├── bin/houyi-server          # 主服务（约 10MB，无外部 C 依赖）
 ├── scripts/trial_start.sh    # 一键启动（默认 17000/15432）
 ├── scripts/trial_smoke.sh    # 自检：写入/检索/过滤/删除
@@ -31,7 +31,7 @@ houyidb-0.2.0-beta.8-<date>-darwin-x86_64/    # Intel Mac
 └── sdk/python/               # Python 客户端 + LangChain/LlamaIndex 适配器
 ```
 
-源码包：`houyidb-0.2.0-beta.8-src.tar.gz`（任意平台；含 Dockerfile 与全部 SDK）。
+源码包：`houyidb-0.2.0-beta.9-src.tar.gz`（任意平台；含 Dockerfile 与全部 SDK）。
 
 > 请按 CPU 架构选择预编译包（`uname -m`：`arm64` 用 arm64 包，`x86_64` 用
 > x86_64 包）。Linux/Windows 请用源码包 `cargo build` 或 Docker。
@@ -46,8 +46,8 @@ Apple Silicon（M 系列）用 `darwin-arm64`，Intel Mac 用 `darwin-x86_64`：
 
 ```bash
 uname -m        # arm64 → darwin-arm64；x86_64 → darwin-x86_64
-tar xzf houyidb-0.2.0-beta.8-*-darwin-<arch>.tar.gz
-cd houyidb-0.2.0-beta.8-*-darwin-<arch>
+tar xzf houyidb-0.2.0-beta.9-*-darwin-<arch>.tar.gz
+cd houyidb-0.2.0-beta.9-*-darwin-<arch>
 
 # 若二进制来自网络传输被 Gatekeeper 隔离，先解除（无签名 beta 的常见问题）：
 xattr -dr com.apple.quarantine . 2>/dev/null || true
@@ -66,8 +66,8 @@ xattr -dr com.apple.quarantine . 2>/dev/null || true
 解压源码包后：
 
 ```bash
-tar xzf houyidb-0.2.0-beta.8-src.tar.gz
-cd houyidb-0.2.0-beta.8-src
+tar xzf houyidb-0.2.0-beta.9-src.tar.gz
+cd houyidb-0.2.0-beta.9-src
 docker compose up -d --build        # 首次会编译 Rust，约 5–15 分钟
 curl http://127.0.0.1:7000/v1/health
 ```
@@ -87,8 +87,8 @@ curl http://127.0.0.1:7000/v1/health
 ### 1.3 源码构建（需要 Rust 1.87+）
 
 ```bash
-tar xzf houyidb-0.2.0-beta.8-src.tar.gz
-cd houyidb-0.2.0-beta.8-src
+tar xzf houyidb-0.2.0-beta.9-src.tar.gz
+cd houyidb-0.2.0-beta.9-src
 cargo build --release -p houyi-server
 ./scripts/trial_start.sh
 ```

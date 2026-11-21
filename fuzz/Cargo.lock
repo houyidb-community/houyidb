@@ -313,7 +313,7 @@ dependencies = [
 
 [[package]]
 name = "houyi-core"
-version = "0.2.0-beta.8"
+version = "0.2.0-beta.9"
 dependencies = [
  "anyhow",
  "crossbeam-queue",
@@ -325,7 +325,7 @@ dependencies = [
 
 [[package]]
 name = "houyi-persistence"
-version = "0.2.0-beta.8"
+version = "0.2.0-beta.9"
 dependencies = [
  "aes-gcm",
  "async-trait",
@@ -341,7 +341,7 @@ dependencies = [
 
 [[package]]
 name = "houyi-query"
-version = "0.2.0-beta.8"
+version = "0.2.0-beta.9"
 dependencies = [
  "anyhow",
  "sqlparser",
@@ -349,7 +349,7 @@ dependencies = [
 
 [[package]]
 name = "houyi-vector"
-version = "0.2.0-beta.8"
+version = "0.2.0-beta.9"
 dependencies = [
  "ahash",
  "async-trait",

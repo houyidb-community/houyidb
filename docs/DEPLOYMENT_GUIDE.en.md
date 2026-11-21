@@ -2,7 +2,7 @@
 
 > [中文](DEPLOYMENT_GUIDE.md)
 
-> Applies to v0.2.0-beta.8. HouyiDB is a **single-node, memory-first** vector database;
+> Applies to v0.2.0-beta.9. HouyiDB is a **single-node, memory-first** vector database;
 > high availability is manual leader/follower promotion, with no automatic election.
 > During beta, use it first for functional validation and non-critical workloads.
 
@@ -149,7 +149,7 @@ helm install houyi ./deploy/helm/houyidb -n houyidb --create-namespace \
   --set persistence.size=100Gi
 ```
 
-The default image is `ghcr.io/houyidb-community/houyidb:v0.2.0-beta.8`;
+The default image is `ghcr.io/houyidb-community/houyidb:v0.2.0-beta.9`;
 override `image.repository` / `image.tag` for a self-built image.
 
 Primary/standby uses **two releases** (v1 has no automatic election; increasing

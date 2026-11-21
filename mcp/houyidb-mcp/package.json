@@ -1,6 +1,6 @@
 {
   "name": "houyidb-mcp",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Model Context Protocol server for HouyiDB vector search",
   "mcpName": "io.github.houyidb-community/houyidb-mcp",
   "license": "Apache-2.0",

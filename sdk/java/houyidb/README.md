@@ -8,7 +8,7 @@ HouyiDB 向量数据库的官方 Java 客户端（collections HTTP API）。同�
 
 ```groovy
 dependencies {
-    implementation 'top.houyidb:houyidb-client:0.2.0-beta.8'
+    implementation 'top.houyidb:houyidb-client:0.2.0-beta.9'
 }
 ```
 

@@ -1,4 +1,4 @@
-# HouyiDB Trial Manual (v0.2.0-beta.8)
+# HouyiDB Trial Manual (v0.2.0-beta.9)
 
 > [中文](USER_MANUAL.md)
 
@@ -19,8 +19,8 @@
 Prebuilt packages (macOS; one each for Apple Silicon and Intel):
 
 ```
-houyidb-0.2.0-beta.8-<date>-darwin-arm64/     # Apple Silicon (M1/M2/M3/M4)
-houyidb-0.2.0-beta.8-<date>-darwin-x86_64/    # Intel Mac
+houyidb-0.2.0-beta.9-<date>-darwin-arm64/     # Apple Silicon (M1/M2/M3/M4)
+houyidb-0.2.0-beta.9-<date>-darwin-x86_64/    # Intel Mac
 ├── bin/houyi-server          # 主服务（约 10MB，无外部 C 依赖）
 ├── scripts/trial_start.sh    # 一键启动（默认 17000/15432）
 ├── scripts/trial_smoke.sh    # 自检：写入/检索/过滤/删除
@@ -33,7 +33,7 @@ houyidb-0.2.0-beta.8-<date>-darwin-x86_64/    # Intel Mac
 └── sdk/python/               # Python 客户端 + LangChain/LlamaIndex 适配器
 ```
 
-Source package: `houyidb-0.2.0-beta.8-src.tar.gz` (any platform; includes the
+Source package: `houyidb-0.2.0-beta.9-src.tar.gz` (any platform; includes the
 Dockerfile and all SDKs).
 
 > Choose the prebuilt package by CPU architecture (`uname -m`: use the arm64
@@ -50,8 +50,8 @@ Use `darwin-arm64` on Apple Silicon (M series) and `darwin-x86_64` on Intel Macs
 
 ```bash
 uname -m        # arm64 → darwin-arm64；x86_64 → darwin-x86_64
-tar xzf houyidb-0.2.0-beta.8-*-darwin-<arch>.tar.gz
-cd houyidb-0.2.0-beta.8-*-darwin-<arch>
+tar xzf houyidb-0.2.0-beta.9-*-darwin-<arch>.tar.gz
+cd houyidb-0.2.0-beta.9-*-darwin-<arch>
 
 # If the binary was quarantined by Gatekeeper after network transfer, remove the quarantine first (a common issue with unsigned beta builds):
 xattr -dr com.apple.quarantine . 2>/dev/null || true
@@ -70,8 +70,8 @@ Once you see `HTTP : http://127.0.0.1:17000`, open another terminal:
 After extracting the source package:
 
 ```bash
-tar xzf houyidb-0.2.0-beta.8-src.tar.gz
-cd houyidb-0.2.0-beta.8-src
+tar xzf houyidb-0.2.0-beta.9-src.tar.gz
+cd houyidb-0.2.0-beta.9-src
 docker compose up -d --build        # 首次会编译 Rust，约 5–15 分钟
 curl http://127.0.0.1:7000/v1/health
 ```
@@ -92,8 +92,8 @@ curl http://127.0.0.1:7000/v1/health
 ### 1.3 Build from Source (requires Rust 1.87+)
 
 ```bash
-tar xzf houyidb-0.2.0-beta.8-src.tar.gz
-cd houyidb-0.2.0-beta.8-src
+tar xzf houyidb-0.2.0-beta.9-src.tar.gz
+cd houyidb-0.2.0-beta.9-src
 cargo build --release -p houyi-server
 ./scripts/trial_start.sh
 ```

@@ -4,6 +4,8 @@
 
 ## Unreleased
 
+## v0.2.0-beta.9 (2026-11-21)
+
 ### Added
 - **houyi-mobile JNI/AAR**: new `houyi-mobile-jni` crate (native bindings for
   the Kotlin `cc.houyidb.mobile.HouyiDB` facade, with u64 search ids) and a

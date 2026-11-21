@@ -4,6 +4,8 @@
 
 ## Unreleased
 
+## v0.2.0-beta.9 (2026-11-21)
+
 ### Added
 - **houyi-mobile JNI/AAR**：新增 `houyi-mobile-jni`（Kotlin
   `cc.houyidb.mobile.HouyiDB` 的 native 绑定，检索结果用 u64 id）与

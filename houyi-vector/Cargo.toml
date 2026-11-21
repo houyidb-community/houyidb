@@ -16,7 +16,7 @@ cxl-memory = []
 ha-raft = []
 
 [dependencies]
-houyi-core = { path = "../houyi-core", version = "0.2.0-beta.8", default-features = false, features = ["portable"] }
+houyi-core = { path = "../houyi-core", version = "0.2.0-beta.9", default-features = false, features = ["portable"] }
 ahash = "0.8"
 # f16 存储编码（P1.1）；版本由工作区统一声明。
 # EN: f16 storage encoding (P1.1); version declared once at the workspace level.
