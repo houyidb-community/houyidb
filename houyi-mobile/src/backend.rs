@@ -48,7 +48,87 @@ pub(crate) struct Backend {
     /// 2500 (25k candidates at k=10, matching old behavior); mobile may lower
     /// it to trade recall for latency.
     search_target_per_k: usize,
+    /// 下一次 build 使用的 nprobe（None = 自适应公式）。
+    /// EN: nprobe for the next build (None = adaptive formula).
+    build_nprobe: Option<usize>,
+    /// 运行期 nprobe / ef_search 设置（建图后立即生效，待建图则建图时应用）。
+    /// EN: Runtime nprobe / ef_search settings (applied immediately when built,
+    /// or at build time when still pending).
+    search_nprobe: NprobeSetting,
+    search_ef_search: Option<usize>,
     kind: BackendKind,
+}
+
+/// nprobe 设置：绝对值或按簇数推导，避免在未建图时猜簇数量。
+/// EN: nprobe setting: absolute or derived from the cluster count, so nothing
+/// has to guess the cluster count before a build.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum NprobeSetting {
+    /// 沿用构建期值。
+    /// EN: Keep the build-time value.
+    Default,
+    /// 显式簇数（夹取到 1..=num_clusters）。
+    /// EN: Explicit cluster count (clamped to 1..=num_clusters).
+    Absolute(usize),
+    /// 全部簇（高召回）。
+    /// EN: All clusters (high recall).
+    All,
+    /// `max(4, num_clusters / divisor)`（快速档）。
+    /// EN: `max(4, num_clusters / divisor)` (fast preset).
+    Div(usize),
+}
+
+/// 移动端召回/延迟预设。
+/// EN: Mobile recall/latency presets.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SearchPreset {
+    /// 低延迟：per_k=500，少量簇。
+    /// EN: Low latency: per_k=500, few clusters.
+    Fast,
+    /// 默认平衡档：沿用默认预算与构建期 nprobe。
+    /// EN: Default balanced preset: built-in budget and build-time nprobe.
+    Balanced,
+    /// 高召回：per_k=5000，全簇路由；clustered-hnsw 提高 ef_search。
+    /// EN: High recall: per_k=5000, all clusters; clustered-hnsw raises
+    /// ef_search.
+    HighRecall,
+}
+
+impl SearchPreset {
+    /// 从 C/JNI 的整数码解析：0=fast、1=balanced、2=high_recall。
+    /// EN: Parse the C/JNI integer code: 0=fast, 1=balanced, 2=high_recall.
+    pub fn from_code(code: u8) -> Option<Self> {
+        match code {
+            0 => Some(Self::Fast),
+            1 => Some(Self::Balanced),
+            2 => Some(Self::HighRecall),
+            _ => None,
+        }
+    }
+
+    fn per_k(self) -> usize {
+        match self {
+            Self::Fast => 500,
+            Self::Balanced => DEFAULT_SEARCH_TARGET_PER_K,
+            Self::HighRecall => 5000,
+        }
+    }
+
+    fn nprobe(self) -> NprobeSetting {
+        match self {
+            Self::Fast => NprobeSetting::Div(16),
+            Self::Balanced => NprobeSetting::Default,
+            Self::HighRecall => NprobeSetting::All,
+        }
+    }
+
+    fn ef_search(self) -> Option<usize> {
+        match self {
+            Self::Fast => Some(64),
+            Self::Balanced => None,
+            Self::HighRecall => Some(512),
+        }
+    }
 }
 
 enum BackendKind {
@@ -153,6 +233,9 @@ impl Backend {
             metric,
             dtype,
             search_target_per_k: DEFAULT_SEARCH_TARGET_PER_K,
+            build_nprobe: None,
+            search_nprobe: NprobeSetting::Default,
+            search_ef_search: None,
             kind,
         })
     }
@@ -177,6 +260,98 @@ impl Backend {
         }
         self.search_target_per_k = per_k;
         Ok(())
+    }
+
+    /// 设置检索选项（None = 该项保持不变）。
+    ///
+    /// - `per_k`：候选预算（1..=100000）。
+    /// - `nprobe`：路由簇数（1..=100000，建图后被夹取到簇数）。
+    /// - `ef_search`：仅 clustered-hnsw 生效（1..=4096），逐簇写入图实例。
+    ///
+    /// EN: Set search options (None leaves a field unchanged).
+    /// - `per_k`: candidate budget (1..=100000).
+    /// - `nprobe`: routed cluster count (clamped to the cluster count after a
+    ///   build).
+    /// - `ef_search`: clustered-hnsw only (1..=4096), written into every
+    ///   cluster graph.
+    pub(crate) fn set_search_options(
+        &mut self,
+        per_k: Option<usize>,
+        nprobe: Option<usize>,
+        ef_search: Option<usize>,
+    ) -> Result<(), String> {
+        if let Some(per_k) = per_k {
+            self.set_search_target(per_k)?;
+        }
+        if let Some(nprobe) = nprobe {
+            if nprobe == 0 || nprobe > 100_000 {
+                return Err(format!("{ERR_INVALID}nprobe must be in 1..=100000"));
+            }
+            self.search_nprobe = NprobeSetting::Absolute(nprobe);
+        }
+        if let Some(ef_search) = ef_search {
+            if ef_search == 0 || ef_search > 4096 {
+                return Err(format!("{ERR_INVALID}ef_search must be in 1..=4096"));
+            }
+            self.search_ef_search = Some(ef_search);
+        }
+        self.apply_search_settings();
+        Ok(())
+    }
+
+    /// 应用预设（fast / balanced / high_recall）。
+    /// EN: Apply a preset (fast / balanced / high_recall).
+    pub(crate) fn set_search_preset(&mut self, preset: SearchPreset) -> Result<(), String> {
+        self.search_target_per_k = preset.per_k();
+        self.search_nprobe = preset.nprobe();
+        self.search_ef_search = preset.ef_search();
+        self.apply_search_settings();
+        Ok(())
+    }
+
+    /// 下一次 build 使用的 nprobe；0 = 恢复自适应公式。已建图需重建才生效
+    /// （运行期可用 `set_search_options` 的 nprobe 直接抬高路由簇数）。
+    /// EN: nprobe for the next build; 0 restores the adaptive formula. A built
+    /// index only picks it up on rebuild (use `set_search_options` nprobe to
+    /// raise routing immediately).
+    pub(crate) fn set_build_nprobe(&mut self, nprobe: usize) -> Result<(), String> {
+        if nprobe > 100_000 {
+            return Err(format!("{ERR_INVALID}nprobe must be <= 100000"));
+        }
+        self.build_nprobe = if nprobe == 0 { None } else { Some(nprobe) };
+        Ok(())
+    }
+
+    /// 把已保存的运行期设置应用到已构建的索引（未建图时留待 build 处理）。
+    /// EN: Apply saved runtime settings to a built index (pending indexes pick
+    /// them up at build time).
+    fn apply_search_settings(&mut self) {
+        let nprobe = self.search_nprobe;
+        let ef = self.search_ef_search;
+        match &mut self.kind {
+            BackendKind::FlatClustered(LazyIndex::Built { index, .. }) => {
+                index.set_search_nprobe(Self::resolve_nprobe(nprobe, index.num_clusters()));
+            }
+            BackendKind::ClusteredHnsw(LazyIndex::Built { index, .. }) => {
+                index.set_search_nprobe(Self::resolve_nprobe(nprobe, index.num_clusters()));
+                if let Some(ef) = ef {
+                    index.set_search_ef_search(ef);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// 把 nprobe 设置解析成绝对值：Default=0、All=全部、Div=按簇数推导。
+    /// EN: Resolve an nprobe setting: Default=0, All=every cluster, Div=derived
+    /// from the cluster count.
+    fn resolve_nprobe(setting: NprobeSetting, num_clusters: usize) -> usize {
+        match setting {
+            NprobeSetting::Default => 0,
+            NprobeSetting::Absolute(value) => value.min(num_clusters),
+            NprobeSetting::All => num_clusters,
+            NprobeSetting::Div(divisor) => (num_clusters / divisor.max(1)).max(4),
+        }
     }
 
     /// 插入/覆盖；建图后的 flat-clustered 立即可见。
@@ -233,6 +408,11 @@ impl Backend {
     /// EN: Build or recluster; returns the indexed count. A built index is
     /// exported and rebuilt from its current rows.
     pub(crate) fn build(&mut self) -> usize {
+        // 建图前先取出设置：match 借用了 self.kind，之后无法再借 self。
+        // EN: Snapshot settings before the match borrows self.kind.
+        let build_nprobe = self.build_nprobe;
+        let runtime_nprobe = self.search_nprobe;
+        let runtime_ef = self.search_ef_search;
         match &mut self.kind {
             BackendKind::Flat(store) => store.len(),
             BackendKind::FlatClustered(state) => match state {
@@ -243,7 +423,7 @@ impl Backend {
                     }
                     let (ids, vecs) = store.take_for_build();
                     let c = (n as f64).sqrt().ceil() as usize;
-                    let fc = FlatClustered::build_with_storage_dtype(
+                    let fc = FlatClustered::build_with_storage_dtype_and_nprobe(
                         &vecs,
                         &ids,
                         self.dims,
@@ -252,7 +432,12 @@ impl Backend {
                         10,
                         0,
                         self.dtype,
+                        build_nprobe,
                     );
+                    fc.set_search_nprobe(Backend::resolve_nprobe(
+                        runtime_nprobe,
+                        fc.num_clusters(),
+                    ));
                     let count = fc.total_vectors();
                     *state = LazyIndex::Built {
                         index: fc,
@@ -267,7 +452,7 @@ impl Backend {
                     let n = index.total_vectors();
                     let (ids, vecs) = flatten_export(index.export_vectors(), self.dims);
                     let c = (n as f64).sqrt().ceil() as usize;
-                    let fc = FlatClustered::build_with_storage_dtype(
+                    let fc = FlatClustered::build_with_storage_dtype_and_nprobe(
                         &vecs,
                         &ids,
                         self.dims,
@@ -276,7 +461,12 @@ impl Backend {
                         10,
                         0,
                         self.dtype,
+                        build_nprobe,
                     );
+                    fc.set_search_nprobe(Backend::resolve_nprobe(
+                        runtime_nprobe,
+                        fc.num_clusters(),
+                    ));
                     let count = fc.total_vectors();
                     *state = LazyIndex::Built {
                         index: fc,
@@ -293,8 +483,18 @@ impl Backend {
                     }
                     let (ids, vecs) = store.take_for_build();
                     let known_ids: ahash::AHashSet<u64> = ids.iter().copied().collect();
-                    let cfg = cluster_config(n, self.dims);
+                    let mut cfg = cluster_config(n, self.dims);
+                    if let Some(nprobe) = build_nprobe {
+                        cfg.nprobe = nprobe.clamp(1, cfg.num_clusters);
+                    }
                     let ch = ClusteredHnsw::build(&vecs, &ids, self.dims, self.metric, &cfg);
+                    ch.set_search_nprobe(Backend::resolve_nprobe(
+                        runtime_nprobe,
+                        ch.num_clusters(),
+                    ));
+                    if let Some(ef) = runtime_ef {
+                        ch.set_search_ef_search(ef);
+                    }
                     let count = ch.total_vectors();
                     *state = LazyIndex::Built {
                         index: ch,
@@ -309,8 +509,18 @@ impl Backend {
                     let n = index.total_vectors();
                     let (ids, vecs) = flatten_export(index.export_vectors(), self.dims);
                     let known_ids: ahash::AHashSet<u64> = ids.iter().copied().collect();
-                    let cfg = cluster_config(n, self.dims);
+                    let mut cfg = cluster_config(n, self.dims);
+                    if let Some(nprobe) = build_nprobe {
+                        cfg.nprobe = nprobe.clamp(1, cfg.num_clusters);
+                    }
                     let ch = ClusteredHnsw::build(&vecs, &ids, self.dims, self.metric, &cfg);
+                    ch.set_search_nprobe(Backend::resolve_nprobe(
+                        runtime_nprobe,
+                        ch.num_clusters(),
+                    ));
+                    if let Some(ef) = runtime_ef {
+                        ch.set_search_ef_search(ef);
+                    }
                     let count = ch.total_vectors();
                     *state = LazyIndex::Built {
                         index: ch,
@@ -480,6 +690,9 @@ impl Backend {
                     metric,
                     dtype,
                     search_target_per_k: DEFAULT_SEARCH_TARGET_PER_K,
+                    build_nprobe: None,
+                    search_nprobe: NprobeSetting::Default,
+                    search_ef_search: None,
                     kind: BackendKind::FlatClustered(LazyIndex::Built {
                         index,
                         known_ids: None,

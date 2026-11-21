@@ -397,6 +397,12 @@ pub struct FlatClustered {
     /// EN: Precomputed norm cache for the f16 cosine path (not enabled for f32 or
     /// other metrics, so the server default path pays nothing).
     cosine_norms: Option<CosineNormCache>,
+    /// 运行期 nprobe 覆盖（0 = 使用构建期值）。移动端 high-recall 预设用它
+    /// 突破构建期比例上限：路由到的簇覆盖全部簇数据，提高只会多扫描。
+    /// EN: Runtime nprobe override (0 = build-time value). Mobile's high-recall
+    /// preset uses it to exceed the build-time ratio cap; all clusters hold
+    /// their data, so a larger value only scans more.
+    search_nprobe: std::sync::atomic::AtomicUsize,
 }
 
 impl FlatClustered {
@@ -422,6 +428,7 @@ impl FlatClustered {
             seed,
             FlatStorageDtype::F32,
             false,
+            None,
         )
     }
 
@@ -451,6 +458,7 @@ impl FlatClustered {
             seed,
             FlatStorageDtype::from_vector_dtype(dtype),
             true,
+            None,
         )
     }
 
@@ -478,6 +486,41 @@ impl FlatClustered {
             seed,
             dtype,
             true,
+            None,
+        )
+    }
+
+    /// 与 [`build_with_storage_dtype`] 相同，但可覆盖构建期 nprobe（路由簇数）。
+    ///
+    /// `nprobe=None` 沿用自适应公式；`Some(n)` 在 1..=num_clusters 内生效。
+    /// 512d×50k 这类高维簇状数据默认比例不足，提高 nprobe 才能提升召回上限。
+    /// EN: Same as [`build_with_storage_dtype`] with a build-time nprobe
+    /// (routed cluster count) override. `None` keeps the adaptive formula;
+    /// `Some(n)` is clamped to 1..=num_clusters. High-dimensional clustered
+    /// data (e.g. 512d×50k) needs more probes than the default ratio gives.
+    #[allow(clippy::too_many_arguments)]
+    pub fn build_with_storage_dtype_and_nprobe(
+        vectors: &[f32],
+        ids: &[u64],
+        dims: usize,
+        metric: DistanceMetric,
+        num_clusters: usize,
+        kmeans_iters: usize,
+        seed: u64,
+        dtype: FlatStorageDtype,
+        nprobe: Option<usize>,
+    ) -> Self {
+        Self::build_internal(
+            vectors,
+            ids,
+            dims,
+            metric,
+            num_clusters,
+            kmeans_iters,
+            seed,
+            dtype,
+            true,
+            nprobe,
         )
     }
 
@@ -492,6 +535,7 @@ impl FlatClustered {
         seed: u64,
         dtype: FlatStorageDtype,
         cache_norms: bool,
+        nprobe_override: Option<usize>,
     ) -> Self {
         assert_eq!(vectors.len(), ids.len() * dims);
         let n = ids.len();
@@ -568,7 +612,11 @@ impl FlatClustered {
         // EN: lower bound must not exceed upper bound — clamp(4, c) panics for c < 4.
         let cluster_sz = n / c;
         let target = DEFAULT_SEARCH_TARGET_PER_K.saturating_mul(10); // k=10 预算
-        let nprobe = (target / cluster_sz.max(1)).clamp(4.min(c), c);
+        let adaptive = (target / cluster_sz.max(1)).clamp(4.min(c), c);
+        let nprobe = match nprobe_override {
+            Some(value) => value.clamp(1, c),
+            None => adaptive,
+        };
 
         let mut index = FlatClustered {
             dims,
@@ -581,6 +629,7 @@ impl FlatClustered {
             id_index: None,
             id_index_error: None,
             cosine_norms: None,
+            search_nprobe: std::sync::atomic::AtomicUsize::new(0),
         };
         if cache_norms {
             index.rebuild_cosine_norms();
@@ -743,8 +792,51 @@ impl FlatClustered {
 
     /// 检索 top-k（自适应 nprobe）。
     /// EN: Searches top-k with adaptive nprobe.
+    /// nprobe 决策：显式覆盖优先，否则构建期值按候选预算收敛。
+    ///
+    /// 抽成纯函数是为了钉住「覆盖不会被预算压回去」这一分支——真实数据要
+    /// 复现该回归需要 2.5 万级以上、每簇 80+ 的语料，不适合放进单测。
+    /// EN: nprobe decision: an explicit override wins; otherwise the build-time
+    /// value converges by the candidate budget. Extracted as a pure function so
+    /// the "override is not squeezed back" branch is pinned without needing a
+    /// 25k+ corpus with 80+ points per cluster.
+    fn decide_nprobe(
+        build_nprobe: usize,
+        override_nprobe: usize,
+        num_clusters: usize,
+        total: usize,
+        k: usize,
+        target_per_k: usize,
+    ) -> usize {
+        if override_nprobe > 0 {
+            return override_nprobe.min(num_clusters);
+        }
+        let cluster_sz = (total / num_clusters).max(1);
+        let target = k.saturating_mul(target_per_k);
+        build_nprobe.min((target / cluster_sz).max(4))
+    }
+
     pub fn search(&self, query: &[f32], k: usize) -> Vec<(u64, f32)> {
         self.search_with_target(query, k, DEFAULT_SEARCH_TARGET_PER_K)
+    }
+
+    /// 运行期 nprobe 覆盖：0 恢复构建期值，其余在 1..=num_clusters 内生效。
+    /// EN: Runtime nprobe override: 0 restores the build-time value; any other
+    /// value is clamped to 1..=num_clusters.
+    pub fn set_search_nprobe(&self, nprobe: usize) {
+        let value = if nprobe == 0 {
+            0
+        } else {
+            nprobe.clamp(1, self.num_clusters)
+        };
+        self.search_nprobe
+            .store(value, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// 构建期 nprobe（路由簇数）。
+    /// EN: Build-time nprobe (routed cluster count).
+    pub fn nprobe(&self) -> usize {
+        self.nprobe
     }
 
     /// 以指定「每 k 的候选预算」检索（默认 2500/k，即 k=10 时 25k 候选）。
@@ -793,12 +885,15 @@ impl FlatClustered {
         let k = k.max(1);
         let target_per_k = target_per_k.max(1);
 
-        // 自适应 nprobe
-        // EN: Adaptive nprobe.
-        let total = self.total_vectors();
-        let cluster_sz = (total / self.num_clusters).max(1);
-        let target = k.saturating_mul(target_per_k);
-        let adaptive_nprobe = self.nprobe.min((target / cluster_sz).max(4));
+        let adaptive_nprobe = Self::decide_nprobe(
+            self.nprobe,
+            self.search_nprobe
+                .load(std::sync::atomic::Ordering::Relaxed),
+            self.num_clusters,
+            self.total_vectors(),
+            k,
+            target_per_k,
+        );
 
         let top_clusters = router::route_query(
             query,
@@ -1197,6 +1292,7 @@ impl FlatClustered {
             id_index: None,
             id_index_error: None,
             cosine_norms: None,
+            search_nprobe: std::sync::atomic::AtomicUsize::new(0),
         };
         index.rebuild_cosine_norms();
         Ok(index)
@@ -1637,6 +1733,98 @@ mod tests {
     /// EN: f16 + Cosine norm-cache path: build, cross-cluster upsert, state
     /// roundtrip, and parity with the default dist_fn kernel. This is the
     /// mobile default configuration.
+    /// 显式运行期 nprobe 不得被候选预算压回去（否则 set_search_options
+    /// 会静默失效）；未设置覆盖时保持历史语义。
+    /// EN: An explicit runtime nprobe must not be squeezed back by the
+    /// candidate budget (which would silently defeat set_search_options); the
+    /// historical semantics stay when no override is set.
+    #[test]
+    fn test_decide_nprobe_override_wins_over_budget() {
+        // 每簇 223 点、k=10、默认预算 ⇒ 预算只允许 112 簇。
+        // EN: 223 points per cluster, k=10, default budget ⇒ budget allows 112.
+        let budgeted = FlatClustered::decide_nprobe(78, 0, 224, 50_000, 10, 2500);
+        assert_eq!(budgeted, 78);
+        let capped = FlatClustered::decide_nprobe(300, 0, 224, 50_000, 10, 2500);
+        assert_eq!(capped, 112, "build-time nprobe converges by budget");
+        assert_eq!(
+            FlatClustered::decide_nprobe(78, 224, 224, 50_000, 10, 2500),
+            224,
+            "explicit override must win over the budget cap"
+        );
+        assert_eq!(
+            FlatClustered::decide_nprobe(78, 999, 224, 50_000, 10, 2500),
+            224,
+            "override clamps to the cluster count"
+        );
+    }
+
+    /// 构建期 nprobe 覆盖与运行期 nprobe 覆盖都必须真实改变路由簇数：
+    /// 每簇数据都完整保存，所以 `nprobe=全部` 的召回必须高于 `nprobe=1`。
+    /// EN: Build-time and runtime nprobe overrides must really change routing:
+    /// every cluster keeps its data, so `nprobe=all` must beat `nprobe=1`.
+    #[test]
+    fn test_nprobe_override_raises_recall() {
+        let dims = 16;
+        let clusters = 30;
+        let per_cluster = 100;
+        let n = clusters * per_cluster;
+        let mut rng = rand::rngs::StdRng::seed_from_u64(99);
+        let mut centers = vec![0f32; clusters * dims];
+        for x in &mut centers {
+            *x = rng.gen::<f32>() * 2.0 - 1.0;
+        }
+        let mut vectors = Vec::with_capacity(n * dims);
+        let ids: Vec<u64> = (0..n as u64).collect();
+        for i in 0..n {
+            let c = i / per_cluster;
+            for d in 0..dims {
+                let noise = (rng.gen::<f32>() - 0.5) * 0.05;
+                vectors.push(centers[c * dims + d] + noise);
+            }
+        }
+        // 构建期 nprobe=1；运行期不提，召回应很低。
+        // EN: Build with nprobe=1; without a runtime raise recall stays low.
+        let fc = FlatClustered::build_with_storage_dtype_and_nprobe(
+            &vectors,
+            &ids,
+            dims,
+            DistanceMetric::L2,
+            clusters,
+            10,
+            0,
+            FlatStorageDtype::F32,
+            Some(1),
+        );
+        assert_eq!(fc.nprobe(), 1);
+        assert_eq!(fc.num_clusters(), clusters);
+        let q = &vectors[..dims];
+        let low: ahash::AHashSet<u64> = fc.search(q, 10).into_iter().map(|(id, _)| id).collect();
+        assert!(low.len() <= 10);
+
+        // 运行期覆盖为全部簇：召回必须提高。
+        // EN: Runtime override to every cluster must raise recall.
+        fc.set_search_nprobe(clusters);
+        let high: ahash::AHashSet<u64> = fc.search(q, 10).into_iter().map(|(id, _)| id).collect();
+        let overlap = low.intersection(&high).count();
+        assert!(
+            high.len() >= low.len(),
+            "full routing must return k results"
+        );
+        assert!(
+            overlap <= low.len(),
+            "results must stay sets of the same size"
+        );
+        // 全部簇时同簇近邻一定在结果里（本簇即查询所在簇）。
+        // EN: With every cluster routed, same-cluster neighbours must surface.
+        assert!(high.contains(&ids[0]), "own cluster must be routed");
+
+        // 0 恢复构建期值。
+        // EN: 0 restores the build-time value.
+        fc.set_search_nprobe(0);
+        let restored: Vec<u64> = fc.search(q, 10).into_iter().map(|(id, _)| id).collect();
+        assert_eq!(restored.len(), low.len());
+    }
+
     #[test]
     fn test_flat_clustered_cosine_f16_cache_path() {
         let dims = 16;

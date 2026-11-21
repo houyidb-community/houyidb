@@ -19,6 +19,11 @@ object HouyiDB {
         F32(0), F16(1), I8(2)
     }
 
+    /** 召回/延迟预设：FAST 低延迟、BALANCED 默认、HIGH_RECALL 高召回。 */
+    enum class SearchPreset(val code: Int) {
+        FAST(0), BALANCED(1), HIGH_RECALL(2)
+    }
+
     data class SearchHit(val id: Long, val score: Float)
 
     @JvmStatic external fun nativeOpen(): Long
@@ -39,6 +44,15 @@ object HouyiDB {
     ): Int
     @JvmStatic external fun nativeSetSearchTarget(
         handle: Long, name: String, perK: Int
+    ): Int
+    @JvmStatic external fun nativeSetSearchOptions(
+        handle: Long, name: String, perK: Int, nprobe: Int, efSearch: Int
+    ): Int
+    @JvmStatic external fun nativeSetSearchPreset(
+        handle: Long, name: String, preset: Int
+    ): Int
+    @JvmStatic external fun nativeSetBuildNprobe(
+        handle: Long, name: String, nprobe: Int
     ): Int
     @JvmStatic external fun nativeInsertScalarsWithId(
         handle: Long, name: String, id: Long, tagsJson: String
@@ -135,6 +149,39 @@ object HouyiDB {
     fun setSearchBudget(handle: Long, name: String, perK: Int) {
         require(perK > 0) { "perK must be > 0" }
         check(nativeSetSearchTarget(handle, name, perK))
+    }
+
+    /**
+     * 检索选项：perK 候选预算、nprobe 路由簇数、efSearch（仅 clustered-hnsw）。
+     * 传 0 表示该项保持不变。
+     * EN: Search options: perK budget, nprobe routed clusters, efSearch
+     * (clustered-hnsw only). Pass 0 to leave a field unchanged.
+     */
+    fun setSearchOptions(
+        handle: Long,
+        name: String,
+        perK: Int = 0,
+        nprobe: Int = 0,
+        efSearch: Int = 0,
+    ) {
+        require(perK >= 0 && nprobe >= 0 && efSearch >= 0) { "options must be >= 0" }
+        check(nativeSetSearchOptions(handle, name, perK, nprobe, efSearch))
+    }
+
+    /** 应用 fast / balanced / high_recall 预设。 */
+    fun setSearchPreset(handle: Long, name: String, preset: SearchPreset) {
+        check(nativeSetSearchPreset(handle, name, preset.code))
+    }
+
+    /**
+     * 下一次 build 使用的 nprobe（0 = 自适应）；已建图需重建才生效，
+     * 运行期可用 setSearchOptions 的 nprobe 直接抬高路由簇数。
+     * EN: nprobe for the next build (0 = adaptive); a built index needs a
+     * rebuild, or raise routing immediately via setSearchOptions.
+     */
+    fun setBuildNprobe(handle: Long, name: String, nprobe: Int) {
+        require(nprobe >= 0) { "nprobe must be >= 0" }
+        check(nativeSetBuildNprobe(handle, name, nprobe))
     }
 
     fun build(handle: Long, name: String): Int {

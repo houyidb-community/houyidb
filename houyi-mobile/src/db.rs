@@ -299,6 +299,55 @@ impl MobileDB {
         result
     }
 
+    /// 设置检索选项（0 = 该项保持不变）：候选预算、路由簇数、ef_search。
+    /// EN: Set search options (0 leaves a field unchanged): candidate budget,
+    /// routed cluster count, ef_search.
+    pub fn set_search_options(
+        &self,
+        coll_name: &str,
+        per_k: u32,
+        nprobe: u32,
+        ef_search: u32,
+    ) -> Result<(), String> {
+        let col = self
+            .get(coll_name)
+            .ok_or_else(|| format!("collection '{coll_name}' not found"))?;
+        let result = col.backend.lock().unwrap().set_search_options(
+            (per_k > 0).then_some(per_k as usize),
+            (nprobe > 0).then_some(nprobe as usize),
+            (ef_search > 0).then_some(ef_search as usize),
+        );
+        result
+    }
+
+    /// 应用 fast / balanced / high_recall 预设。
+    /// EN: Apply the fast / balanced / high_recall preset.
+    pub fn set_search_preset(
+        &self,
+        coll_name: &str,
+        preset: crate::backend::SearchPreset,
+    ) -> Result<(), String> {
+        let col = self
+            .get(coll_name)
+            .ok_or_else(|| format!("collection '{coll_name}' not found"))?;
+        let result = col.backend.lock().unwrap().set_search_preset(preset);
+        result
+    }
+
+    /// 下一次 build 使用的 nprobe（0 = 自适应）。
+    /// EN: nprobe for the next build (0 = adaptive).
+    pub fn set_build_nprobe(&self, coll_name: &str, nprobe: u32) -> Result<(), String> {
+        let col = self
+            .get(coll_name)
+            .ok_or_else(|| format!("collection '{coll_name}' not found"))?;
+        let result = col
+            .backend
+            .lock()
+            .unwrap()
+            .set_build_nprobe(nprobe as usize);
+        result
+    }
+
     /// 构建 Collection 索引 / Build collection index.
     /// EN: Build the collection index.
     pub fn build(&self, coll_name: &str) -> Result<usize, String> {

@@ -101,6 +101,26 @@ uint32_t houyi_mobile_db_search_hybrid_u64(void* db, const char* name, const flo
                                            const char* filters_json,
                                            HouyiMobileResult* results,
                                            uint32_t max_results);
+// 检索选项：per_k 候选预算、nprobe 路由簇数、ef_search（仅 clustered-hnsw）。
+// 任一参数传 0 表示该项保持不变；越界/集合缺失返回 -1，成功返回 0。
+// nprobe 建图后夹取到簇数；提高只会多扫描（所有簇都保存了自己的数据）。
+// EN: Search options: per_k candidate budget, nprobe routed cluster count, and
+// ef_search (clustered-hnsw only). Pass 0 to leave a field unchanged; returns
+// 0 on success and -1 for out-of-range values or a missing collection. nprobe
+// is clamped to the cluster count after a build; raising it only scans more.
+int32_t houyi_mobile_db_set_search_options(void* db, const char* name, uint32_t per_k,
+                                           uint32_t nprobe, uint32_t ef_search);
+// 预设：0=fast（per_k 500、少量簇）、1=balanced（默认）、2=high_recall
+// （per_k 5000、全簇路由、clustered-hnsw ef 512）。非法码返回 -1。
+// EN: Presets: 0=fast (per_k 500, few clusters), 1=balanced (default),
+// 2=high_recall (per_k 5000, all clusters, clustered-hnsw ef 512). Invalid
+// codes return -1.
+int32_t houyi_mobile_db_set_search_preset(void* db, const char* name, uint8_t preset);
+// 下一次 houyi_mobile_db_build 使用的 nprobe；0 = 自适应公式。已建图需重建
+// 才生效（运行期请用 set_search_options 的 nprobe）。
+// EN: nprobe for the next houyi_mobile_db_build; 0 = adaptive formula. A built
+// index needs a rebuild (use set_search_options nprobe at runtime).
+int32_t houyi_mobile_db_set_build_nprobe(void* db, const char* name, uint32_t nprobe);
 int32_t houyi_mobile_db_save(void* db, const char* path);
 void* houyi_mobile_db_load(const char* path);
 // 内存快照：把整个数据库编码进调用方缓冲区，**不写任何临时文件**（加密/上传由

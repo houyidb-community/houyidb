@@ -100,6 +100,10 @@ pub struct ClusteredHnsw {
     boundary_alpha: f32,
     centroids: Vec<f32>,
     clusters: Vec<RwLock<ClusterGraph>>,
+    /// 运行期 nprobe 覆盖（0 = 构建期值）；提高只会多路由簇。
+    /// EN: Runtime nprobe override (0 = build-time value); raising it only
+    /// routes more clusters.
+    search_nprobe: AtomicUsize,
     /// 已索引的向量总数（含边界复制）
     /// EN: Total indexed vectors (including boundary replication).
     total_indexed: AtomicUsize,
@@ -185,6 +189,7 @@ impl ClusteredHnsw {
             boundary_alpha: alpha,
             centroids: km.centroids,
             clusters,
+            search_nprobe: AtomicUsize::new(0),
             total_indexed: AtomicUsize::new(total),
             next_id: std::sync::atomic::AtomicU64::new(max_id + 1),
         }
@@ -207,7 +212,12 @@ impl ClusteredHnsw {
             let total = self.total_vectors();
             let cluster_sz = (total / self.num_clusters).max(1);
             let target = k.saturating_mul(DEFAULT_SEARCH_TARGET_PER_K);
-            self.nprobe.min((target / cluster_sz).max(4))
+            let base = self.nprobe.max(
+                self.search_nprobe
+                    .load(Ordering::Relaxed)
+                    .min(self.num_clusters),
+            );
+            base.min((target / cluster_sz).max(4))
         };
         let top_clusters = router::route_query(
             query,
@@ -335,6 +345,34 @@ impl ClusteredHnsw {
 
     pub fn num_clusters(&self) -> usize {
         self.num_clusters
+    }
+
+    /// 运行期 nprobe 覆盖：0 恢复构建期值，其余夹取到 1..=num_clusters。
+    /// EN: Runtime nprobe override: 0 restores the build-time value; other
+    /// values are clamped to 1..=num_clusters.
+    pub fn set_search_nprobe(&self, nprobe: usize) {
+        let value = if nprobe == 0 {
+            0
+        } else {
+            nprobe.clamp(1, self.num_clusters)
+        };
+        self.search_nprobe.store(value, Ordering::Relaxed);
+    }
+
+    /// 运行期 ef_search 覆盖：逐簇写入图实例（一次性，热路径零改动）。
+    /// EN: Runtime ef_search override: writes each cluster graph once, leaving
+    /// the hot search path untouched.
+    pub fn set_search_ef_search(&self, ef_search: usize) {
+        let ef = ef_search.max(1);
+        for cluster in &self.clusters {
+            cluster.write().graph.set_ef_search(ef);
+        }
+    }
+
+    /// 构建期 nprobe。
+    /// EN: Build-time nprobe.
+    pub fn nprobe(&self) -> usize {
+        self.nprobe
     }
 
     pub fn total_vectors(&self) -> usize {
@@ -537,6 +575,7 @@ mod tests {
                 // EN: c0=(1,0), c1=(0.9,0.1): for v=(1,0), IP distances are d0=-1 and d1=-0.9.
                 centroids: vec![1.0, 0.0, 0.9, 0.1],
                 clusters,
+                search_nprobe: AtomicUsize::new(0),
                 total_indexed: AtomicUsize::new(0),
                 next_id: std::sync::atomic::AtomicU64::new(1),
             }

@@ -180,7 +180,47 @@ void*   houyi_mobile_db_load_buffer(const uint8_t* bytes, size_t len);
   it immediately afterwards.
 - Kotlin: `HouyiDB.saveBytes(handle): ByteArray` / `HouyiDB.loadBytes(bytes): Long`.
 
-### 2.9 Search-budget tuning (flat-clustered cosine)
+### 2.9 Search budget and recall presets
+
+```c
+int32_t houyi_mobile_db_set_search_options(void* db, const char* name,
+                                           uint32_t per_k, uint32_t nprobe, uint32_t ef_search);
+int32_t houyi_mobile_db_set_search_preset(void* db, const char* name, uint8_t preset);
+int32_t houyi_mobile_db_set_build_nprobe(void* db, const char* name, uint32_t nprobe);
+```
+
+- A zero value in any option means "leave unchanged"; out-of-range values or a
+  missing collection return -1.
+- `nprobe` is the routed cluster count. The build-time ratio can be too small on
+  high-dimensional clustered data such as 512d×50k: override it with
+  `set_build_nprobe` before `build`, or raise routing on a built index with
+  `set_search_options` (every cluster keeps its own data, so raising it only
+  scans more).
+- `ef_search` applies to `clustered-hnsw` only (written into every cluster
+  graph).
+- Presets:
+
+| Preset | per_k | nprobe | ef_search (CH) | Use case |
+|---|---:|---|---:|---|
+| `0` fast | 500 | `max(4, clusters/16)` | 64 | first screen / interactive |
+| `1` balanced | 2500 | build-time value | build-time value | default |
+| `2` high_recall | 5000 | all clusters | 512 | hard cases like 512d×50k |
+
+- An explicit nprobe wins over the `per_k` budget convergence (it is never
+  squeezed back); in the C ABI `per_k=0` means "unchanged", so use the balanced
+  preset to restore defaults.
+- Measured recall/latency curve on device (512d×50k, f16, k=10): nprobe
+  112→0.857 at 3.3 ms, 140→0.913 at 4.2 ms, 168→0.957 at 4.8 ms,
+  196→0.981 at 5.7 ms, 224 (all)→0.999 at 6.5 ms. Pick a point in between with
+  `set_search_options(nprobe=…)` instead of the presets.
+
+```kotlin
+HouyiDB.setSearchPreset(db, "faces", HouyiDB.SearchPreset.HIGH_RECALL)
+HouyiDB.setSearchOptions(db, "faces", perK = 0, nprobe = 32, efSearch = 0)
+HouyiDB.setBuildNprobe(db, "faces", 32)   // applies to the next build
+```
+
+### 2.10 Original search-budget notes (flat-clustered cosine)
 
 ```c
 int32_t houyi_mobile_set_search_target(void* handle, uint32_t per_k);

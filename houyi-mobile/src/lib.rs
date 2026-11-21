@@ -9,7 +9,7 @@
 // EN: FFI entry points deref raw pointers by design; `unsafe` cannot be enforced across the C ABI.
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
-mod backend;
+pub mod backend;
 pub mod db;
 mod filter;
 mod snapshot;
@@ -611,6 +611,85 @@ pub extern "C" fn houyi_mobile_db_search(
         out[i * 2 + 1] = *dist;
     }
     n as u32
+}
+
+/// 设置检索选项：候选预算（per_k）、路由簇数（nprobe）、ef_search（仅
+/// clustered-hnsw）。任一参数为 0 表示该项保持不变。
+/// 返回 0 成功、-1 参数/集合缺失/越界。
+/// EN: Set search options: candidate budget (per_k), routed clusters (nprobe),
+/// and ef_search (clustered-hnsw only). A zero value leaves that field
+/// unchanged. Returns 0 on success, -1 for bad arguments/missing collection.
+#[no_mangle]
+pub extern "C" fn houyi_mobile_db_set_search_options(
+    db_handle: *mut db::MobileDB,
+    coll_name: *const std::ffi::c_char,
+    per_k: u32,
+    nprobe: u32,
+    ef_search: u32,
+) -> i32 {
+    if db_handle.is_null() || coll_name.is_null() {
+        return -1;
+    }
+    let db = unsafe { &*db_handle };
+    let c_name = unsafe { std::ffi::CStr::from_ptr(coll_name) };
+    let name = match c_name.to_str() {
+        Ok(value) => value,
+        Err(_) => return -1,
+    };
+    match db.set_search_options(name, per_k, nprobe, ef_search) {
+        Ok(()) => 0,
+        Err(_) => -1,
+    }
+}
+
+/// 应用检索预设：0=fast、1=balanced、2=high_recall；其他值返回 -1。
+/// EN: Apply a search preset: 0=fast, 1=balanced, 2=high_recall; other values
+/// return -1.
+#[no_mangle]
+pub extern "C" fn houyi_mobile_db_set_search_preset(
+    db_handle: *mut db::MobileDB,
+    coll_name: *const std::ffi::c_char,
+    preset: u8,
+) -> i32 {
+    if db_handle.is_null() || coll_name.is_null() {
+        return -1;
+    }
+    let Some(preset) = backend::SearchPreset::from_code(preset) else {
+        return -1;
+    };
+    let db = unsafe { &*db_handle };
+    let c_name = unsafe { std::ffi::CStr::from_ptr(coll_name) };
+    let name = match c_name.to_str() {
+        Ok(value) => value,
+        Err(_) => return -1,
+    };
+    match db.set_search_preset(name, preset) {
+        Ok(()) => 0,
+        Err(_) => -1,
+    }
+}
+
+/// 下一次 build 使用的 nprobe（0 = 自适应公式）。
+/// EN: nprobe for the next build (0 = adaptive formula).
+#[no_mangle]
+pub extern "C" fn houyi_mobile_db_set_build_nprobe(
+    db_handle: *mut db::MobileDB,
+    coll_name: *const std::ffi::c_char,
+    nprobe: u32,
+) -> i32 {
+    if db_handle.is_null() || coll_name.is_null() {
+        return -1;
+    }
+    let db = unsafe { &*db_handle };
+    let c_name = unsafe { std::ffi::CStr::from_ptr(coll_name) };
+    let name = match c_name.to_str() {
+        Ok(value) => value,
+        Err(_) => return -1,
+    };
+    match db.set_build_nprobe(name, nprobe) {
+        Ok(()) => 0,
+        Err(_) => -1,
+    }
 }
 
 /// 保存整个数据库到路径（原子写 + CRC 校验）。
@@ -1387,6 +1466,133 @@ mod tests {
         let _ = std::fs::remove_file(&truncated);
         let _ = std::fs::remove_file(&bad_magic_path);
         let _ = std::fs::remove_file(&bad_crc_path);
+    }
+
+    /// 检索预设与 nprobe 覆盖：构建期 nprobe=1 时随机查询召回很低，
+    /// high_recall 预设（全簇路由）必须显著提升；非法参数必须拒绝。
+    /// EN: Presets and nprobe overrides: with a build-time nprobe of 1, random
+    /// queries recall poorly; the high_recall preset (all clusters) must lift
+    /// it clearly, and invalid options must be rejected.
+    #[test]
+    fn test_search_presets_and_nprobe_override() {
+        use crate::backend::SearchPreset;
+        use rand::Rng;
+        use rand::SeedableRng;
+        let dims = 8usize;
+        let clusters = 20usize;
+        let per_cluster = 50usize;
+        let n = clusters * per_cluster;
+        let mut rng = rand::rngs::StdRng::seed_from_u64(4242);
+        let mut centers = vec![0f32; clusters * dims];
+        for x in &mut centers {
+            *x = rng.gen::<f32>() * 2.0 - 1.0;
+        }
+        let mut data = Vec::with_capacity(n * dims);
+        for i in 0..n {
+            let c = i / per_cluster;
+            for d in 0..dims {
+                // 噪声足够大，使 top-10 真的跨簇：否则 nprobe=1 本身就能覆盖。
+                // EN: Noise must be large enough that top-10 spans clusters;
+                // otherwise nprobe=1 already covers the true neighbours.
+                data.push(centers[c * dims + d] + (rng.gen::<f32>() - 0.5) * 0.8);
+            }
+        }
+        let db = db::MobileDB::new();
+        for name in ["approx", "exact"] {
+            db.get_or_create_with_config(
+                name,
+                dims,
+                if name == "approx" {
+                    "flat-clustered"
+                } else {
+                    "flat"
+                },
+                DistanceMetric::Cosine,
+                FlatStorageDtype::F32,
+            )
+            .unwrap();
+        }
+        for i in 0..n {
+            let v = &data[i * dims..(i + 1) * dims];
+            db.insert("approx", i as u64, v).unwrap();
+            db.insert("exact", i as u64, v).unwrap();
+        }
+        // 构建期 nprobe=1：随机查询只能扫到约 1/20 的簇。
+        // EN: Build-time nprobe=1: a random query only scans ~1/20 of clusters.
+        db.set_build_nprobe("approx", 1).unwrap();
+        assert!(db.build("approx").unwrap() > 0);
+
+        let recall = |db: &db::MobileDB| -> f64 {
+            let mut rng = rand::rngs::StdRng::seed_from_u64(7);
+            let mut hits = 0usize;
+            let total = 20usize * 10;
+            for _ in 0..20 {
+                let q: Vec<f32> = (0..dims).map(|_| rng.gen::<f32>() * 2.0 - 1.0).collect();
+                let truth: ahash::AHashSet<u64> = db
+                    .search("exact", &q, 10)
+                    .unwrap()
+                    .into_iter()
+                    .map(|(id, _)| id)
+                    .collect();
+                let got: ahash::AHashSet<u64> = db
+                    .search("approx", &q, 10)
+                    .unwrap()
+                    .into_iter()
+                    .map(|(id, _)| id)
+                    .collect();
+                hits += truth.intersection(&got).count();
+            }
+            hits as f64 / total as f64
+        };
+        let low = recall(&db);
+        db.set_search_preset("approx", SearchPreset::HighRecall)
+            .unwrap();
+        let high = recall(&db);
+        assert!(
+            high > low + 0.3,
+            "high_recall preset must lift recall: low={low} high={high}"
+        );
+        // 回到默认档并恢复构建期 nprobe。
+        // EN: Back to the balanced preset restores the build-time nprobe.
+        db.set_search_preset("approx", SearchPreset::Balanced)
+            .unwrap();
+        // 0 值字段保持不变，其余越界拒绝。
+        // EN: Zero fields stay unchanged; out-of-range values are rejected.
+        assert!(db.set_search_options("approx", 0, 0, 0).is_ok());
+        assert!(db.set_search_options("approx", 0, 0, 5000).is_err());
+        assert!(db.set_search_options("missing", 0, 0, 0).is_err());
+
+        // C ABI：预设码与选项越界返回 -1。
+        // EN: C ABI: bad preset codes and options return -1.
+        let name = CString::new("approx").unwrap();
+        let abi = houyi_mobile_db_open();
+        let ty = CString::new("flat-clustered").unwrap();
+        assert_eq!(
+            houyi_mobile_db_collection_v2(abi, name.as_ptr(), dims as u32, ty.as_ptr(), 1, 0),
+            0
+        );
+        for (id, v) in data.chunks_exact(dims).enumerate().take(40) {
+            assert_eq!(
+                houyi_mobile_db_insert(abi, name.as_ptr(), id as u64, v.as_ptr(), dims as u32),
+                0
+            );
+        }
+        assert_eq!(
+            houyi_mobile_db_set_search_options(abi, name.as_ptr(), 0, 0, 0),
+            0
+        );
+        assert_eq!(
+            houyi_mobile_db_set_search_options(abi, name.as_ptr(), 0, 0, 5000),
+            -1
+        );
+        assert_eq!(
+            houyi_mobile_db_set_search_options(std::ptr::null_mut(), name.as_ptr(), 0, 0, 0),
+            -1
+        );
+        assert_eq!(houyi_mobile_db_set_search_preset(abi, name.as_ptr(), 2), 0);
+        assert_eq!(houyi_mobile_db_set_search_preset(abi, name.as_ptr(), 9), -1);
+        assert_eq!(houyi_mobile_db_set_build_nprobe(abi, name.as_ptr(), 0), 0);
+        houyi_mobile_db_close(abi);
     }
 
     /// 内存快照：encode/decode 往返、空库、坏 magic/CRC/截断拒绝，以及

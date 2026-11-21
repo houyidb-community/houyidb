@@ -171,7 +171,42 @@ void*   houyi_mobile_db_load_buffer(const uint8_t* bytes, size_t len);
   `load_buffer` 调用期间被读取，返回后可立即加密或清零。
 - Kotlin：`HouyiDB.saveBytes(handle): ByteArray` / `HouyiDB.loadBytes(bytes): Long`。
 
-### 2.9 检索预算调优（flat-clustered 余弦）
+### 2.9 检索预算与召回预设
+
+```c
+int32_t houyi_mobile_db_set_search_options(void* db, const char* name,
+                                           uint32_t per_k, uint32_t nprobe, uint32_t ef_search);
+int32_t houyi_mobile_db_set_search_preset(void* db, const char* name, uint8_t preset);
+int32_t houyi_mobile_db_set_build_nprobe(void* db, const char* name, uint32_t nprobe);
+```
+
+- 三个参数任一为 0 表示「保持不变」；越界或集合缺失返回 -1。
+- `nprobe` 是路由簇数。构建期比例在 512d×50k 这类高维簇状数据上可能不足，
+  可在 `build` 前用 `set_build_nprobe` 覆盖；已建图时用 `set_search_options`
+  的运行期 nprobe 直接提高（所有簇都保存了自己的数据，提高只会多扫描）。
+- `ef_search` 仅对 `clustered-hnsw` 生效（逐簇写入图实例）。
+- 预设：
+
+| 预设 | per_k | nprobe | ef_search（CH） | 适用 |
+|---|---:|---|---:|---|
+| `0` fast | 500 | `max(4, 簇数/16)` | 64 | 首屏/交互 |
+| `1` balanced | 2500 | 构建期值 | 构建期值 | 默认 |
+| `2` high_recall | 5000 | 全部簇 | 512 | 512d×50k 等难例 |
+
+- 显式 nprobe 优先于 `per_k` 的预算收敛（不会被预算压回去）；`per_k=0` 的
+  C ABI 语义是「保持不变」，恢复默认请用 balanced 预设。
+- 512d×50k 真机实测的 recall–延迟曲线（f16，k=10）：nprobe 112→0.857 /
+  3.3 ms，140→0.913 / 4.2 ms，168→0.957 / 4.8 ms，196→0.981 / 5.7 ms，
+  224（全部）→0.999 / 6.5 ms。介于 fast 与 high_recall 之间时直接用
+  `set_search_options(nprobe=…)` 选点。
+
+```kotlin
+HouyiDB.setSearchPreset(db, "faces", HouyiDB.SearchPreset.HIGH_RECALL)
+HouyiDB.setSearchOptions(db, "faces", perK = 0, nprobe = 32, efSearch = 0)
+HouyiDB.setBuildNprobe(db, "faces", 32)   // 下次 build 生效
+```
+
+### 2.10 原有检索预算说明（flat-clustered 余弦）
 
 ```c
 int32_t houyi_mobile_set_search_target(void* handle, uint32_t per_k);

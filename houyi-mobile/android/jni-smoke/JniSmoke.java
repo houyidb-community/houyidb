@@ -33,6 +33,18 @@ public class JniSmoke {
         if (again.size() != 1 || again.get(0).getId() != 42L) throw new AssertionError("loaded search");
         List<HouyiDB.SearchHit> bigAfter = api.search(loaded, "faces", new float[]{1f, 0f, 0f, 0f}, 1);
         if (bigAfter.size() != 1 || bigAfter.get(0).getId() != big) throw new AssertionError("u64 id lost after load");
+        // 检索选项与预设：0 表示不变；high_recall 仍要返回正确结果。
+        // EN: Search options and presets: 0 means unchanged; high_recall must
+        // still return the correct hit.
+        api.setSearchOptions(db, "faces", 0, 0, 0);
+        api.setSearchPreset(db, "faces", HouyiDB.SearchPreset.HIGH_RECALL);
+        List<HouyiDB.SearchHit> presetHits = api.search(db, "faces", new float[]{1f, 0f, 0f, 0f}, 1);
+        if (presetHits.size() != 1 || presetHits.get(0).getId() != big) {
+            throw new AssertionError("high_recall preset search");
+        }
+        api.setSearchPreset(db, "faces", HouyiDB.SearchPreset.BALANCED);
+        api.setBuildNprobe(db, "faces", 0);
+
         // 内存快照：saveBytes/loadBytes 往返（Vault 加密路径），坏字节必须拒绝。
         // EN: In-memory snapshot: saveBytes/loadBytes roundtrip (the Vault
         // encryption path); corrupt bytes must be rejected.

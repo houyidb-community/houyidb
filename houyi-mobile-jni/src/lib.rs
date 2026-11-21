@@ -680,6 +680,112 @@ pub extern "system" fn Java_cc_houyidb_mobile_HouyiDB_nativeLoadBytes(
     }
 }
 
+/// 设置检索选项（0 = 该项保持不变）；失败返回 -1 并写入 lastError。
+/// EN: Set search options (0 leaves a field unchanged); -1 on failure.
+#[no_mangle]
+pub extern "system" fn Java_cc_houyidb_mobile_HouyiDB_nativeSetSearchOptions(
+    mut env: JNIEnv<'_>,
+    _this: JObject<'_>,
+    handle: jlong,
+    name: JString<'_>,
+    per_k: jint,
+    nprobe: jint,
+    ef_search: jint,
+) -> jint {
+    clear_error();
+    let Some(db) = handle_from(handle) else {
+        set_error("invalid database handle");
+        return -1;
+    };
+    let Ok(name) = string_arg(&mut env, &name) else {
+        set_error("invalid collection name");
+        return -1;
+    };
+    let (Ok(per_k), Ok(nprobe), Ok(ef_search)) = (
+        u32::try_from(per_k),
+        u32::try_from(nprobe),
+        u32::try_from(ef_search),
+    ) else {
+        set_error("negative search option");
+        return -1;
+    };
+    match db.set_search_options(&name, per_k, nprobe, ef_search) {
+        Ok(()) => 0,
+        Err(message) => {
+            set_error(message);
+            -1
+        }
+    }
+}
+
+/// 应用检索预设（0/1/2）；失败返回 -1。
+/// EN: Apply a search preset (0/1/2); -1 on failure.
+#[no_mangle]
+pub extern "system" fn Java_cc_houyidb_mobile_HouyiDB_nativeSetSearchPreset(
+    mut env: JNIEnv<'_>,
+    _this: JObject<'_>,
+    handle: jlong,
+    name: JString<'_>,
+    preset: jint,
+) -> jint {
+    clear_error();
+    let Some(db) = handle_from(handle) else {
+        set_error("invalid database handle");
+        return -1;
+    };
+    let Ok(name) = string_arg(&mut env, &name) else {
+        set_error("invalid collection name");
+        return -1;
+    };
+    let Ok(code) = u8::try_from(preset) else {
+        set_error("invalid preset");
+        return -1;
+    };
+    let Some(preset) = houyi_mobile::backend::SearchPreset::from_code(code) else {
+        set_error("invalid preset");
+        return -1;
+    };
+    match db.set_search_preset(&name, preset) {
+        Ok(()) => 0,
+        Err(message) => {
+            set_error(message);
+            -1
+        }
+    }
+}
+
+/// 下一次 build 使用的 nprobe（0 = 自适应）；失败返回 -1。
+/// EN: nprobe for the next build (0 = adaptive); -1 on failure.
+#[no_mangle]
+pub extern "system" fn Java_cc_houyidb_mobile_HouyiDB_nativeSetBuildNprobe(
+    mut env: JNIEnv<'_>,
+    _this: JObject<'_>,
+    handle: jlong,
+    name: JString<'_>,
+    nprobe: jint,
+) -> jint {
+    clear_error();
+    let Some(db) = handle_from(handle) else {
+        set_error("invalid database handle");
+        return -1;
+    };
+    let Ok(name) = string_arg(&mut env, &name) else {
+        set_error("invalid collection name");
+        return -1;
+    };
+    let Ok(nprobe) = u32::try_from(nprobe) else {
+        set_error("negative nprobe");
+        return -1;
+    };
+    match db.set_build_nprobe(&name, nprobe) {
+        Ok(()) => 0,
+        Err(message) => {
+            set_error(message);
+            -1
+        }
+    }
+}
+
 #[no_mangle]
 pub extern "system" fn Java_cc_houyidb_mobile_HouyiDB_nativeLastError(
     env: JNIEnv<'_>,
