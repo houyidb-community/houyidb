@@ -112,6 +112,10 @@ struct LazyClusters<T> {
     /// big-endian hosts.
     decode: fn(&[u8]) -> Vec<T>,
     decoded: Vec<OnceLock<Vec<T>>>,
+    /// 尚未解码的非空簇数量；归零即可释放 `source`（O(1) 判定）。
+    /// EN: Number of non-empty clusters not decoded yet; reaching zero allows
+    /// releasing `source` (an O(1) test).
+    remaining: std::sync::atomic::AtomicUsize,
 }
 
 /// 簇向量存储：构建与普通加载写满 Owned；view 加载为 Lazy。
@@ -141,26 +145,31 @@ impl<T: Copy> ClusterStorage<T> {
     fn cluster(&self, cluster: usize) -> &[T] {
         match self {
             ClusterStorage::Owned(v) => &v[cluster],
-            ClusterStorage::Lazy(l) => l.decoded[cluster].get_or_init(|| {
-                let (off, len) = l.windows[cluster];
-                let source = l
-                    .source
-                    .as_ref()
-                    .expect("lazy cluster without a byte source");
-                (l.decode)(&source.bytes()[off..off + len])
-            }),
+            ClusterStorage::Lazy(l) => {
+                let slot = &l.decoded[cluster];
+                if slot.get().is_none() {
+                    let (off, len) = l.windows[cluster];
+                    let source = l
+                        .source
+                        .as_ref()
+                        .expect("lazy cluster without a byte source");
+                    let decoded = (l.decode)(&source.bytes()[off..off + len]);
+                    if slot.set(decoded).is_ok() {
+                        l.remaining
+                            .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                    }
+                }
+                slot.get().expect("cluster initialized above")
+            }
         }
     }
 
-    /// 取某簇的可变向量（写路径用）；Lazy 时只解码这一簇，其余保持惰性。
-    /// EN: Get a cluster's mutable vector for writes; Lazy decodes only this
-    /// cluster and leaves the others lazy.
     /// 所有簇解码完成后释放快照字节源，避免写入后的长期占用。
     /// EN: Release the snapshot byte source once every cluster has been
     /// decoded, so a written index does not retain it.
     fn try_release_source(&mut self) {
         if let ClusterStorage::Lazy(l) = self {
-            if l.decoded.iter().all(|slot| slot.get().is_some()) {
+            if l.source.is_some() && l.remaining.load(std::sync::atomic::Ordering::Relaxed) == 0 {
                 l.source = None;
             }
         }
@@ -170,14 +179,18 @@ impl<T: Copy> ClusterStorage<T> {
         match self {
             ClusterStorage::Owned(v) => &mut v[cluster],
             ClusterStorage::Lazy(l) => {
-                if l.decoded[cluster].get().is_none() {
+                let slot = &l.decoded[cluster];
+                if slot.get().is_none() {
                     let (off, len) = l.windows[cluster];
                     let source = l
                         .source
                         .as_ref()
                         .expect("lazy cluster without a byte source");
                     let decoded = (l.decode)(&source.bytes()[off..off + len]);
-                    let _ = l.decoded[cluster].set(decoded);
+                    if slot.set(decoded).is_ok() {
+                        l.remaining
+                            .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                    }
                 }
                 l.decoded[cluster]
                     .get_mut()
@@ -1626,51 +1639,79 @@ fn lazy_cluster_payloads(
     windows: &[ClusterWindow],
     dtype: FlatStorageDtype,
 ) -> ClusterVectors {
-    fn empty_locks<T>(n: usize) -> Vec<OnceLock<Vec<T>>> {
-        (0..n).map(|_| OnceLock::new()).collect()
+    /// 预先建槽：零长度窗口视为已解码，避免它们永远阻塞源释放。
+    /// EN: Pre-create slots; zero-length windows count as decoded so they never
+    /// block source release.
+    fn lazy_locks<T>(windows: &[(usize, usize)]) -> Vec<OnceLock<Vec<T>>> {
+        windows
+            .iter()
+            .map(|&(_, len)| {
+                let slot = OnceLock::new();
+                if len == 0 {
+                    let _ = slot.set(Vec::new());
+                }
+                slot
+            })
+            .collect()
     }
+    fn lazy_remaining(windows: &[(usize, usize)]) -> std::sync::atomic::AtomicUsize {
+        std::sync::atomic::AtomicUsize::new(windows.iter().filter(|w| w.1 > 0).count())
+    }
+
     match dtype {
-        FlatStorageDtype::F32 => ClusterVectors::F32(ClusterStorage::Lazy(LazyClusters {
-            source: Some(source),
-            windows: windows
+        FlatStorageDtype::F32 => {
+            let vecs: Vec<(usize, usize)> = windows
                 .iter()
                 .map(|w| (base + w.vec_off, w.vec_bytes))
-                .collect(),
-            decode: decode_f32_payload,
-            decoded: empty_locks(windows.len()),
-        })),
-        FlatStorageDtype::F16 => ClusterVectors::F16(ClusterStorage::Lazy(LazyClusters {
-            source: Some(source),
-            windows: windows
+                .collect();
+            ClusterVectors::F32(ClusterStorage::Lazy(LazyClusters {
+                source: Some(source),
+                decoded: lazy_locks(&vecs),
+                remaining: lazy_remaining(&vecs),
+                windows: vecs,
+                decode: decode_f32_payload,
+            }))
+        }
+        FlatStorageDtype::F16 => {
+            let vecs: Vec<(usize, usize)> = windows
                 .iter()
                 .map(|w| (base + w.vec_off, w.vec_bytes))
-                .collect(),
-            decode: decode_f16_payload,
-            decoded: empty_locks(windows.len()),
-        })),
+                .collect();
+            ClusterVectors::F16(ClusterStorage::Lazy(LazyClusters {
+                source: Some(source),
+                decoded: lazy_locks(&vecs),
+                remaining: lazy_remaining(&vecs),
+                windows: vecs,
+                decode: decode_f16_payload,
+            }))
+        }
         FlatStorageDtype::I8 => {
+            let code_windows: Vec<(usize, usize)> = windows
+                .iter()
+                .map(|w| (base + w.vec_off, w.vec_bytes))
+                .collect();
+            let scale_windows: Vec<(usize, usize)> = windows
+                .iter()
+                .map(|w| {
+                    let (off, len) = w
+                        .scale_off
+                        .expect("parse_state guarantees i8 scales for I8 dtype");
+                    (base + off, len)
+                })
+                .collect();
             let codes = LazyClusters {
                 source: Some(Arc::clone(&source)),
-                windows: windows
-                    .iter()
-                    .map(|w| (base + w.vec_off, w.vec_bytes))
-                    .collect(),
+                decoded: lazy_locks(&code_windows),
+                remaining: lazy_remaining(&code_windows),
+                windows: code_windows,
                 decode: bulk_bitcopy,
-                decoded: empty_locks(windows.len()),
             };
             let scales = LazyClusters {
                 source: Some(source),
-                windows: windows
-                    .iter()
-                    .map(|w| {
-                        let (off, len) = w
-                            .scale_off
-                            .expect("parse_state guarantees i8 scales for I8 dtype");
-                        (base + off, len)
-                    })
-                    .collect(),
+                decoded: lazy_locks(&scale_windows),
+                remaining: lazy_remaining(&scale_windows),
+                windows: scale_windows,
                 decode: decode_f32_payload,
-                decoded: empty_locks(windows.len()),
             };
             ClusterVectors::I8 {
                 codes: ClusterStorage::Lazy(codes),
@@ -2171,6 +2212,38 @@ mod tests {
     /// EN: View mode parses metadata and decodes per cluster lazily; search
     /// results match eager decoding item for item, and the first write decodes
     /// only the clusters it touches.
+    /// 零长度簇必须视为已解码：否则它永远阻塞快照字节源的释放。
+    /// EN: A zero-length cluster must count as decoded, otherwise it blocks
+    /// snapshot source release forever.
+    #[test]
+    fn lazy_zero_length_cluster_allows_source_release() {
+        struct TestBytes(Vec<u8>);
+        impl SnapshotBytes for TestBytes {
+            fn bytes(&self) -> &[u8] {
+                &self.0
+            }
+        }
+
+        let windows = vec![(0usize, 4usize), (4usize, 0usize)];
+        let empty_slot = OnceLock::new();
+        let _ = empty_slot.set(Vec::new());
+        let source: Arc<dyn SnapshotBytes> = Arc::new(TestBytes(vec![0, 0, 0x80, 0x3f]));
+        let mut storage: ClusterStorage<f32> = ClusterStorage::Lazy(LazyClusters {
+            source: Some(source),
+            decoded: vec![OnceLock::new(), empty_slot],
+            remaining: std::sync::atomic::AtomicUsize::new(1),
+            windows,
+            decode: decode_f32_payload,
+        });
+        assert_eq!(storage.cluster(0), &[1.0f32]);
+        assert!(storage.cluster(1).is_empty());
+        storage.try_release_source();
+        match &storage {
+            ClusterStorage::Lazy(l) => assert!(l.source.is_none(), "source must be released"),
+            ClusterStorage::Owned(_) => panic!("storage must stay lazy"),
+        }
+    }
+
     #[test]
     fn test_flat_clustered_view_state_matches_eager() {
         struct TestBytes(Vec<u8>);
