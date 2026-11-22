@@ -135,6 +135,8 @@ flat-clustered 构建态的簇向量在该簇第一次被检索时解码并缓�
   显示 view 约 55 ms、eager 约 46–70 ms（仅量级参考）。
 - 代价：view 模式不校验整文件 CRC，且文件在映射期间不能被原地截断/改写；
   详见手册 2.8。
+- 口径提醒：Android `dumpsys meminfo` 会把 mmap 文件页计入 PSS/RSS，所以 App
+  集成时总 PSS 不一定下降；native heap（匿名内存）与峰值分布才是 view 的主要收益。
 
 ## 线程数扫描（128d×100k，RAYON_NUM_THREADS，各 3 次）
 

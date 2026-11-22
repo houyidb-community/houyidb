@@ -192,6 +192,10 @@ void* houyi_mobile_db_load_view(const char* path);  // NULL 表示失败
   可被内核回收。只要仍有簇未解码，快照字节源（mmap 或回退缓冲）就保持存活；
   全部簇解码并写入后自动释放。
 - 仅 `flat-clustered` 构建态惰性解码；`flat` / `clustered-hnsw` 仍按原方式加载。
+- view 模式要求磁盘上是**明文快照**；Vault/加密快照不能直接使用（继续用
+  `loadBytes` 的 eager 路径，或等待后续加密 view）。不要把解密后的明文写入磁盘。
+- Android `dumpsys meminfo` 口径下，mmap 的文件页会计入 PSS/RSS；view 的收益主要
+  体现在 native heap（匿名内存）与峰值分布的收敛，总 PSS 不一定下降。
 - Kotlin：`HouyiDB.loadView(path): Long`。
 
 ### 2.9 检索预算与召回预设

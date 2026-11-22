@@ -151,6 +151,9 @@ valid samples):
   (eager), indicative only.
 - Cost: view mode skips the whole-file CRC and the file must not be truncated or
   overwritten in place while mapped; see manual section 2.8.
+- Measurement note: Android `dumpsys meminfo` counts mapped file pages toward
+  PSS/RSS, so total PSS does not necessarily drop in an app; native heap
+  (anonymous memory) and a tighter peak distribution are view mode's main wins.
 
 ## Thread-count sweep (128d×100k, RAYON_NUM_THREADS, 3 runs each)
 

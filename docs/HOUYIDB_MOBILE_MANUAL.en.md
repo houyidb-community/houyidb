@@ -209,6 +209,12 @@ void* houyi_mobile_db_load_view(const char* path);  // NULL on failure
   decoded and the index written.
 - Only flat-clustered built states decode lazily; `flat` / `clustered-hnsw` load
   as before.
+- View mode requires a **plaintext snapshot on disk**; Vault/encrypted snapshots
+  cannot be used directly (keep the eager `loadBytes` path, or wait for a future
+  encrypted view). Never write decrypted plaintext to disk.
+- Under Android `dumpsys meminfo`, mapped file pages count toward PSS/RSS; the
+  view-mode gain shows up mainly in native heap (anonymous memory) and a tighter
+  peak distribution, so total PSS does not necessarily drop.
 - Kotlin: `HouyiDB.loadView(path): Long`.
 
 ### 2.9 Search budget and recall presets
