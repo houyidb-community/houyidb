@@ -12,9 +12,10 @@ EN: Official HouyiDB Rust facade re-exporting the full public API of
 houyidb = "0.2.0-beta.9"
 ```
 
-预发布版本需要显式写版本号；也可以用 `cargo add houyidb@0.2.0-beta.9`。
-EN: Pre-releases require an explicit version; `cargo add houyidb@0.2.0-beta.9`
-also works.
+`cargo add houyidb` 会选中当前预发布版本；也可以显式指定
+`cargo add houyidb@0.2.0-beta.9`。
+EN: `cargo add houyidb` selects the current pre-release; you can also pin it
+explicitly with `cargo add houyidb@0.2.0-beta.9`.
 
 用法与 `houyidb-client` 完全一致，示例见
 [`houyidb-client` README](https://crates.io/crates/houyidb-client)。
