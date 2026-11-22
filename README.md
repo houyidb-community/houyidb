@@ -75,7 +75,7 @@ streaming 50% 阶段串行查询总耗时从 104s 降到 3.9s、p99 从 1.72s �
 - **Python**：`sdk/python/houyidb` + LangChain / LlamaIndex adapter
 - **TypeScript**：`sdk/typescript/houyidb`（bigint 处理 >2^53 id）
 - **Go**：`sdk/go/houyidb`
-- **Rust**：`sdk/rust/houyidb-client`
+- **Rust**：`sdk/rust/houyidb`（门面 crate，重导出 client）/ `sdk/rust/houyidb-client`
 - **.NET**：`sdk/dotnet`（net8.0 + net10.0）
 - **Java**：`sdk/java/houyidb`（17+）
 

@@ -1096,6 +1096,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "houyidb"
+version = "0.2.0-beta.9"
+dependencies = [
+ "houyidb-client",
+]
+
+[[package]]
 name = "houyidb-client"
 version = "0.2.0-beta.9"
 dependencies = [

@@ -180,7 +180,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
-      - run: cargo test -p houyidb-client
+      - run: cargo test -p houyidb-client -p houyidb
       - run: cargo package -p houyidb-client
       - uses: actions/upload-artifact@v4
         with:
@@ -189,7 +189,16 @@ jobs:
       - if: >-
           (github.event_name == 'release' || inputs.publish) &&
           (github.event_name == 'release' || contains(inputs.ecosystems, 'crates'))
-        run: cargo publish -p houyidb-client --token "$CARGO_REGISTRY_TOKEN"
+        run: |
+          cargo publish -p houyidb-client --token "$CARGO_REGISTRY_TOKEN"
+          # 门面依赖刚发布的 client；等索引刷新后重试几次。
+          # EN: The facade depends on the just-published client; give the index
+          # a moment and retry a few times.
+          for attempt in 1 2 3 4 5; do
+            sleep 10
+            cargo publish -p houyidb --token "$CARGO_REGISTRY_TOKEN" && break
+            if [ "$attempt" = 5 ]; then exit 1; fi
+          done
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
 

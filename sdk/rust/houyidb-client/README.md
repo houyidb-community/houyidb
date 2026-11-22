@@ -4,6 +4,11 @@
 
 HouyiDB 向量数据库的官方 Rust 客户端（collections HTTP API）。同步阻塞式（`ureq` + rustls），仅 4 个直接依赖，与服务端共用同一套 `stable_id` 算法与依赖版本。
 
+> 高层用户也可以直接依赖门面 crate `houyidb`（完整重导出本 crate）：
+> `houyidb = "0.2.0-beta.9"`。
+> EN: You may also depend on the facade crate `houyidb` (a full re-export of
+> this crate): `houyidb = "0.2.0-beta.9"`.
+
 ```toml
 [dependencies]
 houyidb-client = { path = "sdk/rust/houyidb-client" }

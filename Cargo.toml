@@ -8,6 +8,7 @@ members = [
     "houyi-mobile",
     "houyi-mobile-jni",
     "sdk/rust/houyidb-client",
+    "sdk/rust/houyidb",
     "houyi-model",
 ]
 resolver = "2"

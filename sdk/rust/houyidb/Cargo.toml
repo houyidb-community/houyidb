@@ -1,0 +1,19 @@
+[package]
+name = "houyidb"
+description = "Official Rust facade for the HouyiDB vector database client"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository = "https://github.com/houyidb-community/houyidb"
+homepage = "https://github.com/houyidb-community/houyidb"
+documentation = "https://docs.rs/houyidb"
+readme = "README.md"
+keywords = ["vector-database", "hnsw", "embeddings", "rag"]
+categories = ["database"]
+
+[dependencies]
+# 与 houyidb-client 同版本发布；发版时两处一起 bump。
+# EN: Released in lockstep with houyidb-client; bump both on release.
+houyidb-client = { path = "../houyidb-client", version = "0.2.0-beta.9" }

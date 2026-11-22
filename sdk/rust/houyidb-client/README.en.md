@@ -4,6 +4,9 @@
 
 The official Rust client for the HouyiDB vector database (collections HTTP API). Synchronous blocking (`ureq` + rustls), with only 4 direct dependencies; it shares the same `stable_id` algorithm and dependency versions with the server.
 
+> You may also depend on the facade crate `houyidb` (a full re-export of this
+> crate): `houyidb = "0.2.0-beta.9"`.
+
 ```toml
 [dependencies]
 houyidb-client = { path = "sdk/rust/houyidb-client" }
