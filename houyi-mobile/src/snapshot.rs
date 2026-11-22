@@ -297,12 +297,19 @@ pub(crate) fn load_view_from(path: &Path) -> Result<MobileDB, String> {
     // overwrites the file in place during use (see the public docs).
     match unsafe { memmap2::Mmap::map(&file) } {
         Ok(map) => decode_snapshot_view(Arc::new(MmapSource(map))),
-        Err(_) => {
-            // 部分文件系统不支持映射：退回整块读取，仍保持按簇惰性解码。
+        Err(map_err) => {
+            // 部分文件系统不支持映射：退回整块读取，仍保持按簇惰性解码；
+            // 读取失败时带上 mmap 原因，便于定位设备侧问题。
             // EN: Some filesystems cannot map; fall back to a whole-file copy
-            // while keeping the lazy per-cluster decode.
-            let bytes = std::fs::read(path)
-                .map_err(|e| format!("snapshot: read {}: {e}", path.display()))?;
+            // while keeping the lazy per-cluster decode. If the read also
+            // fails, include the mmap error so device-side failures are
+            // diagnosable.
+            let bytes = std::fs::read(path).map_err(|e| {
+                format!(
+                    "snapshot: read {} (mmap failed: {map_err}): {e}",
+                    path.display()
+                )
+            })?;
             decode_snapshot_view(Arc::new(VecSource(bytes)))
         }
     }
@@ -1056,6 +1063,18 @@ mod tests {
         viewed.save_to(&path2).unwrap();
         let reloaded = MobileDB::load_from(&path2).unwrap();
         assert_eq!(reloaded.count("faces").unwrap(), n + 1);
+        // 重新编码后新向量与未触达簇的原始向量都必须可检索。
+        // EN: After re-encoding, both the inserted vector and the original
+        // vectors of untouched clusters must remain searchable.
+        assert_eq!(reloaded.search("faces", &probe, 1).unwrap()[0].0, 9001);
+        for qi in 0..4 {
+            let q = &vectors[qi * dims..(qi + 1) * dims];
+            assert_eq!(
+                reloaded.search("faces", q, 1).unwrap()[0].0,
+                qi as u64,
+                "original vector {qi} must survive partial write + re-encode"
+            );
+        }
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(&view_saved);
         let _ = std::fs::remove_file(&path2);

@@ -100,9 +100,10 @@ pub trait SnapshotBytes: Send + Sync {
 /// EN: Per-cluster lazy storage: records byte windows and decodes a cluster on
 /// first access, caching the result.
 struct LazyClusters<T> {
-    /// 整份快照字节（窗口相对其起点）。
-    /// EN: Whole snapshot bytes (windows are relative to its start).
-    source: Arc<dyn SnapshotBytes>,
+    /// 整份快照字节（窗口相对其起点）；所有簇解码后置 None 以释放映射。
+    /// EN: Whole snapshot bytes (windows are relative to its start); set to
+    /// None once every cluster is decoded so the mapping can be released.
+    source: Option<Arc<dyn SnapshotBytes>>,
     /// 每簇 (起始偏移, 字节数)。
     /// EN: Per-cluster (offset, byte length).
     windows: Vec<(usize, usize)>,
@@ -142,7 +143,11 @@ impl<T: Copy> ClusterStorage<T> {
             ClusterStorage::Owned(v) => &v[cluster],
             ClusterStorage::Lazy(l) => l.decoded[cluster].get_or_init(|| {
                 let (off, len) = l.windows[cluster];
-                (l.decode)(&l.source.bytes()[off..off + len])
+                let source = l
+                    .source
+                    .as_ref()
+                    .expect("lazy cluster without a byte source");
+                (l.decode)(&source.bytes()[off..off + len])
             }),
         }
     }
@@ -150,13 +155,28 @@ impl<T: Copy> ClusterStorage<T> {
     /// 取某簇的可变向量（写路径用）；Lazy 时只解码这一簇，其余保持惰性。
     /// EN: Get a cluster's mutable vector for writes; Lazy decodes only this
     /// cluster and leaves the others lazy.
+    /// 所有簇解码完成后释放快照字节源，避免写入后的长期占用。
+    /// EN: Release the snapshot byte source once every cluster has been
+    /// decoded, so a written index does not retain it.
+    fn try_release_source(&mut self) {
+        if let ClusterStorage::Lazy(l) = self {
+            if l.decoded.iter().all(|slot| slot.get().is_some()) {
+                l.source = None;
+            }
+        }
+    }
+
     fn cluster_mut(&mut self, cluster: usize) -> &mut Vec<T> {
         match self {
             ClusterStorage::Owned(v) => &mut v[cluster],
             ClusterStorage::Lazy(l) => {
                 if l.decoded[cluster].get().is_none() {
                     let (off, len) = l.windows[cluster];
-                    let decoded = (l.decode)(&l.source.bytes()[off..off + len]);
+                    let source = l
+                        .source
+                        .as_ref()
+                        .expect("lazy cluster without a byte source");
+                    let decoded = (l.decode)(&source.bytes()[off..off + len]);
                     let _ = l.decoded[cluster].set(decoded);
                 }
                 l.decoded[cluster]
@@ -229,6 +249,20 @@ impl ClusterVectors {
             ClusterVectors::F32(_) => FlatStorageDtype::F32,
             ClusterVectors::F16(_) => FlatStorageDtype::F16,
             ClusterVectors::I8 { .. } => FlatStorageDtype::I8,
+        }
+    }
+
+    /// 所有簇解码完成后释放快照字节源（仅 Lazy 存储有源）。
+    /// EN: Release the snapshot byte source once every cluster is decoded
+    /// (only Lazy storage has one).
+    fn try_release_source(&mut self) {
+        match self {
+            ClusterVectors::F32(v) => v.try_release_source(),
+            ClusterVectors::F16(v) => v.try_release_source(),
+            ClusterVectors::I8 { codes, scales } => {
+                codes.try_release_source();
+                scales.try_release_source();
+            }
         }
     }
 
@@ -843,10 +877,6 @@ impl FlatClustered {
         if let Some(message) = &self.id_index_error {
             return Err(message.clone());
         }
-        // 首次写入后原始 view 窗口不再代表索引内容，保存需重新编码。
-        // EN: After the first write the raw view window no longer represents
-        // the index, so saving re-encodes.
-        self.view_window = None;
         let target = *router::route_query(vector, &self.centroids, self.dims, 1, self.metric)
             .first()
             .expect("route_query returns one cluster when num_clusters > 0");
@@ -884,12 +914,17 @@ impl FlatClustered {
                 ));
             }
             if old_cluster == target {
+                // 首次真正修改前才失效原始窗口；被拒绝的写入仍可复用。
+                // EN: Invalidate the raw window right before the first actual
+                // mutation, so a rejected write can still reuse it.
+                self.view_window = None;
                 self.cluster_vecs
                     .overwrite(old_cluster, slot, self.dims, vector);
                 if let Some(cache) = self.cosine_norms.as_mut() {
                     let norm2 = self.cluster_vecs.norm2(old_cluster, slot, self.dims);
                     cache.set_norm2(old_cluster, slot, norm2);
                 }
+                self.cluster_vecs.try_release_source();
                 return Ok(());
             }
             // 跨簇搬移：swap_remove 保持其余槽位连续，并把被交换的尾部 id
@@ -897,6 +932,7 @@ impl FlatClustered {
             // EN: Cross-cluster move: swap_remove keeps the remaining slots
             // contiguous and re-points the swapped tail id in the map so no
             // dangling slot survives for later searches.
+            self.view_window = None;
             let moved_id = {
                 let ids = &mut self.cluster_ids[old_cluster];
                 let last = ids.len() - 1;
@@ -912,8 +948,10 @@ impl FlatClustered {
             }
         }
 
+        self.view_window = None;
         self.cluster_ids[target].push(id);
         self.cluster_vecs.push(target, vector);
+        self.cluster_vecs.try_release_source();
         let slot = self.cluster_ids[target].len() - 1;
         if let Some(cache) = self.cosine_norms.as_mut() {
             let norm2 = self.cluster_vecs.norm2(target, slot, self.dims);
@@ -1593,7 +1631,7 @@ fn lazy_cluster_payloads(
     }
     match dtype {
         FlatStorageDtype::F32 => ClusterVectors::F32(ClusterStorage::Lazy(LazyClusters {
-            source,
+            source: Some(source),
             windows: windows
                 .iter()
                 .map(|w| (base + w.vec_off, w.vec_bytes))
@@ -1602,7 +1640,7 @@ fn lazy_cluster_payloads(
             decoded: empty_locks(windows.len()),
         })),
         FlatStorageDtype::F16 => ClusterVectors::F16(ClusterStorage::Lazy(LazyClusters {
-            source,
+            source: Some(source),
             windows: windows
                 .iter()
                 .map(|w| (base + w.vec_off, w.vec_bytes))
@@ -1612,7 +1650,7 @@ fn lazy_cluster_payloads(
         })),
         FlatStorageDtype::I8 => {
             let codes = LazyClusters {
-                source: Arc::clone(&source),
+                source: Some(Arc::clone(&source)),
                 windows: windows
                     .iter()
                     .map(|w| (base + w.vec_off, w.vec_bytes))
@@ -1621,7 +1659,7 @@ fn lazy_cluster_payloads(
                 decoded: empty_locks(windows.len()),
             };
             let scales = LazyClusters {
-                source,
+                source: Some(source),
                 windows: windows
                     .iter()
                     .map(|w| {
@@ -2131,8 +2169,8 @@ mod tests {
     /// view 模式：元数据解析后按簇惰性解码，检索结果与 eager 解码逐项一致；
     /// 首次写入只解码触达的簇，之后仍可正常增量插入。
     /// EN: View mode parses metadata and decodes per cluster lazily; search
-    /// results match eager decoding item for item, and the first write
-    /// materializes the clusters before inserting.
+    /// results match eager decoding item for item, and the first write decodes
+    /// only the clusters it touches.
     #[test]
     fn test_flat_clustered_view_state_matches_eager() {
         struct TestBytes(Vec<u8>);
@@ -2175,9 +2213,15 @@ mod tests {
                 let q = &vectors[qi * dims..(qi + 1) * dims];
                 assert_eq!(fc.search(q, 10), viewed.search(q, 10));
             }
+            // 被拒绝的写入不应失效原始保存窗口；成功的写入必须失效。
+            // EN: A rejected write must not invalidate the raw save window; a
+            // successful write must.
+            assert!(viewed.insert(9100, &vec![0.0f32; dims - 1]).is_err());
+            assert!(viewed.state_window().is_some());
             let mut probe = vec![0.0f32; dims];
             probe[0] = 1.0;
             viewed.insert(9000, &probe).expect("insert after view");
+            assert!(viewed.state_window().is_none());
             assert!(viewed.search(&probe, 1).iter().any(|(id, _)| *id == 9000));
             let again = viewed.encode_state().expect("encode after view");
             let decoded = FlatClustered::decode_state(&again).expect("decode after view");

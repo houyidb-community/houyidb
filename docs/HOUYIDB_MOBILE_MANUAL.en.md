@@ -204,7 +204,9 @@ void* houyi_mobile_db_load_view(const char* path);  // NULL on failure
   after a write the index is re-encoded from the current data.
 - Decoded clusters stay cached; once queries cover every cluster, memory
   approaches eager loading, but the mapped pages are file-backed and
-  reclaimable.
+  reclaimable. The snapshot byte source (mmap or fallback buffer) stays alive
+  while any cluster is undecoded and is released after every cluster has been
+  decoded and the index written.
 - Only flat-clustered built states decode lazily; `flat` / `clustered-hnsw` load
   as before.
 - Kotlin: `HouyiDB.loadView(path): Long`.

@@ -333,8 +333,9 @@ object HouyiDB {
      * cluster vectors decode per cluster on first search. The whole-file CRC is
      * skipped (structural validation remains complete); do not truncate or
      * overwrite the file in place after loading (temp file + rename is safe).
-     * The first write materializes the clusters; afterwards behavior matches a
-     * normal load.
+     * The first write decodes only the clusters it touches and their norms;
+     * the rest stay lazy. Saving an unwritten view reuses the raw built-state
+     * bytes, while a written index is re-encoded.
      */
     fun loadView(path: String): Long {
         val handle = nativeLoadView(path)

@@ -189,7 +189,8 @@ void* houyi_mobile_db_load_view(const char* path);  // NULL 表示失败
 - 首次写入只解码本次会触碰的簇及其范数，其余簇保持惰性。保存时：未写入过的
   视图直接复用原始构建态字节；写入后按当前数据重新编码。
 - 已解码的簇会常驻缓存；查询覆盖全部簇后内存占用接近 eager，但映射页是文件页、
-  可被内核回收。
+  可被内核回收。只要仍有簇未解码，快照字节源（mmap 或回退缓冲）就保持存活；
+  全部簇解码并写入后自动释放。
 - 仅 `flat-clustered` 构建态惰性解码；`flat` / `clustered-hnsw` 仍按原方式加载。
 - Kotlin：`HouyiDB.loadView(path): Long`。
 
