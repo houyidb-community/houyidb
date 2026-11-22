@@ -1624,8 +1624,6 @@ fn decode_cluster_payloads(
     }
 }
 
-/// 把解析出的窗口包装成按簇惰性解码的存储（view 模式）。
-/// EN: Wrap parsed windows into per-cluster lazy storage (view mode).
 /// 预先建槽：零长度窗口视为已解码，避免它们永远阻塞源释放。
 /// EN: Pre-create slots; zero-length windows count as decoded so they never
 /// block source release.
@@ -1648,6 +1646,8 @@ fn lazy_remaining(windows: &[(usize, usize)]) -> std::sync::atomic::AtomicUsize 
     std::sync::atomic::AtomicUsize::new(windows.iter().filter(|w| w.1 > 0).count())
 }
 
+/// 把解析出的窗口包装成按簇惰性解码的存储（view 模式）。
+/// EN: Wrap parsed windows into per-cluster lazy storage (view mode).
 fn lazy_cluster_payloads(
     source: Arc<dyn SnapshotBytes>,
     base: usize,
