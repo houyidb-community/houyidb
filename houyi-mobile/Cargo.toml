@@ -24,6 +24,7 @@ ahash = "0.8"
 # rayon version as houyi-vector.
 rayon.workspace = true
 crc32fast.workspace = true
+memmap2.workspace = true
 serde_json.workspace = true
 
 [dev-dependencies]

@@ -1207,11 +1207,7 @@ impl FlatClustered {
         // EN: Two-phase decode: read ids and payload windows sequentially, then
         // copy each cluster payload into its target type in parallel (one memcpy
         // per cluster on little-endian hosts instead of per-element conversion).
-        let elem_bytes = match dtype {
-            FlatStorageDtype::F32 => 4,
-            FlatStorageDtype::F16 => 2,
-            _ => 1,
-        };
+        let elem_bytes = dtype.bytes_per_dim();
         let mut seen = ahash::AHashSet::new();
         let mut windows: Vec<ClusterWindow> = Vec::with_capacity(num_clusters);
         let mut cluster_ids: Vec<Vec<u64>> = Vec::with_capacity(num_clusters);
@@ -1251,7 +1247,7 @@ impl FlatClustered {
                 }
                 let off = r.pos();
                 r.skip(scale_bytes)?;
-                Some(off)
+                Some((off, scale_bytes))
             } else {
                 None
             };
@@ -1259,14 +1255,16 @@ impl FlatClustered {
             windows.push(ClusterWindow {
                 vec_off,
                 vec_bytes,
-                count,
                 scale_off,
             });
         }
-        let cluster_vecs = decode_cluster_payloads(bytes, &windows, dtype)?;
+        // 先做廉价的结构校验，再为解码付出分配与拷贝成本。
+        // EN: Cheap structural validation first, before paying for allocation
+        // and copying in the decode.
         if r.remaining() != 0 {
             return Err("flat-clustered state: trailing bytes".to_string());
         }
+        let cluster_vecs = decode_cluster_payloads(bytes, &windows, dtype)?;
         let mut index = FlatClustered {
             dims,
             metric,
@@ -1291,8 +1289,10 @@ impl FlatClustered {
 struct ClusterWindow {
     vec_off: usize,
     vec_bytes: usize,
-    count: usize,
-    scale_off: Option<usize>,
+    /// i8 缩放系数的字节窗口；解析阶段已做 checked_mul 与剩余长度校验。
+    /// EN: Byte window of the i8 scales; the parse phase has already applied
+    /// checked_mul and remaining-length validation.
+    scale_off: Option<(usize, usize)>,
 }
 
 /// i8 簇解码的中间结果：量化码 + 每簇缩放系数。
@@ -1328,15 +1328,15 @@ fn decode_cluster_payloads(
                 .collect();
             Ok(ClusterVectors::F16(lists?))
         }
-        _ => {
+        FlatStorageDtype::I8 => {
             let pairs: Result<Vec<ScaledCodes>, String> = windows
                 .par_iter()
                 .map(|w| {
-                    let codes = bulk_i8(&bytes[w.vec_off..w.vec_off + w.vec_bytes])?;
-                    let off = w
+                    let codes = bulk_i8(&bytes[w.vec_off..w.vec_off + w.vec_bytes]);
+                    let (off, scale_bytes) = w
                         .scale_off
                         .ok_or_else(|| "flat-clustered state: missing i8 scales".to_string())?;
-                    let scales = bulk_f32(&bytes[off..off + w.count * 4])?;
+                    let scales = bulk_f32(&bytes[off..off + scale_bytes])?;
                     Ok((codes, scales))
                 })
                 .collect();
@@ -1352,11 +1352,17 @@ fn bulk_f32(bytes: &[u8]) -> Result<Vec<f32>, String> {
     if !bytes.len().is_multiple_of(4) {
         return Err("flat-clustered state: f32 payload not aligned".to_string());
     }
-    let mut out = vec![0f32; bytes.len() / 4];
-    // SAFETY：目标缓冲已按 f32 长度分配，字节数与来源一致。
-    // EN: SAFETY: destination is sized for f32 and the byte counts match.
+    let len = bytes.len() / 4;
+    // 只分配不零初始化：拷贝会写满全部元素，少一遍 26 MB 级的 memset。
+    // EN: Allocate without zero-init: the copy fills every element, saving a
+    // full memset pass over the payload.
+    let mut out: Vec<f32> = Vec::with_capacity(len);
+    // SAFETY：容量为 len 且拷贝覆盖全部元素后才 set_len；f32 为 Copy，无析构问题。
+    // EN: SAFETY: capacity is len, every element is written before set_len, and
+    // f32 is Copy so there is no drop concern.
     unsafe {
         std::ptr::copy_nonoverlapping(bytes.as_ptr(), out.as_mut_ptr() as *mut u8, bytes.len());
+        out.set_len(len);
     }
     Ok(out)
 }
@@ -1377,12 +1383,16 @@ fn bulk_f16(bytes: &[u8]) -> Result<Vec<f16>, String> {
     if !bytes.len().is_multiple_of(2) {
         return Err("flat-clustered state: f16 payload not aligned".to_string());
     }
-    let mut out = vec![f16::from_bits(0); bytes.len() / 2];
-    // SAFETY：f16 是 u16 的透明封装，目标缓冲已按元素数分配。
-    // EN: SAFETY: f16 is a transparent u16 wrapper and the destination is sized
-    // for the element count.
+    let len = bytes.len() / 2;
+    // 同 bulk_f32：不零初始化，直接写入位模式。
+    // EN: Like bulk_f32: skip zero-init and write the bit patterns directly.
+    let mut out: Vec<f16> = Vec::with_capacity(len);
+    // SAFETY：容量为 len 且拷贝覆盖全部元素后才 set_len；f16 是 Copy 的 u16 封装。
+    // EN: SAFETY: capacity is len, every element is written before set_len, and
+    // f16 is a Copy u16 wrapper.
     unsafe {
         std::ptr::copy_nonoverlapping(bytes.as_ptr(), out.as_mut_ptr() as *mut u8, bytes.len());
+        out.set_len(len);
     }
     Ok(out)
 }
@@ -1398,13 +1408,23 @@ fn bulk_f16(bytes: &[u8]) -> Result<Vec<f16>, String> {
         .collect())
 }
 
-fn bulk_i8(bytes: &[u8]) -> Result<Vec<i8>, String> {
-    Ok(bytes.iter().map(|&b| b as i8).collect())
+fn bulk_i8(bytes: &[u8]) -> Vec<i8> {
+    // i8 与 u8 布局相同，直接整块拷贝（逐字节 map 会被 LLVM 优化但不如 memcpy 稳定）。
+    // EN: i8 and u8 share a layout, so copy the whole block (a per-byte map may be
+    // optimized by LLVM but a memcpy is the reliable shape).
+    let mut out: Vec<i8> = Vec::with_capacity(bytes.len());
+    // SAFETY：容量为 len 且拷贝覆盖全部元素后才 set_len；i8 为 Copy。
+    // EN: SAFETY: capacity is len, every element is written before set_len, and
+    // i8 is Copy.
+    unsafe {
+        std::ptr::copy_nonoverlapping(bytes.as_ptr(), out.as_mut_ptr() as *mut u8, bytes.len());
+        out.set_len(bytes.len());
+    }
+    out
 }
 
-/// 单簇向量载荷在状态字节中的窗口（供并行解码）。
-/// EN: Windows of one cluster's vector payload inside the state bytes (for
-/// parallel decoding).
+/// 构建态状态字节的 magic：HOUYI Flat Clustered v1。
+/// EN: Magic for built-state bytes: HOUYI Flat Clustered v1.
 const FLAT_CLUSTERED_STATE_MAGIC: &[u8; 8] = b"HOUYIFC1";
 const FLAT_CLUSTERED_STATE_VERSION: u32 = 1;
 /// 构建态解码的防御上限：移动端实际远小于此值，避免恶意/损坏头部放大分配。

@@ -66,6 +66,34 @@ absolute terms.
 (Persisting the norm cache into the snapshot was also tried: 80 vs 80 ms median
 in A/B, no gain, reverted.)
 
+## Cold-load round 2 (mmap + parallel CRC + no zero-init)
+
+Building on the parallel bulk decode above:
+
+- File snapshots load through a read-only mmap instead of a whole-file `read`,
+  falling back to `fs::read` when mapping is unavailable.
+- CRC32 is computed in parallel chunks and combined in order; the result is
+  bit-identical to a single pass.
+- Cluster payloads are no longer zero-initialized before being fully
+  overwritten; `set_len` after the copy removes a 26 MB-class memset.
+- The trailing-bytes check now runs before decoding, so malformed snapshots no
+  longer pay the full decode cost.
+
+Same-session alternating A/B (92% battery, 28 °C, background stopped; 6 loads
+per round, median of the last 5):
+
+| Index | Previous round | This round | Speedup |
+|---|---:|---:|---:|
+| flat-clustered f16 (26.6 MB snapshot) | 77.8 ms | **35.7 ms** | 2.2× |
+| flat-clustered i8 (14.2 MB snapshot) | 38.3 ms | **27.8 ms** | 1.4× |
+
+Cumulative versus the original per-element decode (176 / 148.5 ms, measured in
+an earlier session; indicative only): about **4.9× / 5.3×**. Peak RSS is close between versions (f16 87 MB / i8 51 MB)
+because the decoded buffers are still owned; the mmap gain is one fewer
+whole-file copy and heap allocation, and mapped pages are file-backed and
+reclaimable. Against USearch f32 64.5 MB at 53–97 ms, f16 now sits at about
+two-thirds of its fastest figure and i8 remains faster in absolute terms.
+
 ## Thread-count sweep (128d×100k, RAYON_NUM_THREADS, 3 runs each)
 
 | Threads | f16 p50 median | i8 p50 median | Build |

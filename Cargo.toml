@@ -59,6 +59,12 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tracing-appender = "0.2"
 # WAL v2 记录 CRC32 校验(P4.1)
 crc32fast = "1"
+# 移动端快照只读映射（P2 冷加载）：省掉 26 MB 级的整块读入与一份峰值内存；
+# 映射失败时调用方退回 fs::read，行为不变。
+# EN: Read-only mapping for mobile snapshots (P2 cold load): removes a ~26 MB
+# whole-file read and one peak-memory copy; callers fall back to fs::read when
+# mapping is unavailable, so behavior is unchanged.
+memmap2 = "0.9"
 # TLS(P4.2.2):rustls 纯 Rust 栈(避免 OpenSSL 系统依赖,与 ureq 选型同规);
 # 只编 ring provider(不引入 aws-lc-rs 的 C 构建链)。tls12 兼容旧客户端。
 rustls = { version = "0.23", default-features = false, features = ["ring", "logging", "std", "tls12"] }

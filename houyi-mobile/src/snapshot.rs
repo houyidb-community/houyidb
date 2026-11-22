@@ -22,6 +22,7 @@ use crate::db::{CollectionSnapshot, MobileDB};
 use crate::filter::{ColType, ScalarStoreSnapshot, ScalarVal};
 use houyi_vector::cluster::FlatStorageDtype;
 use houyi_vector::DistanceMetric;
+use rayon::prelude::*;
 use std::collections::HashSet;
 use std::fs::OpenOptions;
 use std::io::Write;
@@ -43,6 +44,36 @@ const MAX_SCALAR_ROWS: usize = 10_000_000;
 /// metadata before reading so a corrupt file cannot force an unbounded read.
 const MAX_SNAPSHOT_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 
+/// 并行 CRC32：分块计算后用 `Hasher::combine` 按原始顺序合并。
+///
+/// `combine` 的语义是「self 的数据在前、other 的数据在后」，因此按块顺序
+/// 合并与整段单遍计算逐位一致。小于 1 MiB 时并行调度不划算，仍走单遍。
+/// EN: Parallel CRC-32: hash chunks and combine them in original order. The
+/// result is bit-identical to one pass over the whole slice because `combine`
+/// treats self's data as preceding other's. Below 1 MiB the parallel scheduling
+/// overhead is not worth it, so a single pass is used.
+fn crc32_parallel(bytes: &[u8]) -> u32 {
+    const PARALLEL_MIN_BYTES: usize = 1 << 20;
+    if bytes.len() < PARALLEL_MIN_BYTES {
+        return crc32fast::hash(bytes);
+    }
+    let chunks = rayon::current_num_threads().clamp(2, 8);
+    let chunk_len = bytes.len().div_ceil(chunks);
+    let hashes: Vec<crc32fast::Hasher> = bytes
+        .par_chunks(chunk_len)
+        .map(|chunk| {
+            let mut h = crc32fast::Hasher::new();
+            h.update(chunk);
+            h
+        })
+        .collect();
+    let mut acc = crc32fast::Hasher::new();
+    for h in &hashes {
+        acc.combine(h);
+    }
+    acc.finalize()
+}
+
 /// 把数据库编码成完整快照字节（magic + 版本 + 长度 + CRC32 + body）。
 ///
 /// 先在缓冲区预留头部再把 body 直接追加进去，最后回填头部：整个编码过程只有
@@ -56,7 +87,7 @@ pub(crate) fn encode_snapshot(db: &MobileDB) -> Result<Vec<u8>, String> {
     encode_body_into(&mut w, db)?;
     let mut bytes = w.finish();
     let body_len = bytes.len() - HEADER_LEN;
-    let crc = crc32fast::hash(&bytes[HEADER_LEN..]);
+    let crc = crc32_parallel(&bytes[HEADER_LEN..]);
     let body_len =
         u64::try_from(body_len).map_err(|_| "snapshot: body length overflows u64".to_string())?;
     bytes[..8].copy_from_slice(MAGIC);
@@ -94,7 +125,7 @@ pub(crate) fn decode_snapshot(bytes: &[u8]) -> Result<MobileDB, String> {
         return Err("snapshot: body length mismatch".to_string());
     }
     let body = &bytes[HEADER_LEN..];
-    if crc32fast::hash(body) != crc {
+    if crc32_parallel(body) != crc {
         return Err("snapshot: crc mismatch".to_string());
     }
     let snapshots = decode_body(body, version)?;
@@ -156,6 +187,27 @@ pub(crate) fn load_from(path: &Path) -> Result<MobileDB, String> {
     if size > MAX_SNAPSHOT_BYTES {
         return Err(format!("snapshot: file too large ({size} bytes)"));
     }
+    // 只读映射省掉整块 read 拷贝与一份峰值内存；解码会在返回前把所有数据
+    // 复制进自有的簇缓冲，映射随后即可释放。快照由本库以「临时文件 +
+    // rename」原子替换，已打开的 inode 不会被本库截断，因此正常使用下映射
+    // 期间不会因截断触发 SIGBUS。
+    // EN: A read-only mapping removes the whole-file read copy and one peak
+    // memory copy; decoding copies everything into owned cluster buffers before
+    // returning, so the mapping can be dropped. This library replaces snapshots
+    // atomically (temp file + rename) and never truncates an open inode, so
+    // normal use cannot SIGBUS the mapping.
+    if let Ok(file) = std::fs::File::open(path) {
+        // SAFETY：映射为只读，文件句柄在 map 生命周期内保持打开；如上所述
+        // 不会发生并发截断。
+        // EN: SAFETY: the mapping is read-only, the handle stays open for the
+        // mapping's lifetime, and concurrent truncation cannot happen as above.
+        if let Ok(map) = unsafe { memmap2::Mmap::map(&file) } {
+            return decode_snapshot(&map);
+        }
+    }
+    // 映射不可用（如部分特殊文件系统）时退回整块读取，语义一致。
+    // EN: Fall back to a whole-file read when mapping is unavailable (e.g. some
+    // special filesystems); semantics are identical.
     let bytes =
         std::fs::read(path).map_err(|e| format!("snapshot: read {}: {e}", path.display()))?;
     decode_snapshot(&bytes)
@@ -734,6 +786,21 @@ mod tests {
         assert_eq!(col.metric, DistanceMetric::L2);
         assert_eq!(col.dtype, FlatStorageDtype::F32);
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn parallel_crc_matches_single_pass() {
+        // 覆盖小段（走单遍）、并行阈值边界与非整块长度。
+        // EN: Cover small inputs (single pass), the parallel threshold boundary,
+        // and a non-chunk-aligned length.
+        for len in [0usize, 1, 4095, (1 << 20) - 1, 1 << 20, (1 << 20) + 7] {
+            let data: Vec<u8> = (0..len).map(|i| (i * 31 + 7) as u8).collect();
+            assert_eq!(
+                crc32_parallel(&data),
+                crc32fast::hash(&data),
+                "crc mismatch at len {len}"
+            );
+        }
     }
 
     #[test]
