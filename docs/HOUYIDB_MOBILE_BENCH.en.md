@@ -41,6 +41,29 @@ nprobe sweep (512d×50k, f16, one build, runtime `set_search_options`):
 | 196 | 5.69 ms | 0.9810 |
 | 224 (all clusters) | 6.53 ms | 0.9990 |
 
+## Full-battery confirmation (100%, 31 °C, background stopped)
+
+- 512d×50k (3-round medians): f16 balanced 3108 µs / 0.857, f16 high_recall
+  6270 µs / **0.999**; i8 balanced 2146 µs / 0.856, i8 high_recall
+  3885 µs / **0.986**.
+- clustered-hnsw 128d×100k cold load: 237.0 / 240.3 / 239.5 ms (median 239 ms),
+  recall 0.9350.
+
+## Thread-count sweep (128d×100k, RAYON_NUM_THREADS, 3 runs each)
+
+| Threads | f16 p50 median | i8 p50 median | Build |
+|---:|---:|---:|---:|
+| 2 | 3497 µs | 1659 µs | 11.4–12.5 s |
+| 4 | 1667 µs | 1068 µs | 6.3–7.1 s |
+| 6 | **1332 µs** | 1114 µs | 6.0–7.3 s |
+| 8 (default) | 1530 µs | 1198 µs | 5.3–5.9 s |
+
+Conclusion: 2 threads are unusable; 4/6/8 differ by 10–15% on queries and are
+temperature-sensitive (the same configuration varied by up to 40% across
+rounds), so there is **no stable winner**. Builds are always fastest with 8
+threads, so the library keeps the default and apps may pick a count per device
+via `houyi_mobile_set_threads`.
+
 ## Verdicts
 
 ### Effective
@@ -54,8 +77,17 @@ nprobe sweep (512d×50k, f16, one build, runtime `set_search_options`):
   (i8); the default preset matches the historical baseline; an explicit nprobe
   is no longer silently squeezed back by the candidate budget.
 - **P1.5 clustered-hnsw built-state snapshot**: 128d×100k cold load
-  **10.6 s → 243 ms** with unchanged recall; the snapshot grows from 50.8 MB to
-  77.4 MB (boundary replication + graph links).
+  **10.6 s → 243 ms** (239 ms on the full-battery rerun) with unchanged recall;
+  the snapshot grows from 50.8 MB to 77.4 MB (boundary replication + graph links).
+
+### P2 additions (APIs, no latency change)
+
+- Batch search `houyi_mobile_db_search_batch_u64` / Kotlin `searchBatch`: one
+  lock for many queries, unchanged per-query latency and recall.
+- Diagnostics `houyi_mobile_db_collection_stats` /
+  `houyi_mobile_db_memory_usage` / Kotlin `collectionStats` / `memoryUsage`.
+- Thread count `houyi_mobile_set_threads` / Kotlin `setThreads` (see the table
+  above).
 
 ### Ineffective (reverted, not kept)
 

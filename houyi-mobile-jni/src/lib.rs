@@ -680,6 +680,170 @@ pub extern "system" fn Java_cc_houyidb_mobile_HouyiDB_nativeLoadBytes(
     }
 }
 
+/// 初始化检索线程数（须在首次检索/建图前调用）；失败返回 -1。
+/// EN: Initialize the search thread count (before the first search/build);
+/// -1 on failure.
+#[no_mangle]
+pub extern "system" fn Java_cc_houyidb_mobile_HouyiDB_nativeSetThreads(
+    _env: JNIEnv<'_>,
+    _this: JObject<'_>,
+    threads: jint,
+) -> jint {
+    clear_error();
+    let Ok(threads) = u32::try_from(threads) else {
+        set_error("invalid thread count");
+        return -1;
+    };
+    if houyi_mobile::houyi_mobile_set_threads(threads) == 0 {
+        0
+    } else {
+        set_error("thread pool already initialized or invalid count");
+        -1
+    }
+}
+
+/// 集合诊断：把 9 项统计写入 long 数组（count/dims/index_type/metric/dtype/
+/// built/nprobe/num_clusters/estimated_bytes）。失败返回 -1。
+/// EN: Collection diagnostics: write 9 values into a long array (count/dims/
+/// index_type/metric/dtype/built/nprobe/num_clusters/estimated_bytes). -1 on
+/// failure.
+#[no_mangle]
+pub extern "system" fn Java_cc_houyidb_mobile_HouyiDB_nativeCollectionStats(
+    mut env: JNIEnv<'_>,
+    _this: JObject<'_>,
+    handle: jlong,
+    name: JString<'_>,
+    out: JLongArray<'_>,
+) -> jint {
+    clear_error();
+    let Some(db) = handle_from(handle) else {
+        set_error("invalid database handle");
+        return -1;
+    };
+    let Ok(name) = string_arg(&mut env, &name) else {
+        set_error("invalid collection name");
+        return -1;
+    };
+    let stats = match db.stats(&name) {
+        Ok(value) => value,
+        Err(message) => {
+            set_error(message);
+            return -1;
+        }
+    };
+    let index_type = match stats.index_type {
+        "flat" => 0i64,
+        "flat-clustered" => 1,
+        _ => 2,
+    };
+    let values = [
+        stats.count as i64,
+        stats.dims as i64,
+        index_type,
+        i64::from(stats.metric.to_snapshot_byte()),
+        i64::from(stats.dtype.to_snapshot_byte()),
+        i64::from(u8::from(stats.built)),
+        stats.nprobe as i64,
+        stats.num_clusters as i64,
+        stats.estimated_bytes as i64,
+    ];
+    if let Err(e) = env.set_long_array_region(&out, 0, &values) {
+        set_error(format!("cannot write stats array: {e}"));
+        return -1;
+    }
+    0
+}
+
+/// 所有集合的堆内存估算（字节）。
+/// EN: Estimated heap usage across all collections in bytes.
+#[no_mangle]
+pub extern "system" fn Java_cc_houyidb_mobile_HouyiDB_nativeMemoryUsage(
+    _env: JNIEnv<'_>,
+    _this: JObject<'_>,
+    handle: jlong,
+) -> jlong {
+    clear_error();
+    let Some(db) = handle_from(handle) else {
+        set_error("invalid database handle");
+        return -1;
+    };
+    db.memory_usage() as jlong
+}
+
+/// 批量检索：每行结果占 k 个槽位，outCounts[i] 写实际命中数。
+/// EN: Batch search: each query owns k result slots; outCounts[i] gets its hit
+/// count.
+#[no_mangle]
+pub extern "system" fn Java_cc_houyidb_mobile_HouyiDB_nativeSearchBatch(
+    mut env: JNIEnv<'_>,
+    _this: JObject<'_>,
+    handle: jlong,
+    name: JString<'_>,
+    queries: JFloatArray<'_>,
+    nq: jint,
+    dims: jint,
+    k: jint,
+    out_ids: JLongArray<'_>,
+    out_scores: JFloatArray<'_>,
+    out_counts: jni::objects::JIntArray<'_>,
+) -> jint {
+    clear_error();
+    let Some(db) = handle_from(handle) else {
+        set_error("invalid database handle");
+        return -1;
+    };
+    let Ok(name) = string_arg(&mut env, &name) else {
+        set_error("invalid collection name");
+        return -1;
+    };
+    let (Ok(nq), Ok(dims), Ok(k)) = (
+        usize::try_from(nq),
+        usize::try_from(dims),
+        usize::try_from(k),
+    ) else {
+        set_error("negative batch argument");
+        return -1;
+    };
+    let query_len = match env.get_array_length(&queries) {
+        Ok(value) => value as usize,
+        Err(_) => {
+            set_error("invalid query array");
+            return -1;
+        }
+    };
+    let mut flat = vec![0.0f32; query_len];
+    if env.get_float_array_region(&queries, 0, &mut flat).is_err() {
+        set_error("invalid query array");
+        return -1;
+    }
+    let found = match db.search_batch(&name, &flat, dims, nq, k) {
+        Ok(value) => value,
+        Err(message) => {
+            set_error(message);
+            return -1;
+        }
+    };
+    let mut ids = vec![0i64; nq * k];
+    let mut scores = vec![0.0f32; nq * k];
+    let mut counts = vec![0i32; nq];
+    for (i, hits) in found.iter().enumerate() {
+        let n = hits.len().min(k);
+        for (j, (id, score)) in hits.iter().take(n).enumerate() {
+            ids[i * k + j] = *id as i64;
+            scores[i * k + j] = *score;
+        }
+        counts[i] = n as i32;
+    }
+    if env.set_long_array_region(&out_ids, 0, &ids).is_err()
+        || env.set_float_array_region(&out_scores, 0, &scores).is_err()
+        || env.set_int_array_region(&out_counts, 0, &counts).is_err()
+    {
+        set_error("cannot write batch results");
+        return -1;
+    }
+    0
+}
+
 /// 设置检索选项（0 = 该项保持不变）；失败返回 -1 并写入 lastError。
 /// EN: Set search options (0 leaves a field unchanged); -1 on failure.
 #[no_mangle]

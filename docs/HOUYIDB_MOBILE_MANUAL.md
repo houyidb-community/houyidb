@@ -209,7 +209,34 @@ HouyiDB.setSearchOptions(db, "faces", perK = 0, nprobe = 32, efSearch = 0)
 HouyiDB.setBuildNprobe(db, "faces", 32)   // 下次 build 生效
 ```
 
-### 2.10 原有检索预算说明（flat-clustered 余弦）
+### 2.10 批量检索与诊断
+
+```c
+int32_t houyi_mobile_db_search_batch_u64(void* db, const char* name,
+                                         const float* queries, uint32_t dims,
+                                         uint32_t nq, uint32_t k,
+                                         HouyiMobileResult* results,
+                                         uint32_t max_results_per_query, uint32_t* counts);
+int32_t houyi_mobile_db_collection_stats(void* db, const char* name,
+                                         HouyiMobileCollectionStats* out);
+size_t  houyi_mobile_db_memory_usage(void* db);
+```
+
+- `search_batch_u64`：一次调用处理 `nq` 条查询，结果按行存放（第 i 条占
+  `results[i*max_results_per_query..]`），`counts[i]` 写实际命中数。一次加锁，
+  适合相册一次匹配多张脸；返回 0 成功、-1 参数/集合/维度错误。
+- `collection_stats`：`count/dims/index_type/metric/dtype/built/nprobe/
+  num_clusters`，配合 `memory_usage` 可在 App 侧选择 f16/i8 与预设。
+- Kotlin：`searchBatch(...): List<List<SearchHit>>`、
+  `collectionStats(...)`（`CollectionStats`）、`memoryUsage(handle)`。
+- 批量内部仍按查询逐条执行（每次查询已按簇并行）；它的收益是减少 JNI/加锁
+  次数，不会改变单查询的延迟与召回。
+- 线程数：`houyi_mobile_set_threads(n)` / Kotlin `setThreads(n)`，须在首次
+  检索/建图前调用（全局池只能初始化一次）。真机 128d×100k：2 线程明显变慢，
+  4/6/8 查询中位数差约 10–15%，建图以 8 线程最快；建议建图用默认、交互检索
+  按机型实测选定。
+
+### 2.11 原有检索预算说明（flat-clustered 余弦）
 
 ```c
 int32_t houyi_mobile_set_search_target(void* handle, uint32_t per_k);

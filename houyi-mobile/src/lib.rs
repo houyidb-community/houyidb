@@ -613,6 +613,181 @@ pub extern "C" fn houyi_mobile_db_search(
     n as u32
 }
 
+/// 集合诊断快照（C ABI 布局）。
+/// EN: Collection diagnostics snapshot (C ABI layout).
+#[repr(C)]
+pub struct HouyiMobileCollectionStats {
+    /// 向量数量。
+    /// EN: Vector count.
+    pub count: u32,
+    /// 维度。
+    /// EN: Dimensionality.
+    pub dims: u32,
+    /// 索引类型码：0=flat、1=flat-clustered、2=clustered-hnsw。
+    /// EN: Index type code: 0=flat, 1=flat-clustered, 2=clustered-hnsw.
+    pub index_type: u8,
+    /// 度量码（同 create_v2）：0=L2、1=Cosine、2=IP、3=L1。
+    /// EN: Metric code (same as create_v2): 0=L2, 1=Cosine, 2=IP, 3=L1.
+    pub metric: u8,
+    /// 存储编码：0=f32、1=f16、2=i8。
+    /// EN: Storage encoding: 0=f32, 1=f16, 2=i8.
+    pub dtype: u8,
+    /// 是否已建图（flat 恒为 0）。
+    /// EN: Whether a build completed (always 0 for flat).
+    pub built: u8,
+    /// 构建期 nprobe（路由簇数）；未建图或 flat 为 0。
+    /// EN: Build-time nprobe (routed clusters); 0 when unbuilt or flat.
+    pub nprobe: u32,
+    /// 簇数量；未建图或 flat 为 0。
+    /// EN: Cluster count; 0 when unbuilt or flat.
+    pub num_clusters: u32,
+    /// 保留字段（当前为 0）。
+    /// EN: Reserved (currently 0).
+    pub reserved: u32,
+}
+
+/// 填充集合诊断信息。返回 0 成功、-1 参数非法/集合缺失。
+/// EN: Fill collection diagnostics. Returns 0 on success, -1 for bad
+/// arguments or a missing collection.
+#[no_mangle]
+pub extern "C" fn houyi_mobile_db_collection_stats(
+    db_handle: *mut db::MobileDB,
+    coll_name: *const std::ffi::c_char,
+    out: *mut HouyiMobileCollectionStats,
+) -> i32 {
+    if db_handle.is_null() || coll_name.is_null() || out.is_null() {
+        return -1;
+    }
+    let db = unsafe { &*db_handle };
+    let c_name = unsafe { std::ffi::CStr::from_ptr(coll_name) };
+    let name = match c_name.to_str() {
+        Ok(value) => value,
+        Err(_) => return -1,
+    };
+    let stats = match db.stats(name) {
+        Ok(value) => value,
+        Err(_) => return -1,
+    };
+    let index_type = match stats.index_type {
+        "flat" => 0,
+        "flat-clustered" => 1,
+        _ => 2,
+    };
+    unsafe {
+        *out = HouyiMobileCollectionStats {
+            count: stats.count as u32,
+            dims: stats.dims as u32,
+            index_type,
+            metric: stats.metric.to_snapshot_byte(),
+            dtype: stats.dtype.to_snapshot_byte(),
+            built: u8::from(stats.built),
+            nprobe: stats.nprobe as u32,
+            num_clusters: stats.num_clusters as u32,
+            reserved: 0,
+        };
+    }
+    0
+}
+
+/// 所有集合的堆内存估算（字节）。db 为 NULL 返回 0。
+/// EN: Estimated heap usage across all collections in bytes; 0 for a NULL db.
+#[no_mangle]
+pub extern "C" fn houyi_mobile_db_memory_usage(db_handle: *mut db::MobileDB) -> usize {
+    if db_handle.is_null() {
+        return 0;
+    }
+    let db = unsafe { &*db_handle };
+    db.memory_usage()
+}
+
+/// 批量检索：一次调用处理 nq 条查询（相册一次匹配多张脸）。
+///
+/// `results` 按行存放：第 i 条查询占 `results[i*max_results_per_query ..]`，
+/// `counts[i]` 写入该查询实际命中数（≤ max_results_per_query）。
+/// 返回 0 成功、-1 参数非法/集合缺失/维度不符。
+/// EN: Batch search handling nq queries in one call (matching several faces at
+/// once). `results` is row-major: query i owns
+/// `results[i*max_results_per_query ..]`; `counts[i]` receives its hit count
+/// (≤ max_results_per_query). Returns 0 on success and -1 for bad arguments, a
+/// missing collection, or a dimension mismatch.
+#[no_mangle]
+pub extern "C" fn houyi_mobile_db_search_batch_u64(
+    db_handle: *mut db::MobileDB,
+    coll_name: *const std::ffi::c_char,
+    queries: *const f32,
+    dims: u32,
+    nq: u32,
+    k: u32,
+    results: *mut HouyiMobileResult,
+    max_results_per_query: u32,
+    counts: *mut u32,
+) -> i32 {
+    if db_handle.is_null()
+        || coll_name.is_null()
+        || (nq > 0 && (queries.is_null() || results.is_null() || counts.is_null()))
+    {
+        return -1;
+    }
+    let db = unsafe { &*db_handle };
+    let c_name = unsafe { std::ffi::CStr::from_ptr(coll_name) };
+    let name = match c_name.to_str() {
+        Ok(value) => value,
+        Err(_) => return -1,
+    };
+    if nq == 0 {
+        return 0;
+    }
+    let query_slice = unsafe { std::slice::from_raw_parts(queries, nq as usize * dims as usize) };
+    let found = match db.search_batch(name, query_slice, dims as usize, nq as usize, k as usize) {
+        Ok(value) => value,
+        Err(_) => return -1,
+    };
+    let stride = max_results_per_query as usize;
+    for (i, hits) in found.iter().enumerate() {
+        let n = hits.len().min(stride).min(k as usize);
+        let base = i * stride;
+        unsafe {
+            let row = std::slice::from_raw_parts_mut(results.add(base), n);
+            for (slot, (id, score)) in row.iter_mut().zip(hits.iter().take(n)) {
+                *slot = HouyiMobileResult {
+                    id: *id,
+                    score: *score,
+                };
+            }
+            *counts.add(i) = n as u32;
+        }
+    }
+    0
+}
+
+/// 初始化检索线程数（1..=256）。必须在首次检索/建图前调用：rayon 全局池
+/// 只能初始化一次，池已存在时返回 -1（此时保持默认线程数）。
+///
+/// 真机实测（128d×100k，Kirin 9010）：2 线程明显变慢；4/6/8 线程的查询
+/// 中位数差异约 10–15%，6 线程略优但随温度波动，建图则以 8 线程最快。
+/// 建议：批量建图用默认，交互检索可在启动时按机型实测选定。
+/// EN: Initialize the search thread count (1..=256). Must be called before the
+/// first search/build: the rayon global pool can only be initialized once, so
+/// this returns -1 when a pool already exists (the default count stays).
+///
+/// On-device (128d×100k, Kirin 9010): 2 threads are clearly slower; 4/6/8
+/// differ by ~10–15% at the median, 6 slightly best but temperature-sensitive,
+/// while builds are fastest with 8. Build with the default and pick the
+/// interactive count per device.
+#[no_mangle]
+pub extern "C" fn houyi_mobile_set_threads(threads: u32) -> i32 {
+    if threads == 0 || threads > 256 {
+        return -1;
+    }
+    match rayon::ThreadPoolBuilder::new()
+        .num_threads(threads as usize)
+        .build_global()
+    {
+        Ok(()) => 0,
+        Err(_) => -1,
+    }
+}
+
 /// 设置检索选项：候选预算（per_k）、路由簇数（nprobe）、ef_search（仅
 /// clustered-hnsw）。任一参数为 0 表示该项保持不变。
 /// 返回 0 成功、-1 参数/集合缺失/越界。
@@ -1537,6 +1712,133 @@ mod tests {
         let from_v3 = db::MobileDB::decode(&v3).expect("v3 snapshot must load");
         assert_eq!(from_v3.count("ch").unwrap(), n);
         assert_eq!(from_v3.search("ch", q, 5).unwrap()[0].0, before[0].0);
+    }
+
+    /// 批量检索与诊断：批量结果必须与逐条检索一致；统计字段与内存估算合理。
+    /// EN: Batch search and diagnostics: batch results must match individual
+    /// searches; stats fields and the memory estimate must be sane.
+    #[test]
+    fn test_batch_search_and_stats() {
+        let dims = 8usize;
+        let db = db::MobileDB::new();
+        db.get_or_create_with_config(
+            "b",
+            dims,
+            "flat-clustered",
+            DistanceMetric::Cosine,
+            FlatStorageDtype::F16,
+        )
+        .unwrap();
+        for i in 0..32u64 {
+            let mut v = vec![0.0f32; dims];
+            v[(i as usize) % dims] = 1.0;
+            v[0] += (i as f32) * 0.01;
+            db.insert("b", i, &v).unwrap();
+        }
+        db.build("b").unwrap();
+
+        let q0: Vec<f32> = (0..dims).map(|d| if d == 0 { 1.0 } else { 0.0 }).collect();
+        let q1: Vec<f32> = (0..dims).map(|d| if d == 3 { 1.0 } else { 0.0 }).collect();
+        let mut flat = q0.clone();
+        flat.extend_from_slice(&q1);
+        let batch = db.search_batch("b", &flat, dims, 2, 5).unwrap();
+        assert_eq!(batch.len(), 2);
+        for (i, q) in [&q0, &q1].iter().enumerate() {
+            let single = db.search("b", q, 5).unwrap();
+            assert_eq!(batch[i].len(), single.len());
+            for (a, b) in batch[i].iter().zip(&single) {
+                assert_eq!(a.0, b.0, "id mismatch in batch row {i}");
+                assert_eq!(a.1, b.1);
+            }
+        }
+        // 维度/形状错误必须拒绝。
+        // EN: Wrong dimensions/shapes must be rejected.
+        assert!(db.search_batch("b", &flat, dims + 1, 2, 5).is_err());
+        assert!(db.search_batch("b", &flat, dims, 3, 5).is_err());
+
+        let stats = db.stats("b").unwrap();
+        assert_eq!(stats.count, 32);
+        assert_eq!(stats.dims, dims);
+        assert_eq!(stats.index_type, "flat-clustered");
+        assert!(stats.built);
+        assert!(stats.nprobe > 0 && stats.num_clusters > 0);
+        assert!(stats.estimated_bytes > 0);
+        assert!(db.memory_usage() >= stats.estimated_bytes);
+
+        // C ABI：批量与诊断。
+        // EN: C ABI: batch and diagnostics.
+        let abi = houyi_mobile_db_open();
+        let name = CString::new("abi-b").unwrap();
+        let ty = CString::new("flat-clustered").unwrap();
+        assert_eq!(
+            houyi_mobile_db_collection_v2(abi, name.as_ptr(), dims as u32, ty.as_ptr(), 1, 1),
+            0
+        );
+        for i in 0..16u64 {
+            let mut v = vec![0.0f32; dims];
+            v[(i as usize) % dims] = 1.0;
+            assert_eq!(
+                houyi_mobile_db_insert(abi, name.as_ptr(), i, v.as_ptr(), dims as u32),
+                0
+            );
+        }
+        assert!(houyi_mobile_db_build(abi, name.as_ptr()) > 0);
+        let mut stats_out = std::mem::MaybeUninit::<HouyiMobileCollectionStats>::uninit();
+        assert_eq!(
+            houyi_mobile_db_collection_stats(abi, name.as_ptr(), stats_out.as_mut_ptr()),
+            0
+        );
+        let stats_out = unsafe { stats_out.assume_init() };
+        assert_eq!(stats_out.count, 16);
+        assert_eq!(stats_out.dims, dims as u32);
+        assert_eq!(stats_out.index_type, 1);
+        assert_eq!(stats_out.dtype, 1);
+        assert_eq!(stats_out.built, 1);
+        assert!(houyi_mobile_db_memory_usage(abi) > 0);
+        assert_eq!(
+            houyi_mobile_db_collection_stats(std::ptr::null_mut(), name.as_ptr(), stats_out_ptr(),),
+            -1
+        );
+
+        let queries = [
+            1.0f32, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+        ];
+        let mut results = vec![HouyiMobileResult { id: 0, score: 0.0 }; 2 * 4];
+        let mut counts = [0u32; 2];
+        assert_eq!(
+            houyi_mobile_db_search_batch_u64(
+                abi,
+                name.as_ptr(),
+                queries.as_ptr(),
+                dims as u32,
+                2,
+                4,
+                results.as_mut_ptr(),
+                4,
+                counts.as_mut_ptr(),
+            ),
+            0
+        );
+        assert!(counts[0] > 0 && counts[1] > 0);
+        assert_eq!(
+            houyi_mobile_db_search_batch_u64(
+                abi,
+                name.as_ptr(),
+                queries.as_ptr(),
+                dims as u32 + 1,
+                2,
+                4,
+                results.as_mut_ptr(),
+                4,
+                counts.as_mut_ptr(),
+            ),
+            -1
+        );
+        houyi_mobile_db_close(abi);
+    }
+
+    fn stats_out_ptr() -> *mut HouyiMobileCollectionStats {
+        std::ptr::null_mut()
     }
 
     /// 检索预设与 nprobe 覆盖：构建期 nprobe=1 时随机查询召回很低，

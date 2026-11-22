@@ -19,6 +19,10 @@ simd-neon = ["houyi-vector/simd-neon"]
 houyi-vector = { path = "../houyi-vector", version = "0.2.0-beta.9", default-features = false, features = ["portable", "simd-neon"] }
 houyi-core = { path = "../houyi-core", version = "0.2.0-beta.9", default-features = false, features = ["portable"] }
 ahash = "0.8"
+# 线程数配置（houyi_mobile_set_threads）；与 houyi-vector 共用同一 rayon 版本。
+# EN: Thread-count configuration (houyi_mobile_set_threads), sharing the same
+# rayon version as houyi-vector.
+rayon.workspace = true
 crc32fast.workspace = true
 serde_json.workspace = true
 

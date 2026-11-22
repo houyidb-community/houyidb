@@ -101,6 +101,44 @@ uint32_t houyi_mobile_db_search_hybrid_u64(void* db, const char* name, const flo
                                            const char* filters_json,
                                            HouyiMobileResult* results,
                                            uint32_t max_results);
+// 初始化检索线程数（1..=256）。须在首次检索/建图前调用：rayon 全局池只能
+// 初始化一次，池已存在返回 -1（保持默认线程数）。
+// EN: Initialize the search thread count (1..=256). Must be called before the
+// first search/build: the rayon global pool can be initialized only once, so
+// -1 is returned when a pool already exists (default count stays).
+int32_t houyi_mobile_set_threads(uint32_t threads);
+// 集合诊断（C 布局）。built：flat 恒 0；nprobe/num_clusters：未建图或 flat 为 0。
+// EN: Collection diagnostics (C layout). `built` is always 0 for flat;
+// nprobe/num_clusters are 0 when unbuilt or flat.
+typedef struct {
+    uint32_t count;
+    uint32_t dims;
+    uint8_t index_type; // 0=flat 1=flat-clustered 2=clustered-hnsw
+    uint8_t metric;     // 同 create_v2
+    uint8_t dtype;      // 0=f32 1=f16 2=i8
+    uint8_t built;
+    uint32_t nprobe;
+    uint32_t num_clusters;
+    uint32_t reserved;
+} HouyiMobileCollectionStats;
+// 填充诊断；0 成功、-1 参数非法/集合缺失。
+// EN: Fill diagnostics; 0 on success, -1 for bad arguments/missing collection.
+int32_t houyi_mobile_db_collection_stats(void* db, const char* name,
+                                         HouyiMobileCollectionStats* out);
+// 全库堆内存估算（字节）；db 为 NULL 返回 0。
+// EN: Estimated heap usage across collections in bytes; 0 for a NULL db.
+size_t houyi_mobile_db_memory_usage(void* db);
+// 批量检索：results 按行存放，第 i 条查询占 results[i*max_results_per_query..]，
+// counts[i] 写实际命中数（≤ max_results_per_query 且 ≤ k）。
+// 返回 0 成功、-1 参数非法/集合缺失/维度不符。
+// EN: Batch search: row-major results, query i owns
+// results[i*max_results_per_query..]; counts[i] gets its hit count (≤
+// max_results_per_query and ≤ k). Returns 0 on success, -1 for bad arguments,
+// a missing collection, or a dimension mismatch.
+int32_t houyi_mobile_db_search_batch_u64(void* db, const char* name, const float* queries,
+                                         uint32_t dims, uint32_t nq, uint32_t k,
+                                         HouyiMobileResult* results,
+                                         uint32_t max_results_per_query, uint32_t* counts);
 // 检索选项：per_k 候选预算、nprobe 路由簇数、ef_search（仅 clustered-hnsw）。
 // 任一参数传 0 表示该项保持不变；越界/集合缺失返回 -1，成功返回 0。
 // nprobe 建图后夹取到簇数；提高只会多扫描（所有簇都保存了自己的数据）。

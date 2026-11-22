@@ -994,6 +994,7 @@ dependencies = [
  "houyi-core",
  "houyi-vector",
  "rand 0.8.8",
+ "rayon",
  "serde_json",
 ]
 

@@ -8,7 +8,7 @@
 //!   db.build("photos")?;
 //!   let results = db.search("photos", &query, 10)?;
 
-use crate::backend::{Backend, BackendSnapshot, ERR_INVALID};
+use crate::backend::{self as base, Backend, BackendSnapshot, ERR_INVALID};
 use crate::filter::{parse_scalar, FilterOp, ScalarStore, ScalarStoreSnapshot, ScalarVal};
 use houyi_vector::cluster::FlatStorageDtype;
 use houyi_vector::DistanceMetric;
@@ -297,6 +297,65 @@ impl MobileDB {
             .ok_or_else(|| format!("collection '{coll_name}' not found"))?;
         let result = col.backend.lock().unwrap().set_search_target(per_k);
         result
+    }
+
+    /// 批量检索：一次加锁处理多条查询（相册一次匹配多张脸）。
+    /// 返回与查询等长的结果向量；任一查询维度不符返回 Err。
+    /// EN: Batch search: one lock for many queries (matching several faces at
+    /// once in an album). Returns one result list per query; a dimension
+    /// mismatch on any query returns Err.
+    pub fn search_batch(
+        &self,
+        coll_name: &str,
+        queries: &[f32],
+        dims: usize,
+        nq: usize,
+        k: usize,
+    ) -> Result<Vec<Vec<(u64, f32)>>, String> {
+        let col = self
+            .get(coll_name)
+            .ok_or_else(|| format!("collection '{coll_name}' not found"))?;
+        if dims != col.dims {
+            return Err(format!("{ERR_INVALID}dim mismatch: {dims} vs {}", col.dims));
+        }
+        let expected = nq
+            .checked_mul(dims)
+            .ok_or_else(|| format!("{ERR_INVALID}batch size overflow"))?;
+        if queries.len() != expected {
+            return Err(format!(
+                "{ERR_INVALID}batch queries have {} values, expected {expected}",
+                queries.len()
+            ));
+        }
+        let guard = col.backend.lock().unwrap();
+        let mut out = Vec::with_capacity(nq);
+        for i in 0..nq {
+            out.push(guard.search(&queries[i * dims..(i + 1) * dims], k));
+        }
+        Ok(out)
+    }
+
+    /// 每集合诊断信息。
+    /// EN: Per-collection diagnostics.
+    pub fn stats(&self, coll_name: &str) -> Result<base::BackendStats, String> {
+        let col = self
+            .get(coll_name)
+            .ok_or_else(|| format!("collection '{coll_name}' not found"))?;
+        let stats = col.backend.lock().unwrap().stats();
+        Ok(stats)
+    }
+
+    /// 所有集合的堆内存估算（向量 + 范数缓存 + 质心 + 图边表近似）。
+    /// EN: Estimated heap usage across all collections (vectors, norm cache,
+    /// centroids, and approximate graph edges).
+    pub fn memory_usage(&self) -> usize {
+        let cols: Vec<_> = {
+            let guard = self.collections.lock().unwrap();
+            guard.values().cloned().collect()
+        };
+        cols.iter()
+            .map(|col| col.backend.lock().unwrap().stats().estimated_bytes)
+            .sum()
     }
 
     /// 设置检索选项（0 = 该项保持不变）：候选预算、路由簇数、ef_search。

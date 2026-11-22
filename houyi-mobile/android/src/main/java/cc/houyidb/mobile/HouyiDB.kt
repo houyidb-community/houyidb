@@ -26,6 +26,19 @@ object HouyiDB {
 
     data class SearchHit(val id: Long, val score: Float)
 
+    /** 集合诊断信息（由 native 填写，estimatedBytes 为堆内存粗估）。 */
+    data class CollectionStats(
+        val count: Int,
+        val dims: Int,
+        val indexType: String,
+        val metric: Metric,
+        val dtype: Dtype,
+        val built: Boolean,
+        val nprobe: Int,
+        val numClusters: Int,
+        val estimatedBytes: Long,
+    )
+
     @JvmStatic external fun nativeOpen(): Long
     @JvmStatic external fun nativeClose(handle: Long)
     @JvmStatic external fun nativeCreateCollectionLegacy(
@@ -53,6 +66,15 @@ object HouyiDB {
     ): Int
     @JvmStatic external fun nativeSetBuildNprobe(
         handle: Long, name: String, nprobe: Int
+    ): Int
+    @JvmStatic external fun nativeSetThreads(threads: Int): Int
+    @JvmStatic external fun nativeCollectionStats(
+        handle: Long, name: String, out: LongArray
+    ): Int
+    @JvmStatic external fun nativeMemoryUsage(handle: Long): Long
+    @JvmStatic external fun nativeSearchBatch(
+        handle: Long, name: String, queries: FloatArray, nq: Int, dims: Int, k: Int,
+        outIds: LongArray, outScores: FloatArray, outCounts: IntArray
     ): Int
     @JvmStatic external fun nativeInsertScalarsWithId(
         handle: Long, name: String, id: Long, tagsJson: String
@@ -182,6 +204,76 @@ object HouyiDB {
     fun setBuildNprobe(handle: Long, name: String, nprobe: Int) {
         require(nprobe >= 0) { "nprobe must be >= 0" }
         check(nativeSetBuildNprobe(handle, name, nprobe))
+    }
+
+    /**
+     * 集合诊断：数量/维度/索引类型/度量/dtype/是否建图/nprobe/簇数/内存估算。
+     * EN: Collection diagnostics: count/dims/index type/metric/dtype/built/
+     * nprobe/cluster count/memory estimate.
+     */
+    fun collectionStats(handle: Long, name: String): CollectionStats {
+        val out = LongArray(9)
+        check(nativeCollectionStats(handle, name, out))
+        val indexType = when (out[2].toInt()) {
+            0 -> "flat"
+            1 -> "flat-clustered"
+            else -> "clustered-hnsw"
+        }
+        return CollectionStats(
+            count = out[0].toInt(),
+            dims = out[1].toInt(),
+            indexType = indexType,
+            metric = Metric.entries.firstOrNull { it.code == out[3].toInt() } ?: Metric.COSINE,
+            dtype = Dtype.entries.firstOrNull { it.code == out[4].toInt() } ?: Dtype.F32,
+            built = out[5] != 0L,
+            nprobe = out[6].toInt(),
+            numClusters = out[7].toInt(),
+            estimatedBytes = out[8],
+        )
+    }
+
+    /**
+     * 初始化检索线程数（须在首次检索/建图前调用；全局线程池只能设置一次）。
+     * 真机 128d×100k：2 线程明显慢，4/6/8 查询差 10–15%，建图 8 最快。
+     * EN: Initialize the search thread count (before the first search/build;
+     * the global pool can only be set once). On-device 128d×100k: 2 threads are
+     * clearly slower, 4/6/8 differ by 10–15% on queries, builds are fastest
+     * with 8.
+     */
+    fun setThreads(threads: Int) {
+        require(threads in 1..256) { "threads must be 1..256" }
+        check(nativeSetThreads(threads))
+    }
+
+    /** 全库堆内存估算（字节）。 */
+    fun memoryUsage(handle: Long): Long = nativeMemoryUsage(handle)
+
+    /**
+     * 批量检索：一次调用处理 nq 条查询（每条 dims 个 float），返回与查询
+     * 对齐的结果列表。适合相册一次匹配多张脸。
+     * EN: Batch search over nq queries (dims floats each), returning one list
+     * per query; suited to matching several album faces at once.
+     */
+    fun searchBatch(
+        handle: Long,
+        name: String,
+        queries: FloatArray,
+        nq: Int,
+        dims: Int,
+        k: Int,
+    ): List<List<SearchHit>> {
+        require(nq >= 0 && dims > 0 && k >= 0) { "invalid batch arguments" }
+        require(queries.size == nq * dims) { "queries must be nq*dims" }
+        val ids = LongArray(nq * k)
+        val scores = FloatArray(nq * k)
+        val counts = IntArray(nq)
+        check(nativeSearchBatch(handle, name, queries, nq, dims, k, ids, scores, counts))
+        return (0 until nq).map { i ->
+            (0 until counts[i]).map { j ->
+                val idx = i * k + j
+                SearchHit(ids[idx], scores[idx])
+            }
+        }
     }
 
     fun build(handle: Long, name: String): Int {

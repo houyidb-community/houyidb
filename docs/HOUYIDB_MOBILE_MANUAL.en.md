@@ -225,7 +225,38 @@ HouyiDB.setSearchOptions(db, "faces", perK = 0, nprobe = 32, efSearch = 0)
 HouyiDB.setBuildNprobe(db, "faces", 32)   // applies to the next build
 ```
 
-### 2.10 Original search-budget notes (flat-clustered cosine)
+### 2.10 Batch search and diagnostics
+
+```c
+int32_t houyi_mobile_db_search_batch_u64(void* db, const char* name,
+                                         const float* queries, uint32_t dims,
+                                         uint32_t nq, uint32_t k,
+                                         HouyiMobileResult* results,
+                                         uint32_t max_results_per_query, uint32_t* counts);
+int32_t houyi_mobile_db_collection_stats(void* db, const char* name,
+                                         HouyiMobileCollectionStats* out);
+size_t  houyi_mobile_db_memory_usage(void* db);
+```
+
+- `search_batch_u64`: handles `nq` queries in one call with row-major results
+  (query i owns `results[i*max_results_per_query..]`); `counts[i]` gets its hit
+  count. One lock acquisition, suited to matching several album faces at once.
+  Returns 0 on success, -1 for bad arguments/collection/dimensions.
+- `collection_stats`: `count/dims/index_type/metric/dtype/built/nprobe/
+  num_clusters`; together with `memory_usage` the app can choose f16/i8 and a
+  preset.
+- Kotlin: `searchBatch(...): List<List<SearchHit>>`, `collectionStats(...)`
+  (`CollectionStats`), `memoryUsage(handle)`.
+- The batch still runs queries one by one (each query is already parallel across
+  clusters); its win is fewer JNI calls and lock acquisitions, with unchanged
+  per-query latency and recall.
+- Threads: `houyi_mobile_set_threads(n)` / Kotlin `setThreads(n)`, called before
+  the first search/build (the global pool can be initialized once). On-device
+  128d×100k: 2 threads are clearly slower; 4/6/8 differ by ~10–15% on query
+  medians and builds are fastest with 8; keep the default for builds and pick
+  the interactive count per device.
+
+### 2.11 Original search-budget notes (flat-clustered cosine)
 
 ```c
 int32_t houyi_mobile_set_search_target(void* handle, uint32_t per_k);

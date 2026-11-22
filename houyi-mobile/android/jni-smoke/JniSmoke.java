@@ -33,6 +33,22 @@ public class JniSmoke {
         if (again.size() != 1 || again.get(0).getId() != 42L) throw new AssertionError("loaded search");
         List<HouyiDB.SearchHit> bigAfter = api.search(loaded, "faces", new float[]{1f, 0f, 0f, 0f}, 1);
         if (bigAfter.size() != 1 || bigAfter.get(0).getId() != big) throw new AssertionError("u64 id lost after load");
+        // 批量检索与诊断。
+        // EN: Batch search and diagnostics.
+        List<List<HouyiDB.SearchHit>> batch = api.searchBatch(
+                db, "faces", new float[]{1f, 0f, 0f, 0f, 0f, 1f, 0f, 0f}, 2, 4, 1);
+        if (batch.size() != 2 || batch.get(0).isEmpty() || batch.get(1).isEmpty()) {
+            throw new AssertionError("searchBatch rows");
+        }
+        if (batch.get(0).get(0).getId() != big || batch.get(1).get(0).getId() != 42L) {
+            throw new AssertionError("searchBatch ordering");
+        }
+        HouyiDB.CollectionStats stats = api.collectionStats(db, "faces");
+        if (stats.getCount() != 2 || !stats.getBuilt() || stats.getNprobe() <= 0) {
+            throw new AssertionError("collectionStats: " + stats);
+        }
+        if (api.memoryUsage(db) <= 0) throw new AssertionError("memoryUsage");
+
         // 检索选项与预设：0 表示不变；high_recall 仍要返回正确结果。
         // EN: Search options and presets: 0 means unchanged; high_recall must
         // still return the correct hit.

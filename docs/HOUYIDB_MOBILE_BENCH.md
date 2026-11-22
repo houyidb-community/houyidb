@@ -39,6 +39,27 @@ nprobe 扫描（512d×50k，f16，同一构建态，运行期 `set_search_option
 | 196 | 5.69 ms | 0.9810 |
 | 224（全部簇） | 6.53 ms | 0.9990 |
 
+## 满电确认（100%、31 °C、后台已停）
+
+- 512d×50k（3 轮中位数）：f16 balanced 3108 µs / 0.857，f16 high_recall
+  6270 µs / **0.999**；i8 balanced 2146 µs / 0.856，i8 high_recall
+  3885 µs / **0.986**。
+- clustered-hnsw 128d×100k 冷加载：237.0 / 240.3 / 239.5 ms（中位数 239 ms），
+  recall 0.9350。
+
+## 线程数扫描（128d×100k，RAYON_NUM_THREADS，各 3 次）
+
+| 线程 | f16 p50 中位数 | i8 p50 中位数 | 建图 |
+|---:|---:|---:|---:|
+| 2 | 3497 µs | 1659 µs | 11.4–12.5 s |
+| 4 | 1667 µs | 1068 µs | 6.3–7.1 s |
+| 6 | **1332 µs** | 1114 µs | 6.0–7.3 s |
+| 8（默认） | 1530 µs | 1198 µs | 5.3–5.9 s |
+
+结论：2 线程明显不可用；4/6/8 查询差异约 10–15%，且受温度影响（同一配置
+跨轮波动可达 40%），**没有稳定赢家**。建图始终是 8 线程最快，因此库默认保持
+不干预；App 可在启动时用 `houyi_mobile_set_threads` 按机型实测选定。
+
 ## 改动结论
 
 ### 有效
@@ -50,6 +71,14 @@ nprobe 扫描（512d×50k，f16，同一构建态，运行期 `set_search_option
   默认档与历史基线一致；nprobe 显式覆盖不再被候选预算静默压回。
 - **P1.5 clustered-hnsw 构建态快照**：128d×100k 冷加载 **10.6 s → 243 ms**，
   recall 不变；代价是快照 50.8 → 77.4 MB（含边界复制与图链接）。
+
+### P2 新增（API，无延迟变化）
+
+- 批量检索 `houyi_mobile_db_search_batch_u64` / Kotlin `searchBatch`：一次加锁
+  处理多条查询，单查询延迟与召回不变。
+- 诊断 `houyi_mobile_db_collection_stats` / `houyi_mobile_db_memory_usage` /
+  Kotlin `collectionStats` / `memoryUsage`。
+- 线程数 `houyi_mobile_set_threads` / Kotlin `setThreads`（见上表）。
 
 ### 无效（已回退，不保留）
 

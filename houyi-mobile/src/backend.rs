@@ -155,6 +155,20 @@ pub(crate) enum BackendSnapshot {
     ClusteredHnswBuilt(Vec<u8>),
 }
 
+/// 后端诊断快照（FFI 结构体的内部形式）。
+/// EN: Backend diagnostics snapshot (internal form of the FFI struct).
+pub struct BackendStats {
+    pub count: usize,
+    pub dims: usize,
+    pub index_type: &'static str,
+    pub metric: DistanceMetric,
+    pub dtype: FlatStorageDtype,
+    pub built: bool,
+    pub nprobe: usize,
+    pub num_clusters: usize,
+    pub estimated_bytes: usize,
+}
+
 impl Backend {
     /// 旧构造：保持历史默认（flat=L2/f32、flat-clustered=Cosine/f16、
     /// clustered-hnsw=Cosine/f32）。
@@ -596,6 +610,79 @@ impl Backend {
                     found
                 }
             },
+        }
+    }
+
+    /// 每集合诊断：索引类型/度量/dtype、是否已建图、nprobe 与簇数、内存估算。
+    /// EN: Per-collection diagnostics: index type/metric/dtype, built flag,
+    /// nprobe and cluster count, plus a memory estimate.
+    pub(crate) fn stats(&self) -> BackendStats {
+        let (index_type, built, nprobe, num_clusters, base_bytes) = match &self.kind {
+            BackendKind::Flat(store) => (
+                "flat",
+                false,
+                0,
+                0,
+                store.len() * self.dims * std::mem::size_of::<f32>(),
+            ),
+            BackendKind::FlatClustered(state) => match state {
+                LazyIndex::Pending(store) => (
+                    "flat-clustered",
+                    false,
+                    0,
+                    0,
+                    store.len() * self.dims * std::mem::size_of::<f32>(),
+                ),
+                LazyIndex::Built { index, .. } => {
+                    let per_dim = match self.dtype {
+                        FlatStorageDtype::F32 => 4,
+                        FlatStorageDtype::F16 => 2,
+                        // 非穷尽枚举：未来新增编码按 i8 保守下界估算。
+                        // EN: Non-exhaustive enum: future encodings fall back to
+                        // the conservative i8 lower bound.
+                        _ => 1,
+                    };
+                    let vectors = index.total_vectors() * self.dims * per_dim;
+                    let extra = index.total_vectors() * 4 + index.num_clusters() * self.dims * 4;
+                    (
+                        "flat-clustered",
+                        true,
+                        index.nprobe(),
+                        index.num_clusters(),
+                        vectors + extra,
+                    )
+                }
+            },
+            BackendKind::ClusteredHnsw(state) => match state {
+                LazyIndex::Pending(store) => (
+                    "clustered-hnsw",
+                    false,
+                    0,
+                    0,
+                    store.len() * self.dims * std::mem::size_of::<f32>(),
+                ),
+                LazyIndex::Built { index, .. } => (
+                    "clustered-hnsw",
+                    true,
+                    index.nprobe(),
+                    index.num_clusters(),
+                    // 图侧每向量 f32 向量 + 链接（估算 12 B/维之外再加边表）。
+                    // EN: f32 vectors plus links (rough edge-table overhead).
+                    index.total_vectors() * self.dims * std::mem::size_of::<f32>()
+                        + index.total_vectors() * 64,
+                ),
+            },
+        };
+        BackendStats {
+            count: self.len(),
+            dims: self.dims,
+            index_type,
+            metric: self.metric,
+            dtype: self.dtype,
+            built,
+            nprobe,
+            num_clusters,
+            estimated_bytes: base_bytes,
         }
     }
 
