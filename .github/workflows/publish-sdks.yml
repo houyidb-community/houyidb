@@ -209,7 +209,7 @@ jobs:
             set -e
             printf '%s\n' "$out"
             if [ "$rc" -eq 0 ]; then return 0; fi
-            if printf '%s' "$out" | grep -q "already uploaded"; then
+            if printf '%s' "$out" | grep -qE "already (uploaded|exists)"; then
               echo "$pkg is already published; continuing"
               return 0
             fi
