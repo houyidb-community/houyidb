@@ -50,6 +50,10 @@ HouyiDB.build(db, "faces")
 val hits = HouyiDB.search(db, "faces", floatArrayOf(1f, 0f, 0f, 0f), 10) // SearchHit(id: Long, score: Float)
 HouyiDB.save(db, "/data/.../houyi.snap")
 val restored = HouyiDB.load("/data/.../houyi.snap")
+// 低启动延迟/低内存：mmap + 按簇惰性解码（不校验整文件 CRC，勿原地改写文件）。
+// EN: Low startup latency/memory: mmap + per-cluster lazy decode (skips the
+// whole-file CRC; do not overwrite the file in place).
+val viewed = HouyiDB.loadView("/data/.../houyi.snap")
 
 // 内存快照：不落明文临时文件，交给 Vault 加密后再持久化。
 // EN: In-memory snapshot: no plaintext temp file; let a Vault encrypt it.
@@ -64,6 +68,10 @@ HouyiDB.close(db)
 - `saveBytes` / `loadBytes` 与文件 API 共用同一格式与校验（magic/版本/
   长度/CRC32）；坏字节会抛 `IllegalStateException`。C 侧对应
   `houyi_mobile_db_save_buffer` / `houyi_mobile_db_load_buffer`。
+- `loadView(path)` 使用只读 mmap，加载只解析元数据，flat-clustered 的簇向量在
+  首次检索命中时解码；不计算整文件 CRC，使用期间不得原地截断/改写文件。C 侧
+  对应 `houyi_mobile_db_load_view`。真机 100k×128：f16 到首查 11.5 ms、
+  峰值 RSS 27 MB（普通加载 52.3 ms / 85.5 MB）。
 - 召回/延迟预设：`setSearchPreset(db, name, SearchPreset.HIGH_RECALL)`；
   也可用 `setSearchOptions(perK, nprobe, efSearch)` 逐项调参（0 = 不变），
   `setBuildNprobe` 控制下次 build 的 nprobe。真机数据见

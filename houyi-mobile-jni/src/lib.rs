@@ -618,6 +618,35 @@ pub extern "system" fn Java_cc_houyidb_mobile_HouyiDB_nativeLoad(
     }
 }
 
+/// view 模式加载：只读 mmap + 元数据解析，簇向量首次检索时按簇解码。
+/// 不校验整文件 CRC；使用期间不得原地截断/改写文件。
+/// EN: View-mode load: read-only mmap plus metadata parsing; cluster vectors
+/// decode per cluster on first search. Skips the whole-file CRC; the file must
+/// not be truncated or overwritten in place while in use.
+#[no_mangle]
+pub extern "system" fn Java_cc_houyidb_mobile_HouyiDB_nativeLoadView(
+    mut env: JNIEnv<'_>,
+    _this: JObject<'_>,
+    path: JString<'_>,
+) -> jlong {
+    clear_error();
+    let Ok(path) = string_arg(&mut env, &path) else {
+        set_error("invalid path");
+        return 0;
+    };
+    match MobileDB::load_view_from(&path) {
+        Ok(db) => {
+            let handle = Box::into_raw(Box::new(db)) as jlong;
+            register_handle(handle);
+            handle
+        }
+        Err(message) => {
+            set_error(message);
+            0
+        }
+    }
+}
+
 /// 把整个数据库编码成 Java byte[]（不落任何临时文件，供 Vault 加密后保存）。
 /// 失败返回 null 并写入 lastError。
 /// EN: Encode the whole database into a Java byte[] (no temp file, so the

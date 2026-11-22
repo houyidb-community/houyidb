@@ -13,6 +13,7 @@ use crate::VectorDtype;
 use half::f16;
 use half::slice::HalfFloatSliceExt;
 use rayon::prelude::*;
+use std::sync::{Arc, OnceLock};
 
 /// 默认候选预算（每 k）：k=10 时约 25k 候选，保持历史召回。
 /// EN: Default candidate budget per k: ~25k candidates at k=10, preserving
@@ -88,18 +89,116 @@ impl FlatStorageDtype {
     }
 }
 
+/// 只读快照字节来源：view 模式持有 mmap 等外部缓冲，按需解码簇载荷。
+/// EN: Read-only snapshot byte source: view mode keeps an external buffer such
+/// as a mmap and decodes cluster payloads on demand.
+pub trait SnapshotBytes: Send + Sync {
+    fn bytes(&self) -> &[u8];
+}
+
+/// 单簇惰性存储：只记录字节窗口，首次访问某簇时才解码并缓存。
+/// EN: Per-cluster lazy storage: records byte windows and decodes a cluster on
+/// first access, caching the result.
+struct LazyClusters<T> {
+    /// 整份快照字节（窗口相对其起点）。
+    /// EN: Whole snapshot bytes (windows are relative to its start).
+    source: Arc<dyn SnapshotBytes>,
+    /// 每簇 (起始偏移, 字节数)。
+    /// EN: Per-cluster (offset, byte length).
+    windows: Vec<(usize, usize)>,
+    /// 小端宿主为整块位拷贝，大端宿主做逐元素转换。
+    /// EN: Bulk bit copy on little-endian hosts, per-element conversion on
+    /// big-endian hosts.
+    decode: fn(&[u8]) -> Vec<T>,
+    decoded: Vec<OnceLock<Vec<T>>>,
+}
+
+/// 簇向量存储：构建与普通加载写满 Owned；view 加载为 Lazy。
+/// EN: Cluster vector storage: Owned for build/eager load, Lazy for view load.
+enum ClusterStorage<T> {
+    Owned(Vec<Vec<T>>),
+    Lazy(LazyClusters<T>),
+}
+
+impl<T: Copy> ClusterStorage<T> {
+    fn clusters(&self) -> usize {
+        match self {
+            ClusterStorage::Owned(v) => v.len(),
+            ClusterStorage::Lazy(l) => l.windows.len(),
+        }
+    }
+
+    fn cluster_len(&self, cluster: usize) -> usize {
+        match self {
+            ClusterStorage::Owned(v) => v[cluster].len(),
+            ClusterStorage::Lazy(l) => l.windows[cluster].1 / std::mem::size_of::<T>(),
+        }
+    }
+
+    /// 取某簇向量切片；Lazy 时首次访问解码并缓存。
+    /// EN: Get a cluster's vector slice; Lazy decodes and caches on first access.
+    fn cluster(&self, cluster: usize) -> &[T] {
+        match self {
+            ClusterStorage::Owned(v) => &v[cluster],
+            ClusterStorage::Lazy(l) => l.decoded[cluster].get_or_init(|| {
+                let (off, len) = l.windows[cluster];
+                (l.decode)(&l.source.bytes()[off..off + len])
+            }),
+        }
+    }
+
+    /// 把全部惰性簇解码成自有存储（写路径前置；已 Owned 时为空操作）。
+    /// EN: Decode every lazy cluster into owned storage (called before writes;
+    /// a no-op when already Owned).
+    fn make_owned(&mut self) {
+        let lazy = match std::mem::replace(self, ClusterStorage::Owned(Vec::new())) {
+            ClusterStorage::Owned(v) => {
+                *self = ClusterStorage::Owned(v);
+                return;
+            }
+            ClusterStorage::Lazy(l) => l,
+        };
+        let LazyClusters {
+            source,
+            windows,
+            decode,
+            decoded,
+        } = lazy;
+        let bytes = source.bytes();
+        let owned = decoded
+            .into_iter()
+            .enumerate()
+            .map(|(cluster, slot)| {
+                slot.into_inner().unwrap_or_else(|| {
+                    let (off, len) = windows[cluster];
+                    decode(&bytes[off..off + len])
+                })
+            })
+            .collect();
+        *self = ClusterStorage::Owned(owned);
+    }
+
+    fn owned_mut(&mut self) -> &mut Vec<Vec<T>> {
+        self.make_owned();
+        match self {
+            ClusterStorage::Owned(v) => v,
+            ClusterStorage::Lazy(_) => unreachable!("make_owned converts to Owned"),
+        }
+    }
+}
+
 /// 聚类内向量存储：f32 或 f16（移动端用 f16 减半内存；服务端默认仍走 f32）。
 /// EN: Per-cluster vector storage: f32 or f16 (mobile uses f16 to halve memory;
 /// the server default stays f32).
 enum ClusterVectors {
-    F32(Vec<Vec<f32>>),
-    F16(Vec<Vec<f16>>),
+    F32(ClusterStorage<f32>),
+    F16(ClusterStorage<f16>),
     /// i8 对称量化：codes 每维 1 B，scales 每向量 1 个 f32。
     /// EN: Symmetric i8 quantization: 1 B per dimension plus one f32 scale per
     /// vector.
     I8 {
-        codes: Vec<Vec<i8>>,
-        scales: Vec<Vec<f32>>,
+        codes: ClusterStorage<i8>,
+        scales: ClusterStorage<f32>,
     },
 }
 
@@ -131,17 +230,17 @@ fn quantize_i8(vector: &[f32]) -> (Vec<i8>, f32) {
 impl ClusterVectors {
     fn clusters(&self) -> usize {
         match self {
-            ClusterVectors::F32(v) => v.len(),
-            ClusterVectors::F16(v) => v.len(),
-            ClusterVectors::I8 { codes, .. } => codes.len(),
+            ClusterVectors::F32(v) => v.clusters(),
+            ClusterVectors::F16(v) => v.clusters(),
+            ClusterVectors::I8 { codes, .. } => codes.clusters(),
         }
     }
 
     fn cluster_len(&self, cluster: usize) -> usize {
         match self {
-            ClusterVectors::F32(v) => v[cluster].len(),
-            ClusterVectors::F16(v) => v[cluster].len(),
-            ClusterVectors::I8 { codes, .. } => codes[cluster].len(),
+            ClusterVectors::F32(v) => v.cluster_len(cluster),
+            ClusterVectors::F16(v) => v.cluster_len(cluster),
+            ClusterVectors::I8 { codes, .. } => codes.cluster_len(cluster),
         }
     }
 
@@ -153,14 +252,29 @@ impl ClusterVectors {
         }
     }
 
+    /// 把全部惰性簇物化为自有存储（写路径前置）。
+    /// EN: Materialize every lazy cluster into owned storage (pre-write step).
+    fn make_owned(&mut self) {
+        match self {
+            ClusterVectors::F32(v) => v.make_owned(),
+            ClusterVectors::F16(v) => v.make_owned(),
+            ClusterVectors::I8 { codes, scales } => {
+                codes.make_owned();
+                scales.make_owned();
+            }
+        }
+    }
+
     fn push(&mut self, cluster: usize, vector: &[f32]) {
         match self {
-            ClusterVectors::F32(v) => v[cluster].extend_from_slice(vector),
-            ClusterVectors::F16(v) => v[cluster].extend(vector.iter().map(|&x| to_f16(x))),
+            ClusterVectors::F32(v) => v.owned_mut()[cluster].extend_from_slice(vector),
+            ClusterVectors::F16(v) => {
+                v.owned_mut()[cluster].extend(vector.iter().map(|&x| to_f16(x)))
+            }
             ClusterVectors::I8 { codes, scales } => {
                 let (q, scale) = quantize_i8(vector);
-                codes[cluster].extend(q);
-                scales[cluster].push(scale);
+                codes.owned_mut()[cluster].extend(q);
+                scales.owned_mut()[cluster].push(scale);
             }
         }
     }
@@ -169,12 +283,12 @@ impl ClusterVectors {
         match self {
             ClusterVectors::F32(v) => {
                 let start = slot * dims;
-                v[cluster][start..start + dims].copy_from_slice(vector);
+                v.owned_mut()[cluster][start..start + dims].copy_from_slice(vector);
             }
             ClusterVectors::F16(v) => {
                 debug_assert_eq!(vector.len(), dims);
                 let start = slot * dims;
-                let dst = &mut v[cluster][start..start + dims];
+                let dst = &mut v.owned_mut()[cluster][start..start + dims];
                 for (dst, &src) in dst.iter_mut().zip(vector) {
                     *dst = to_f16(src);
                 }
@@ -182,8 +296,8 @@ impl ClusterVectors {
             ClusterVectors::I8 { codes, scales } => {
                 let (q, scale) = quantize_i8(vector);
                 let start = slot * dims;
-                codes[cluster][start..start + dims].copy_from_slice(&q);
-                scales[cluster][slot] = scale;
+                codes.owned_mut()[cluster][start..start + dims].copy_from_slice(&q);
+                scales.owned_mut()[cluster][slot] = scale;
             }
         }
     }
@@ -194,26 +308,29 @@ impl ClusterVectors {
     fn remove_slot(&mut self, cluster: usize, slot: usize, dims: usize) {
         match self {
             ClusterVectors::F32(v) => {
-                let last = v[cluster].len() / dims - 1;
+                let rows = v.owned_mut();
+                let last = rows[cluster].len() / dims - 1;
                 let last_start = last * dims;
                 let start = slot * dims;
-                v[cluster].copy_within(last_start..last_start + dims, start);
-                v[cluster].truncate(last * dims);
+                rows[cluster].copy_within(last_start..last_start + dims, start);
+                rows[cluster].truncate(last * dims);
             }
             ClusterVectors::F16(v) => {
-                let last = v[cluster].len() / dims - 1;
+                let rows = v.owned_mut();
+                let last = rows[cluster].len() / dims - 1;
                 let last_start = last * dims;
                 let start = slot * dims;
-                v[cluster].copy_within(last_start..last_start + dims, start);
-                v[cluster].truncate(last * dims);
+                rows[cluster].copy_within(last_start..last_start + dims, start);
+                rows[cluster].truncate(last * dims);
             }
             ClusterVectors::I8 { codes, scales } => {
+                let codes = codes.owned_mut();
                 let last = codes[cluster].len() / dims - 1;
                 let last_start = last * dims;
                 let start = slot * dims;
                 codes[cluster].copy_within(last_start..last_start + dims, start);
                 codes[cluster].truncate(last * dims);
-                scales[cluster].swap_remove(slot);
+                scales.owned_mut()[cluster].swap_remove(slot);
             }
         }
     }
@@ -221,14 +338,14 @@ impl ClusterVectors {
     fn export_row(&self, cluster: usize, slot: usize, dims: usize) -> Vec<f32> {
         let start = slot * dims;
         match self {
-            ClusterVectors::F32(v) => v[cluster][start..start + dims].to_vec(),
-            ClusterVectors::F16(v) => v[cluster][start..start + dims]
+            ClusterVectors::F32(v) => v.cluster(cluster)[start..start + dims].to_vec(),
+            ClusterVectors::F16(v) => v.cluster(cluster)[start..start + dims]
                 .iter()
                 .map(|x| x.to_f32())
                 .collect(),
             ClusterVectors::I8 { codes, scales } => {
-                let scale = scales[cluster][slot];
-                codes[cluster][start..start + dims]
+                let scale = scales.cluster(cluster)[slot];
+                codes.cluster(cluster)[start..start + dims]
                     .iter()
                     .map(|&x| x as f32 * scale)
                     .collect()
@@ -243,11 +360,11 @@ impl ClusterVectors {
         let start = slot * dims;
         match self {
             ClusterVectors::F32(v) => {
-                let row = &v[cluster][start..start + dims];
+                let row = &v.cluster(cluster)[start..start + dims];
                 row.iter().map(|x| x * x).sum()
             }
             ClusterVectors::F16(v) => {
-                let row = &v[cluster][start..start + dims];
+                let row = &v.cluster(cluster)[start..start + dims];
                 row.iter()
                     .map(|x| {
                         let x = x.to_f32();
@@ -256,8 +373,8 @@ impl ClusterVectors {
                     .sum()
             }
             ClusterVectors::I8 { codes, scales } => {
-                let scale = scales[cluster][slot];
-                let ss: i32 = codes[cluster][start..start + dims]
+                let scale = scales.cluster(cluster)[slot];
+                let ss: i32 = codes.cluster(cluster)[start..start + dims]
                     .iter()
                     .map(|&x| (x as i32) * (x as i32))
                     .sum();
@@ -335,7 +452,21 @@ unsafe fn dot_i8_scaled_neon(query: &[f32], codes: &[i8], scale: f32, n: usize) 
 /// only for the f16/i8 cosine paths, leaving the server default f32 path
 /// untouched.
 struct CosineNormCache {
-    inv_vec_norms: Vec<Vec<f32>>,
+    /// 每簇一个 OnceLock：普通加载在 build 时填满，view 加载在首查该簇时计算。
+    /// EN: One OnceLock per cluster: eager loads fill them in `build`, view loads
+    /// compute a cluster's entry on its first access.
+    inv_vec_norms: Vec<OnceLock<Vec<f32>>>,
+}
+
+/// 单簇候选范数（未初始化时按需计算）。
+/// EN: Per-cluster candidate norms (computed on demand when uninitialized).
+fn cluster_inv_norms(vecs: &ClusterVectors, cluster: usize, dims: usize) -> Vec<f32> {
+    let count = vecs.cluster_len(cluster) / dims;
+    let mut inv = Vec::with_capacity(count);
+    for slot in 0..count {
+        inv.push(inv_norm_from_norm2(vecs.norm2(cluster, slot, dims)));
+    }
+    inv
 }
 
 impl CosineNormCache {
@@ -345,29 +476,51 @@ impl CosineNormCache {
         // full serial pass during load.
         let inv_vec_norms = (0..vecs.clusters())
             .into_par_iter()
-            .map(|cluster| {
-                let count = vecs.cluster_len(cluster) / dims;
-                let mut inv = Vec::with_capacity(count);
-                for slot in 0..count {
-                    let norm2 = vecs.norm2(cluster, slot, dims);
-                    inv.push(inv_norm_from_norm2(norm2));
-                }
-                inv
-            })
+            .map(|cluster| OnceLock::from(cluster_inv_norms(vecs, cluster, dims)))
             .collect();
         CosineNormCache { inv_vec_norms }
     }
 
+    /// view 加载：先建空槽，首查某簇时再计算。
+    /// EN: View load: create empty slots and compute on first access.
+    fn lazy(clusters: usize) -> Self {
+        let inv_vec_norms = (0..clusters).map(|_| OnceLock::new()).collect();
+        CosineNormCache { inv_vec_norms }
+    }
+
+    /// 取某簇范数；未初始化时计算（会连带解码该簇）。
+    /// EN: Get a cluster's norms, computing them (and decoding the cluster) on
+    /// first use.
+    fn get(&self, cluster: usize, vecs: &ClusterVectors, dims: usize) -> &[f32] {
+        self.inv_vec_norms[cluster].get_or_init(|| cluster_inv_norms(vecs, cluster, dims))
+    }
+
+    /// 写路径前置：把尚未初始化的簇范数全部补齐。
+    /// EN: Pre-write step: initialize every missing cluster's norms.
+    fn materialize(&mut self, vecs: &ClusterVectors, dims: usize) {
+        for (cluster, slot) in self.inv_vec_norms.iter().enumerate() {
+            slot.get_or_init(|| cluster_inv_norms(vecs, cluster, dims));
+        }
+    }
+
     fn set_norm2(&mut self, cluster: usize, slot: usize, norm2: f32) {
-        self.inv_vec_norms[cluster][slot] = inv_norm_from_norm2(norm2);
+        self.inv_vec_norms[cluster]
+            .get_mut()
+            .expect("norm cache materialized for write")[slot] = inv_norm_from_norm2(norm2);
     }
 
     fn push_norm2(&mut self, cluster: usize, norm2: f32) {
-        self.inv_vec_norms[cluster].push(inv_norm_from_norm2(norm2));
+        self.inv_vec_norms[cluster]
+            .get_mut()
+            .expect("norm cache materialized for write")
+            .push(inv_norm_from_norm2(norm2));
     }
 
     fn remove_slot(&mut self, cluster: usize, slot: usize) {
-        self.inv_vec_norms[cluster].swap_remove(slot);
+        self.inv_vec_norms[cluster]
+            .get_mut()
+            .expect("norm cache materialized for write")
+            .swap_remove(slot);
     }
 }
 
@@ -573,7 +726,7 @@ impl FlatClustered {
                     cluster_ids[cluster_id] = ids_list;
                     cluster_vecs[cluster_id] = vec_list;
                 }
-                ClusterVectors::F32(cluster_vecs)
+                ClusterVectors::F32(ClusterStorage::Owned(cluster_vecs))
             }
             FlatStorageDtype::F16 => {
                 let mut cluster_vecs: Vec<Vec<f16>> = (0..c).map(|_| Vec::new()).collect();
@@ -588,7 +741,7 @@ impl FlatClustered {
                     cluster_ids[cluster_id] = ids_list;
                     cluster_vecs[cluster_id] = vec_list;
                 }
-                ClusterVectors::F16(cluster_vecs)
+                ClusterVectors::F16(ClusterStorage::Owned(cluster_vecs))
             }
             FlatStorageDtype::I8 => {
                 let mut codes: Vec<Vec<i8>> = (0..c).map(|_| Vec::new()).collect();
@@ -608,7 +761,10 @@ impl FlatClustered {
                     codes[cluster_id] = code_list;
                     scales[cluster_id] = scale_list;
                 }
-                ClusterVectors::I8 { codes, scales }
+                ClusterVectors::I8 {
+                    codes: ClusterStorage::Owned(codes),
+                    scales: ClusterStorage::Owned(scales),
+                }
             }
         };
 
@@ -642,16 +798,38 @@ impl FlatClustered {
         index
     }
 
-    /// 重建余弦范数缓存（仅 f16 + cosine 启用）。构建、解码与增量写入后调用。
-    /// EN: Rebuild the cosine norm cache (f16 + cosine only). Called after a
-    /// build, a state decode, and incremental writes.
+    /// 重建余弦范数缓存（仅 f16/i8 + cosine 启用）。构建、解码与增量写入后调用。
+    /// `lazy=true` 用于 view 加载：先建空槽，首查某簇时再计算。
+    /// EN: Rebuild the cosine norm cache (f16/i8 + cosine only). Called after a
+    /// build, a state decode, and incremental writes. `lazy=true` is for view
+    /// loads: create empty slots and compute a cluster's norms on first use.
     fn rebuild_cosine_norms(&mut self) {
+        self.rebuild_cosine_norms_with(false);
+    }
+
+    /// 写路径前置：把 view 的惰性簇与范数一次性物化为自有存储。
+    /// 只有第一次写入付出解码成本，之后是空操作。
+    /// EN: Pre-write step: materialize lazily viewed clusters and norms into
+    /// owned storage. Only the first write pays the decode cost; later writes
+    /// are no-ops.
+    fn materialize_for_write(&mut self) {
+        self.cluster_vecs.make_owned();
+        if let Some(cache) = self.cosine_norms.as_mut() {
+            cache.materialize(&self.cluster_vecs, self.dims);
+        }
+    }
+
+    fn rebuild_cosine_norms_with(&mut self, lazy: bool) {
         self.cosine_norms = if self.metric == DistanceMetric::Cosine
             && matches!(
                 self.cluster_vecs.dtype(),
                 FlatStorageDtype::F16 | FlatStorageDtype::I8
             ) {
-            Some(CosineNormCache::build(&self.cluster_vecs, self.dims))
+            Some(if lazy {
+                CosineNormCache::lazy(self.cluster_vecs.clusters())
+            } else {
+                CosineNormCache::build(&self.cluster_vecs, self.dims)
+            })
         } else {
             None
         };
@@ -706,6 +884,10 @@ impl FlatClustered {
         if let Some(message) = &self.id_index_error {
             return Err(message.clone());
         }
+        // view 加载的惰性簇在首次写入时整体物化；之后为空操作。
+        // EN: Materialize lazily viewed clusters on the first write; later
+        // writes are no-ops.
+        self.materialize_for_write();
         let target = *router::route_query(vector, &self.centroids, self.dims, 1, self.metric)
             .first()
             .expect("route_query returns one cluster when num_clusters > 0");
@@ -915,7 +1097,7 @@ impl FlatClustered {
                 .par_iter()
                 .flat_map(|&cid| {
                     let ids = &self.cluster_ids[cid];
-                    let vecs = &vecs[cid];
+                    let vecs = vecs.cluster(cid);
                     let mut local: Vec<(u64, f32)> = Vec::with_capacity(ids.len());
                     for (i, &id) in ids.iter().enumerate() {
                         if allowed.is_some_and(|set| !set.contains(&id)) {
@@ -947,8 +1129,8 @@ impl FlatClustered {
                     .par_iter()
                     .flat_map(|&cid| {
                         let ids = &self.cluster_ids[cid];
-                        let vecs = &vecs[cid];
-                        let inv_norms = cache.map(|c| c.inv_vec_norms[cid].as_slice());
+                        let vecs = vecs.cluster(cid);
+                        let inv_norms = cache.map(|c| c.get(cid, &self.cluster_vecs, self.dims));
                         let mut scratch = vec![0f32; self.dims];
                         let mut local: Vec<(u64, f32)> = Vec::with_capacity(ids.len());
                         for (i, &id) in ids.iter().enumerate() {
@@ -987,9 +1169,9 @@ impl FlatClustered {
                     .par_iter()
                     .flat_map(|&cid| {
                         let ids = &self.cluster_ids[cid];
-                        let codes = &codes[cid];
-                        let scales = &scales[cid];
-                        let inv_norms = cache.map(|c| c.inv_vec_norms[cid].as_slice());
+                        let codes = codes.cluster(cid);
+                        let scales = scales.cluster(cid);
+                        let inv_norms = cache.map(|c| c.get(cid, &self.cluster_vecs, self.dims));
                         let mut scratch: Option<Vec<f32>> = None;
                         let mut local: Vec<(u64, f32)> = Vec::with_capacity(ids.len());
                         for (i, &id) in ids.iter().enumerate() {
@@ -1136,20 +1318,20 @@ impl FlatClustered {
             }
             match &self.cluster_vecs {
                 ClusterVectors::F32(v) => {
-                    for &x in &v[cluster] {
+                    for &x in v.cluster(cluster) {
                         out.extend_from_slice(&x.to_le_bytes());
                     }
                 }
                 ClusterVectors::F16(v) => {
-                    for x in &v[cluster] {
+                    for x in v.cluster(cluster) {
                         out.extend_from_slice(&x.to_bits().to_le_bytes());
                     }
                 }
                 ClusterVectors::I8 { codes, scales } => {
-                    for &x in &codes[cluster] {
+                    for &x in codes.cluster(cluster) {
                         out.push(x as u8);
                     }
-                    for &scale in &scales[cluster] {
+                    for &scale in scales.cluster(cluster) {
                         out.extend_from_slice(&scale.to_le_bytes());
                     }
                 }
@@ -1158,10 +1340,13 @@ impl FlatClustered {
         Ok(out)
     }
 
-    /// 解码构建态；任何长度/重复 id/尾随字节都拒绝（不 panic、不分配放大）。
-    /// EN: Decode a built state; reject length mismatches, duplicate ids, and
-    /// trailing bytes (no panic, no allocation blow-up).
-    pub fn decode_state(bytes: &[u8]) -> Result<Self, String> {
+    /// 解析构建态元数据与载荷窗口；任何长度/重复 id/尾随字节都拒绝
+    /// （不 panic、不分配放大）。向量载荷本身留给 eager/lazy 两条路径处理。
+    /// EN: Parse built-state metadata and payload windows; reject length
+    /// mismatches, duplicate ids, and trailing bytes (no panic, no allocation
+    /// blow-up). The vector payloads themselves are left to the eager/lazy
+    /// paths.
+    fn parse_state(bytes: &[u8]) -> Result<ParsedState, String> {
         let mut r = StateReader::new(bytes);
         if r.take(FLAT_CLUSTERED_STATE_MAGIC.len())? != FLAT_CLUSTERED_STATE_MAGIC {
             return Err("flat-clustered state: bad magic".to_string());
@@ -1264,23 +1449,86 @@ impl FlatClustered {
         if r.remaining() != 0 {
             return Err("flat-clustered state: trailing bytes".to_string());
         }
-        let cluster_vecs = decode_cluster_payloads(bytes, &windows, dtype)?;
-        let mut index = FlatClustered {
+        Ok(ParsedState {
             dims,
             metric,
             num_clusters,
             nprobe,
             centroids,
             cluster_ids,
+            windows,
+            dtype,
+        })
+    }
+
+    /// 解码构建态（整块复制向量）；任何长度/重复 id/尾随字节都拒绝。
+    /// EN: Decode a built state (copy the vector payloads); reject length
+    /// mismatches, duplicate ids, and trailing bytes.
+    pub fn decode_state(bytes: &[u8]) -> Result<Self, String> {
+        let parsed = Self::parse_state(bytes)?;
+        let cluster_vecs = decode_cluster_payloads(bytes, &parsed.windows, parsed.dtype)?;
+        Ok(Self::from_parsed(parsed, cluster_vecs, false))
+    }
+
+    /// 只解析元数据与载荷窗口，向量按簇惰性解码（view 模式）。
+    ///
+    /// `source` 为整份快照字节，`base`/`len` 定位其中的构建态窗口；调用方
+    /// 负责保证 `source` 在索引生命周期内有效（mmap 文件不得被截断/改写）。
+    /// EN: Parse only the metadata and payload windows and decode vectors
+    /// lazily per cluster (view mode). `source` holds the whole snapshot and
+    /// `base`/`len` locate the built state; the caller must keep `source`
+    /// valid for the index's lifetime (a mapped file must not be truncated or
+    /// overwritten in place).
+    pub fn view_state(
+        source: Arc<dyn SnapshotBytes>,
+        base: usize,
+        len: usize,
+    ) -> Result<Self, String> {
+        let end = base
+            .checked_add(len)
+            .ok_or_else(|| "flat-clustered state: range overflow".to_string())?;
+        let parsed = {
+            let all = source.bytes();
+            let bytes = all
+                .get(base..end)
+                .ok_or_else(|| "flat-clustered state: truncated payload".to_string())?;
+            Self::parse_state(bytes)?
+        };
+        let cluster_vecs = lazy_cluster_payloads(source, base, &parsed.windows, parsed.dtype);
+        Ok(Self::from_parsed(parsed, cluster_vecs, true))
+    }
+
+    fn from_parsed(parsed: ParsedState, cluster_vecs: ClusterVectors, lazy_norms: bool) -> Self {
+        let mut index = FlatClustered {
+            dims: parsed.dims,
+            metric: parsed.metric,
+            num_clusters: parsed.num_clusters,
+            nprobe: parsed.nprobe,
+            centroids: parsed.centroids,
+            cluster_ids: parsed.cluster_ids,
             cluster_vecs,
             id_index: None,
             id_index_error: None,
             cosine_norms: None,
             search_nprobe: std::sync::atomic::AtomicUsize::new(0),
         };
-        index.rebuild_cosine_norms();
-        Ok(index)
+        index.rebuild_cosine_norms_with(lazy_norms);
+        index
     }
+}
+
+/// 构建态解析结果：元数据 + 每簇载荷窗口（向量尚未复制）。
+/// EN: Parsed built state: metadata plus per-cluster payload windows (vectors
+/// are not copied yet).
+struct ParsedState {
+    dims: usize,
+    metric: DistanceMetric,
+    num_clusters: usize,
+    nprobe: usize,
+    centroids: Vec<f32>,
+    cluster_ids: Vec<Vec<u64>>,
+    windows: Vec<ClusterWindow>,
+    dtype: FlatStorageDtype,
 }
 
 /// 单簇向量载荷在状态字节中的窗口（供并行解码）。
@@ -1319,14 +1567,14 @@ fn decode_cluster_payloads(
                 .par_iter()
                 .map(|w| bulk_f32(&bytes[w.vec_off..w.vec_off + w.vec_bytes]))
                 .collect();
-            Ok(ClusterVectors::F32(lists?))
+            Ok(ClusterVectors::F32(ClusterStorage::Owned(lists?)))
         }
         FlatStorageDtype::F16 => {
             let lists: Result<Vec<Vec<f16>>, String> = windows
                 .par_iter()
                 .map(|w| bulk_f16(&bytes[w.vec_off..w.vec_off + w.vec_bytes]))
                 .collect();
-            Ok(ClusterVectors::F16(lists?))
+            Ok(ClusterVectors::F16(ClusterStorage::Owned(lists?)))
         }
         FlatStorageDtype::I8 => {
             let pairs: Result<Vec<ScaledCodes>, String> = windows
@@ -1342,8 +1590,106 @@ fn decode_cluster_payloads(
                 .collect();
             let pairs = pairs?;
             let (codes, scales) = pairs.into_iter().unzip();
-            Ok(ClusterVectors::I8 { codes, scales })
+            Ok(ClusterVectors::I8 {
+                codes: ClusterStorage::Owned(codes),
+                scales: ClusterStorage::Owned(scales),
+            })
         }
+    }
+}
+
+/// 把解析出的窗口包装成按簇惰性解码的存储（view 模式）。
+/// EN: Wrap parsed windows into per-cluster lazy storage (view mode).
+fn lazy_cluster_payloads(
+    source: Arc<dyn SnapshotBytes>,
+    base: usize,
+    windows: &[ClusterWindow],
+    dtype: FlatStorageDtype,
+) -> ClusterVectors {
+    fn empty_locks<T>(n: usize) -> Vec<OnceLock<Vec<T>>> {
+        (0..n).map(|_| OnceLock::new()).collect()
+    }
+    match dtype {
+        FlatStorageDtype::F32 => ClusterVectors::F32(ClusterStorage::Lazy(LazyClusters {
+            source,
+            windows: windows
+                .iter()
+                .map(|w| (base + w.vec_off, w.vec_bytes))
+                .collect(),
+            decode: decode_f32_payload,
+            decoded: empty_locks(windows.len()),
+        })),
+        FlatStorageDtype::F16 => ClusterVectors::F16(ClusterStorage::Lazy(LazyClusters {
+            source,
+            windows: windows
+                .iter()
+                .map(|w| (base + w.vec_off, w.vec_bytes))
+                .collect(),
+            decode: decode_f16_payload,
+            decoded: empty_locks(windows.len()),
+        })),
+        FlatStorageDtype::I8 => {
+            let codes = LazyClusters {
+                source: Arc::clone(&source),
+                windows: windows
+                    .iter()
+                    .map(|w| (base + w.vec_off, w.vec_bytes))
+                    .collect(),
+                decode: bulk_bitcopy,
+                decoded: empty_locks(windows.len()),
+            };
+            let scales = LazyClusters {
+                source,
+                windows: windows
+                    .iter()
+                    .map(|w| {
+                        let (off, len) = w
+                            .scale_off
+                            .expect("parse_state guarantees i8 scales for I8 dtype");
+                        (base + off, len)
+                    })
+                    .collect(),
+                decode: decode_f32_payload,
+                decoded: empty_locks(windows.len()),
+            };
+            ClusterVectors::I8 {
+                codes: ClusterStorage::Lazy(codes),
+                scales: ClusterStorage::Lazy(scales),
+            }
+        }
+    }
+}
+
+/// 惰性解码 f32 载荷：小端整块位拷贝，大端逐元素 from_le。
+/// EN: Lazy f32 payload decode: bulk bit copy on little-endian, per-element
+/// from_le on big-endian.
+fn decode_f32_payload(bytes: &[u8]) -> Vec<f32> {
+    #[cfg(target_endian = "little")]
+    {
+        bulk_bitcopy(bytes)
+    }
+    #[cfg(not(target_endian = "little"))]
+    {
+        bytes
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect()
+    }
+}
+
+/// 惰性解码 f16 载荷（保留 u16 位模式）。
+/// EN: Lazy f16 payload decode (keeps the u16 bit pattern).
+fn decode_f16_payload(bytes: &[u8]) -> Vec<f16> {
+    #[cfg(target_endian = "little")]
+    {
+        bulk_bitcopy(bytes)
+    }
+    #[cfg(not(target_endian = "little"))]
+    {
+        bytes
+            .chunks_exact(2)
+            .map(|c| f16::from_bits(u16::from_le_bytes([c[0], c[1]])))
+            .collect()
     }
 }
 
@@ -1798,6 +2144,68 @@ mod tests {
         assert_eq!(decoded.total_vectors(), 1);
         let found = decoded.search(&vectors[..dims], 1);
         assert_eq!(found.first().map(|x| x.0), Some(7));
+    }
+
+    /// view 模式：元数据解析后按簇惰性解码，检索结果与 eager 解码逐项一致；
+    /// 首次写入会整体物化，之后仍可正常增量插入。
+    /// EN: View mode parses metadata and decodes per cluster lazily; search
+    /// results match eager decoding item for item, and the first write
+    /// materializes the clusters before inserting.
+    #[test]
+    fn test_flat_clustered_view_state_matches_eager() {
+        struct TestBytes(Vec<u8>);
+        impl SnapshotBytes for TestBytes {
+            fn bytes(&self) -> &[u8] {
+                &self.0
+            }
+        }
+
+        let dims = 12;
+        let n = 300;
+        let mut rng = rand::rngs::StdRng::seed_from_u64(77);
+        let mut vectors = Vec::with_capacity(n * dims);
+        let ids: Vec<u64> = (0..n as u64).collect();
+        for _ in 0..n * dims {
+            vectors.push(rng.gen::<f32>() * 2.0 - 1.0);
+        }
+        let c = (n as f64).sqrt().ceil() as usize;
+        for dtype in [FlatStorageDtype::F16, FlatStorageDtype::I8] {
+            let fc = FlatClustered::build_with_storage_dtype(
+                &vectors,
+                &ids,
+                dims,
+                DistanceMetric::Cosine,
+                c,
+                10,
+                0,
+                dtype,
+            );
+            let state = fc.encode_state().expect("encode");
+            // 故意加前缀，验证 view 的基址偏移（含 i8 scale 窗口）。
+            // EN: Prefix the payload to exercise base offsets (including i8
+            // scale windows).
+            let mut padded = vec![0xA5u8; 7];
+            padded.extend_from_slice(&state);
+            let source: Arc<dyn SnapshotBytes> = Arc::new(TestBytes(padded));
+            let mut viewed = FlatClustered::view_state(source, 7, state.len()).expect("view state");
+            assert_eq!(viewed.storage_dtype(), dtype);
+            for qi in 0..5 {
+                let q = &vectors[qi * dims..(qi + 1) * dims];
+                assert_eq!(fc.search(q, 10), viewed.search(q, 10));
+            }
+            let mut probe = vec![0.0f32; dims];
+            probe[0] = 1.0;
+            viewed.insert(9000, &probe).expect("insert after view");
+            assert!(viewed.search(&probe, 1).iter().any(|(id, _)| *id == 9000));
+            let again = viewed.encode_state().expect("encode after view");
+            let decoded = FlatClustered::decode_state(&again).expect("decode after view");
+            assert_eq!(decoded.total_vectors(), n + 1);
+            // 越界的 view 窗口必须拒绝。
+            // EN: Out-of-range view windows must be rejected.
+            let source: Arc<dyn SnapshotBytes> = Arc::new(TestBytes(state.clone()));
+            assert!(FlatClustered::view_state(Arc::clone(&source), 0, state.len() - 1).is_err());
+            assert!(FlatClustered::view_state(source, 0, state.len() + 1).is_err());
+        }
     }
 
     #[test]

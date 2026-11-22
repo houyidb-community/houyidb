@@ -122,9 +122,34 @@ Conclusions:
   CPU frequency.
 - Against `view` (zero-copy mmap): **Houyi is 3–6× slower.** USearch defers the
   page-fault cost to the first query (1–3 ms), so it is ready in 9–11 ms.
-- Therefore cold start cannot be claimed as a win over USearch yet; closing the
-  gap needs a view/lazy-decode mode for snapshots (a new API; the existing
-  eager-load semantics stay unchanged).
+- View mode (next section) brings loading level with USearch; time-to-first-query
+  is still 1–2 ms behind, but peak memory is 40%+ lower.
+
+## Cold-load round 3: view mode (mmap + per-cluster lazy decode)
+
+New `loadView` / `houyi_mobile_db_load_view`: map the snapshot read-only and
+parse metadata only; flat-clustered built-state clusters decode and cache on the
+first search that touches them. The first write materializes every cluster;
+afterwards behavior matches eager loading.
+
+Same-session alternating A/B (100k×128, 31 °C, warm page cache; median of 15
+valid samples):
+
+| Index | eager ready | **view ready** | eager peak RSS | **view peak RSS** | USearch view |
+|---|---:|---:|---:|---:|---:|
+| f16 | 52.3 ms | **11.5 ms** | 85.5 MB | **27.0 MB** | 9.4 ms / 48.1 MB |
+| i8 | 32.0 ms | **10.1 ms** | 49.5 MB | **21.0 MB** | 9.0 ms / 35.8 MB |
+
+- Load alone: Houyi view 7.5 ms (f16) / 7.4 ms (i8), level with USearch view's
+  7.4–7.8 ms.
+- First query: Houyi decodes the ~60 probed clusters (2.3–4 ms), while USearch's
+  HNSW only touches the graph path (1.2–2.1 ms); total startup differs by 1–2 ms.
+- Peak RSS is 41–44% lower than USearch view and 2.4–3.2× lower than eager.
+- On truly cold storage both read from flash; the device cannot drop caches
+  without root, but first-iteration samples were ~55 ms (view) and 46–70 ms
+  (eager), indicative only.
+- Cost: view mode skips the whole-file CRC and the file must not be truncated or
+  overwritten in place while mapped; see manual section 2.8.
 
 ## Thread-count sweep (128d×100k, RAYON_NUM_THREADS, 3 runs each)
 

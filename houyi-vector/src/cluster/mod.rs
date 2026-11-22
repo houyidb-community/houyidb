@@ -10,7 +10,9 @@ pub mod kmeans;
 pub mod pq_flat;
 pub mod router;
 
-pub use flat_clustered::{FlatClustered, FlatStorageDtype, DEFAULT_SEARCH_TARGET_PER_K};
+pub use flat_clustered::{
+    FlatClustered, FlatStorageDtype, SnapshotBytes, DEFAULT_SEARCH_TARGET_PER_K,
+};
 pub use pq_flat::PqFlatClustered;
 
 use crate::hnsw_graph::HnswGraph;

@@ -12,10 +12,12 @@
 
 use crate::storage::VectorStore;
 use houyi_vector::cluster::{
-    ClusterConfig, ClusteredHnsw, FlatClustered, FlatStorageDtype, DEFAULT_SEARCH_TARGET_PER_K,
+    ClusterConfig, ClusteredHnsw, FlatClustered, FlatStorageDtype, SnapshotBytes,
+    DEFAULT_SEARCH_TARGET_PER_K,
 };
 use houyi_vector::distance;
 use houyi_vector::DistanceMetric;
+use std::sync::Arc;
 
 /// 错误前缀：FFI 用前缀而不是完整文案映射 -1/-2，改写说明文字不会改变返回码。
 /// EN: Error prefixes let the FFI map -1/-2 by prefix instead of full prose, so
@@ -145,6 +147,14 @@ pub(crate) enum BackendSnapshot {
     Flat(Vec<(u64, Vec<f32>)>),
     FlatClusteredPending(Vec<(u64, Vec<f32>)>),
     FlatClusteredBuilt(Vec<u8>),
+    /// view 加载的 flat-clustered 构建态：持有 mmap，簇向量按需解码。
+    /// EN: Flat-clustered built state loaded as a view: holds the mmap and
+    /// decodes cluster vectors on demand.
+    FlatClusteredView {
+        source: Arc<dyn SnapshotBytes>,
+        base: usize,
+        len: usize,
+    },
     ClusteredHnsw {
         rows: Vec<(u64, Vec<f32>)>,
         built: bool,
@@ -723,6 +733,41 @@ impl Backend {
         })
     }
 
+    /// 校验并包装从构建态恢复的 flat-clustered（eager 与 view 共用）。
+    /// EN: Validate and wrap a flat-clustered index restored from a built state
+    /// (shared by the eager and view paths).
+    fn restored_flat_clustered(
+        index: FlatClustered,
+        dims: usize,
+        metric: DistanceMetric,
+        dtype: FlatStorageDtype,
+    ) -> Result<Self, String> {
+        if index.state_dims() != dims {
+            return Err(format!(
+                "flat-clustered state dims {} != collection dims {dims}",
+                index.state_dims()
+            ));
+        }
+        if index.vector_metric() != metric || index.storage_dtype() != dtype {
+            return Err(
+                "flat-clustered state metric/dtype mismatch with collection config".to_string(),
+            );
+        }
+        Ok(Backend {
+            dims,
+            metric,
+            dtype,
+            search_target_per_k: DEFAULT_SEARCH_TARGET_PER_K,
+            build_nprobe: None,
+            search_nprobe: NprobeSetting::Default,
+            search_ef_search: None,
+            kind: BackendKind::FlatClustered(LazyIndex::Built {
+                index,
+                known_ids: None,
+            }),
+        })
+    }
+
     /// 从持久化视图重建后端；维度/索引状态不一致返回 Err（不 panic）。
     /// EN: Restore a backend from its persistence view; inconsistent
     /// dimensions/index state return Err instead of panicking.
@@ -738,9 +783,9 @@ impl Backend {
         }
         let expected_type = match &snapshot {
             BackendSnapshot::Flat(_) => "flat",
-            BackendSnapshot::FlatClusteredPending(_) | BackendSnapshot::FlatClusteredBuilt(_) => {
-                "flat-clustered"
-            }
+            BackendSnapshot::FlatClusteredPending(_)
+            | BackendSnapshot::FlatClusteredBuilt(_)
+            | BackendSnapshot::FlatClusteredView { .. } => "flat-clustered",
             BackendSnapshot::ClusteredHnswBuilt(_) => "clustered-hnsw",
             BackendSnapshot::ClusteredHnsw { .. } => "clustered-hnsw",
         };
@@ -760,33 +805,19 @@ impl Backend {
                 insert_rows(&mut backend, &rows, dims)?;
                 Ok(backend)
             }
-            BackendSnapshot::FlatClusteredBuilt(state) => {
-                let index = FlatClustered::decode_state(&state)?;
-                if index.state_dims() != dims {
-                    return Err(format!(
-                        "flat-clustered state dims {} != collection dims {dims}",
-                        index.state_dims()
-                    ));
-                }
-                if index.vector_metric() != metric || index.storage_dtype() != dtype {
-                    return Err(
-                        "flat-clustered state metric/dtype mismatch with collection config"
-                            .to_string(),
-                    );
-                }
-                Ok(Backend {
+            BackendSnapshot::FlatClusteredBuilt(state) => Self::restored_flat_clustered(
+                FlatClustered::decode_state(&state)?,
+                dims,
+                metric,
+                dtype,
+            ),
+            BackendSnapshot::FlatClusteredView { source, base, len } => {
+                Self::restored_flat_clustered(
+                    FlatClustered::view_state(source, base, len)?,
                     dims,
                     metric,
                     dtype,
-                    search_target_per_k: DEFAULT_SEARCH_TARGET_PER_K,
-                    build_nprobe: None,
-                    search_nprobe: NprobeSetting::Default,
-                    search_ef_search: None,
-                    kind: BackendKind::FlatClustered(LazyIndex::Built {
-                        index,
-                        known_ids: None,
-                    }),
-                })
+                )
             }
             BackendSnapshot::ClusteredHnswBuilt(state) => {
                 let index = ClusteredHnsw::decode_state(&state)?;

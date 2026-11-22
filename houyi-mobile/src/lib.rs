@@ -912,6 +912,33 @@ pub extern "C" fn houyi_mobile_db_load(path: *const std::ffi::c_char) -> *mut db
     }
 }
 
+/// 以 view 模式从路径加载：只读 mmap + 元数据解析，簇向量首次检索时解码。
+///
+/// 不校验整文件 CRC（结构校验完整）；调用方不得在数据库使用期间原地截断或
+/// 改写该文件（临时文件 + rename 是安全的）。失败返回 NULL，返回的指针用
+/// `houyi_mobile_db_close` 释放。
+/// EN: Load from a path in view mode: read-only mmap plus metadata parsing;
+/// cluster vectors decode on first search. The whole-file CRC is skipped
+/// (structural validation remains complete); the caller must not truncate or
+/// overwrite the file in place while the database is in use (temp file +
+/// rename is safe). Returns NULL on failure; release the pointer with
+/// `houyi_mobile_db_close`.
+#[no_mangle]
+pub extern "C" fn houyi_mobile_db_load_view(path: *const std::ffi::c_char) -> *mut db::MobileDB {
+    if path.is_null() {
+        return std::ptr::null_mut();
+    }
+    let c_path = unsafe { std::ffi::CStr::from_ptr(path) };
+    let path_str = match c_path.to_str() {
+        Ok(value) => value,
+        Err(_) => return std::ptr::null_mut(),
+    };
+    match db::MobileDB::load_view_from(path_str) {
+        Ok(db) => Box::into_raw(Box::new(db)),
+        Err(_) => std::ptr::null_mut(),
+    }
+}
+
 /// 把数据库编码进调用方缓冲区（不写任何临时文件）。
 ///
 /// 返回 0 成功、-1 参数非法（db 或 written 为空）、-2 缓冲区不足。
@@ -1607,10 +1634,15 @@ mod tests {
         let abi_loaded = houyi_mobile_db_load(abi_path_c.as_ptr());
         assert!(!abi_loaded.is_null());
         assert_eq!(houyi_mobile_db_count(abi_loaded, name.as_ptr()), 1);
+        let abi_viewed = houyi_mobile_db_load_view(abi_path_c.as_ptr());
+        assert!(!abi_viewed.is_null());
+        assert_eq!(houyi_mobile_db_count(abi_viewed, name.as_ptr()), 1);
         assert_eq!(houyi_mobile_db_save(abi_db, std::ptr::null()), -1);
         assert!(houyi_mobile_db_load(std::ptr::null()).is_null());
+        assert!(houyi_mobile_db_load_view(std::ptr::null()).is_null());
         houyi_mobile_db_close(abi_db);
         houyi_mobile_db_close(abi_loaded);
+        houyi_mobile_db_close(abi_viewed);
         let _ = std::fs::remove_file(&abi_path);
 
         // 损坏样本：截断 / 坏 magic / CRC 翻转都必须拒绝。

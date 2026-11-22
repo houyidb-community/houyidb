@@ -20,13 +20,14 @@
 use crate::backend::BackendSnapshot;
 use crate::db::{CollectionSnapshot, MobileDB};
 use crate::filter::{ColType, ScalarStoreSnapshot, ScalarVal};
-use houyi_vector::cluster::FlatStorageDtype;
+use houyi_vector::cluster::{FlatStorageDtype, SnapshotBytes};
 use houyi_vector::DistanceMetric;
 use rayon::prelude::*;
 use std::collections::HashSet;
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 const MAGIC: &[u8; 8] = b"HOUYIMB1";
 /// 快照版本：4 = v3 + clustered-hnsw 构建态标签（旧二进制对 v4 干净拒绝）。
@@ -43,6 +44,17 @@ const MAX_SCALAR_ROWS: usize = 10_000_000;
 /// EN: Total file-size cap; real mobile collections are far smaller. Check
 /// metadata before reading so a corrupt file cannot force an unbounded read.
 const MAX_SNAPSHOT_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+
+/// mmap 快照字节源（view 模式）：只读映射，不整块复制。
+/// EN: mmap snapshot byte source (view mode): a read-only mapping without a
+/// whole-file copy.
+struct MmapSource(memmap2::Mmap);
+
+impl SnapshotBytes for MmapSource {
+    fn bytes(&self) -> &[u8] {
+        &self.0
+    }
+}
 
 /// 并行 CRC32：分块计算后用 `Hasher::combine` 按原始顺序合并。
 ///
@@ -132,6 +144,43 @@ pub(crate) fn decode_snapshot(bytes: &[u8]) -> Result<MobileDB, String> {
     MobileDB::from_snapshots(snapshots)
 }
 
+/// view 模式解码：只校验头部与结构，**不计算整文件 CRC**；flat-clustered
+/// 构建态的向量按簇惰性解码。调用方需保证 `source` 在数据库生命周期内有效。
+/// EN: View-mode decode: validate the header and structure but **skip the
+/// whole-file CRC**; flat-clustered built-state vectors decode lazily per
+/// cluster. The caller must keep `source` valid for the database's lifetime.
+pub(crate) fn decode_snapshot_view(source: Arc<dyn SnapshotBytes>) -> Result<MobileDB, String> {
+    let version = {
+        let bytes = source.bytes();
+        let size =
+            u64::try_from(bytes.len()).map_err(|_| "snapshot: buffer too large".to_string())?;
+        if size > MAX_SNAPSHOT_BYTES {
+            return Err(format!("snapshot: buffer too large ({size} bytes)"));
+        }
+        if bytes.len() < HEADER_LEN {
+            return Err("snapshot: truncated header".to_string());
+        }
+        if &bytes[..8] != MAGIC {
+            return Err("snapshot: bad magic".to_string());
+        }
+        let version = u32::from_le_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]);
+        if !(1..=VERSION).contains(&version) {
+            return Err(format!("snapshot: unsupported version {version}"));
+        }
+        let body_len_u64 = u64::from_le_bytes([
+            bytes[12], bytes[13], bytes[14], bytes[15], bytes[16], bytes[17], bytes[18], bytes[19],
+        ]);
+        let body_len = usize::try_from(body_len_u64)
+            .map_err(|_| "snapshot: body length exceeds address space".to_string())?;
+        if body_len != bytes.len() - HEADER_LEN {
+            return Err("snapshot: body length mismatch".to_string());
+        }
+        version
+    };
+    let snapshots = decode_body_view(&source, HEADER_LEN, version)?;
+    MobileDB::from_snapshots(snapshots)
+}
+
 /// 将数据库原子写入 `path`。
 /// EN: Atomically write the database to `path`.
 pub(crate) fn save_to(db: &MobileDB, path: &Path) -> Result<(), String> {
@@ -215,6 +264,31 @@ pub(crate) fn load_from(path: &Path) -> Result<MobileDB, String> {
     decode_snapshot(&bytes)
 }
 
+/// view 模式从文件加载：只读 mmap，元数据解析后按簇惰性解码。
+///
+/// 不计算整文件 CRC；调用方不得在数据库使用期间原地截断/改写该文件。
+/// EN: Load from a file in view mode: read-only mmap, metadata parsed up front
+/// and clusters decoded lazily. The whole-file CRC is skipped; the caller must
+/// not truncate or overwrite the file in place while the database is in use.
+pub(crate) fn load_view_from(path: &Path) -> Result<MobileDB, String> {
+    let size = std::fs::metadata(path)
+        .map_err(|e| format!("snapshot: stat {}: {e}", path.display()))?
+        .len();
+    if size > MAX_SNAPSHOT_BYTES {
+        return Err(format!("snapshot: file too large ({size} bytes)"));
+    }
+    let file =
+        std::fs::File::open(path).map_err(|e| format!("snapshot: open {}: {e}", path.display()))?;
+    // SAFETY：只读映射；文件句柄在映射建立后即可关闭，映射本身保持有效。
+    // 调用方必须保证使用期间没有他方原地截断/改写（见公开文档）。
+    // EN: SAFETY: read-only mapping; the handle may close after mapping and the
+    // mapping stays valid. The caller must ensure nobody truncates or
+    // overwrites the file in place during use (see the public docs).
+    let map = unsafe { memmap2::Mmap::map(&file) }
+        .map_err(|e| format!("snapshot: mmap {}: {e}", path.display()))?;
+    decode_snapshot_view(Arc::new(MmapSource(map)))
+}
+
 fn temp_path(path: &Path) -> PathBuf {
     use std::sync::atomic::{AtomicU64, Ordering};
     static COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -279,6 +353,24 @@ fn encode_body_into(w: &mut Writer, db: &MobileDB) -> Result<(), String> {
                         .map_err(|_| "snapshot: state length overflow".to_string())?,
                 );
                 w.bytes(&state);
+            }
+            // view 状态保存时直接写回原始构建态字节（未修改时与 eager 完全一致）。
+            // EN: Persist a view state by writing back its raw built-state bytes
+            // (identical to eager when unmodified).
+            BackendSnapshot::FlatClusteredView { source, base, len } => {
+                let end = base
+                    .checked_add(len)
+                    .ok_or_else(|| "snapshot: view state range overflow".to_string())?;
+                let bytes = source
+                    .bytes()
+                    .get(base..end)
+                    .ok_or_else(|| "snapshot: view state out of range".to_string())?;
+                w.u8(2);
+                w.u64(
+                    u64::try_from(bytes.len())
+                        .map_err(|_| "snapshot: state length overflow".to_string())?,
+                );
+                w.bytes(bytes);
             }
             BackendSnapshot::ClusteredHnsw { rows, built } => {
                 w.u8(if built { 4 } else { 3 });
@@ -390,6 +482,29 @@ fn encode_scalars(w: &mut Writer, snapshot: &ScalarStoreSnapshot) -> Result<(), 
 }
 
 fn decode_body(body: &[u8], version: u32) -> Result<Vec<CollectionSnapshot>, String> {
+    decode_body_impl(body, version, None)
+}
+
+/// view 模式：只解析元数据；flat-clustered 构建态记录窗口并惰性解码。
+/// EN: View mode: parse metadata only; flat-clustered built states record
+/// windows and decode lazily.
+fn decode_body_view(
+    source: &Arc<dyn SnapshotBytes>,
+    body_start: usize,
+    version: u32,
+) -> Result<Vec<CollectionSnapshot>, String> {
+    let bytes = source.bytes();
+    let body = bytes
+        .get(body_start..)
+        .ok_or_else(|| "snapshot: body starts past end".to_string())?;
+    decode_body_impl(body, version, Some((source, body_start)))
+}
+
+fn decode_body_impl(
+    body: &[u8],
+    version: u32,
+    view: Option<(&Arc<dyn SnapshotBytes>, usize)>,
+) -> Result<Vec<CollectionSnapshot>, String> {
     let mut r = Reader::new(body);
     let count = r.u32()? as usize;
     if count > MAX_COLLECTIONS || count > r.remaining() / 8 {
@@ -438,8 +553,23 @@ fn decode_body(body: &[u8], version: u32) -> Result<Vec<CollectionSnapshot>, Str
                 }
             }
             2 => {
-                let len = r.u64()? as usize;
-                BackendSnapshot::FlatClusteredBuilt(r.take(len)?.to_vec())
+                let len = usize::try_from(r.u64()?)
+                    .map_err(|_| "snapshot: flat-clustered state too large".to_string())?;
+                match view {
+                    Some((source, body_start)) => {
+                        let off = r.pos();
+                        r.skip(len)?;
+                        let base = body_start
+                            .checked_add(off)
+                            .ok_or_else(|| "snapshot: state offset overflow".to_string())?;
+                        BackendSnapshot::FlatClusteredView {
+                            source: Arc::clone(source),
+                            base,
+                            len,
+                        }
+                    }
+                    None => BackendSnapshot::FlatClusteredBuilt(r.take(len)?.to_vec()),
+                }
             }
             5 => {
                 // clustered-hnsw 构建态：magic/版本等由 ClusteredHnsw::decode_state 校验。
@@ -617,6 +747,12 @@ impl<'a> Reader<'a> {
     fn remaining(&self) -> usize {
         self.bytes.len().saturating_sub(self.pos)
     }
+    fn pos(&self) -> usize {
+        self.pos
+    }
+    fn skip(&mut self, n: usize) -> Result<(), String> {
+        self.take(n).map(|_| ())
+    }
     fn take(&mut self, n: usize) -> Result<&'a [u8], String> {
         if n > self.remaining() {
             return Err("snapshot: truncated payload".to_string());
@@ -717,6 +853,21 @@ impl MobileDB {
     pub fn load_from(path: impl AsRef<Path>) -> Result<MobileDB, String> {
         load_from(path.as_ref())
     }
+
+    /// 以 view 模式从 `path` 加载：只解析元数据，簇向量首次检索时按簇解码。
+    ///
+    /// 不计算整文件 CRC（结构校验完整）；文件通过只读 mmap 引用，加载后
+    /// **不得原地截断或改写该文件**（临时文件 + rename 原子替换是安全的）。
+    /// 仅 flat-clustered 构建态按簇惰性解码；其他后端仍按原方式解码。
+    /// EN: Load `path` in view mode: parse metadata only and decode cluster
+    /// vectors on first search. The whole-file CRC is skipped (structural
+    /// validation remains complete); the file is referenced through a
+    /// read-only mmap and must not be truncated or overwritten in place after
+    /// loading (atomic temp-file + rename is safe). Only flat-clustered built
+    /// states decode lazily; other backends decode as before.
+    pub fn load_view_from(path: impl AsRef<Path>) -> Result<MobileDB, String> {
+        load_view_from(path.as_ref())
+    }
 }
 
 #[cfg(test)]
@@ -815,6 +966,61 @@ mod tests {
                 "crc mismatch at len {len}"
             );
         }
+    }
+
+    #[test]
+    fn view_load_matches_eager_and_materializes_on_write() {
+        use houyi_vector::cluster::FlatStorageDtype;
+        use houyi_vector::DistanceMetric;
+        use rand::{Rng, SeedableRng};
+
+        let dims = 16;
+        let n = 600;
+        let mut rng = rand::rngs::StdRng::seed_from_u64(9);
+        let ids: Vec<u64> = (0..n as u64).collect();
+        let mut vectors = Vec::with_capacity(n * dims);
+        for _ in 0..n * dims {
+            vectors.push(rng.gen::<f32>() * 2.0 - 1.0);
+        }
+        let path =
+            std::env::temp_dir().join(format!("houyi-mobile-view-{}.bin", std::process::id()));
+        let db = MobileDB::new();
+        db.get_or_create_with_config(
+            "faces",
+            dims,
+            "flat-clustered",
+            DistanceMetric::Cosine,
+            FlatStorageDtype::F16,
+        )
+        .unwrap();
+        db.insert_batch("faces", &ids, &vectors, dims).unwrap();
+        db.build("faces").unwrap();
+        db.save_to(&path).unwrap();
+
+        let eager = MobileDB::load_from(&path).unwrap();
+        let viewed = MobileDB::load_view_from(&path).unwrap();
+        assert_eq!(viewed.count("faces").unwrap(), n);
+        for qi in 0..4 {
+            let q = &vectors[qi * dims..(qi + 1) * dims];
+            assert_eq!(
+                eager.search("faces", q, 10).unwrap(),
+                viewed.search("faces", q, 10).unwrap()
+            );
+        }
+        // 写入触发整体物化；之后新向量可被检索到，且可再次保存/加载。
+        // EN: The write materializes the clusters; the new vector is searchable
+        // and the database can be saved and loaded again.
+        let mut probe = vec![0.0f32; dims];
+        probe[0] = 1.0;
+        viewed.insert("faces", 9001, &probe).unwrap();
+        assert_eq!(viewed.search("faces", &probe, 1).unwrap()[0].0, 9001);
+        let path2 =
+            std::env::temp_dir().join(format!("houyi-mobile-view2-{}.bin", std::process::id()));
+        viewed.save_to(&path2).unwrap();
+        let reloaded = MobileDB::load_from(&path2).unwrap();
+        assert_eq!(reloaded.count("faces").unwrap(), n + 1);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&path2);
     }
 
     #[test]

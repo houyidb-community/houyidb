@@ -4,6 +4,16 @@
 
 ## Unreleased
 
+### Performance
+- **houyi-mobile 冷加载**：快照解码改为「顺序读元数据 + 并行整块拷贝」，
+  文件路径改用只读 mmap、CRC32 分块并行，簇缓冲分配不再零初始化；新增
+  view 模式 `houyi_mobile_db_load_view` / Kotlin `loadView`（mmap + 按簇
+  惰性解码，首次写入整体物化）。真机 100k×128 到首次查询：f16
+  52.3 → 11.5 ms、峰值 RSS 85.5 → 27.0 MB；i8 32.0 → 10.1 ms、
+  49.5 → 21.0 MB。加载本身 7.4–7.5 ms，与 USearch `view` 持平。
+  快照格式与现有 API 语义不变；view 模式不校验整文件 CRC，且映射期间
+  文件不得原地截断/改写（详见手册 2.8）。
+
 ## v0.2.0-beta.9 (2026-11-21)
 
 ### Added

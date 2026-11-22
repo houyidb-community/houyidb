@@ -4,6 +4,19 @@
 
 ## Unreleased
 
+### Performance
+- **houyi-mobile cold load**: snapshot decoding now reads metadata sequentially
+  and copies whole cluster payloads in parallel; the file path uses a read-only
+  mmap with parallel chunked CRC32, and cluster buffers are allocated without
+  zero-initialization. Added view mode
+  `houyi_mobile_db_load_view` / Kotlin `loadView` (mmap plus per-cluster lazy
+  decode; the first write materializes every cluster). On-device 100k×128,
+  time to first query: f16 52.3 → 11.5 ms with peak RSS 85.5 → 27.0 MB; i8
+  32.0 → 10.1 ms with 49.5 → 21.0 MB. Load alone is 7.4–7.5 ms, level with
+  USearch `view`. The snapshot format and existing API semantics are unchanged;
+  view mode skips the whole-file CRC and the file must not be truncated or
+  overwritten in place while mapped (see manual section 2.8).
+
 ## v0.2.0-beta.9 (2026-11-21)
 
 ### Added

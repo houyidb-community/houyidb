@@ -110,8 +110,31 @@ i8 绝对值更快。
   32.9 / 52.5 ms 三轮几乎不变），Houyi 的 eager 解码更依赖 CPU 频率。
 - 对 `view`（mmap 零拷贝）：**Houyi 落后 3–6×**。USearch 把缺页成本推到首次
   查询（1–3 ms），总启动仅 9–11 ms。
-- 因此不能宣称冷启动已超越 USearch；要追平需要给快照增加 view/惰性解码模式
-  （新 API，现有 eager 加载语义不变）。
+- view 模式（见下一节）已把加载压到与 USearch 持平；到首查仍差 1–2 ms，
+  但峰值内存低 40% 以上。
+
+## 冷加载优化第三轮：view 模式（mmap + 按簇惰性解码）
+
+新增 `loadView` / `houyi_mobile_db_load_view`：只读 mmap，加载只解析元数据；
+flat-clustered 构建态的簇向量在该簇第一次被检索时解码并缓存。首次写入会把
+所有簇整体物化，之后与 eager 加载一致。
+
+同会话交替 A/B（100k×128，31 °C，warm page cache；15 个有效样本中位数）：
+
+| 索引 | eager 到首查 | **view 到首查** | eager 峰值 RSS | **view 峰值 RSS** | USearch view |
+|---|---:|---:|---:|---:|---:|
+| f16 | 52.3 ms | **11.5 ms** | 85.5 MB | **27.0 MB** | 9.4 ms / 48.1 MB |
+| i8 | 32.0 ms | **10.1 ms** | 49.5 MB | **21.0 MB** | 9.0 ms / 35.8 MB |
+
+- 加载本身：Houyi view 7.5 ms（f16）/ 7.4 ms（i8），与 USearch view 的
+  7.4–7.8 ms 持平。
+- 首次查询：Houyi 需解码命中的约 60 个簇（2.3–4 ms），USearch HNSW 只触碰
+  图路径（1.2–2.1 ms）；总启动差 1–2 ms。
+- 峰值 RSS 比 USearch view 低 41–44%，比 eager 加载低 2.4–3.2 倍。
+- 真冷存储（页缓存未命中）下两者都要读闪存；本机无法 root 清缓存，首轮样本
+  显示 view 约 55 ms、eager 约 46–70 ms（仅量级参考）。
+- 代价：view 模式不校验整文件 CRC，且文件在映射期间不能被原地截断/改写；
+  详见手册 2.8。
 
 ## 线程数扫描（128d×100k，RAYON_NUM_THREADS，各 3 次）
 

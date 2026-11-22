@@ -169,6 +169,15 @@ int32_t houyi_mobile_db_save(void* db, const char* path);
 // safe; use houyi_mobile_db_load_buffer when an in-place overwrite is required).
 // Breaking this precondition can raise SIGBUS.
 void* houyi_mobile_db_load(const char* path);
+// 以 view 模式从文件加载：只读 mmap + 元数据解析，簇向量首次检索时按簇解码。
+// 不校验整文件 CRC（结构校验完整）；使用期间不得原地截断/改写该文件。
+// 失败返回 NULL；返回的指针用 houyi_mobile_db_close 释放。
+// EN: Load in view mode: read-only mmap plus metadata parsing; cluster vectors
+// decode per cluster on first search. Skips the whole-file CRC (structural
+// validation remains complete); do not truncate or overwrite the file in
+// place while in use. Returns NULL on failure; release with
+// houyi_mobile_db_close.
+void* houyi_mobile_db_load_view(const char* path);
 // 内存快照：把整个数据库编码进调用方缓冲区，**不写任何临时文件**（加密/上传由
 // 调用方负责）。返回 0 成功、-1 参数非法（db/written 为 NULL）、-2 缓冲区不足。
 // *written：成功时为实际字节数；返回 -2 时为所需容量，调用方可扩容后重试。

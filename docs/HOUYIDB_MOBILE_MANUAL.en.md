@@ -185,6 +185,29 @@ void*   houyi_mobile_db_load_buffer(const uint8_t* bytes, size_t len);
   it immediately afterwards.
 - Kotlin: `HouyiDB.saveBytes(handle): ByteArray` / `HouyiDB.loadBytes(bytes): Long`.
 
+**View-mode loading (low startup latency / low peak memory)**:
+
+```c
+void* houyi_mobile_db_load_view(const char* path);  // NULL on failure
+```
+
+- Maps the snapshot read-only and parses metadata only; flat-clustered built-state
+  clusters are decoded and cached the first time a search touches them. Measured
+  on 100k×128 f16: ~7 ms to load and ~11 ms to the first query, with a 27 MB peak
+  RSS (eager loading uses 86 MB).
+- **The whole-file CRC is skipped** (structural validation remains complete); use
+  `houyi_mobile_db_load` when integrity verification is required. Do not truncate
+  or overwrite the file in place while it is mapped; `save`'s temp-file + rename
+  is safe, and a Vault-style in-place overwrite should use `load_buffer`.
+- The first write materializes every cluster (roughly one eager decode); after
+  that, behavior matches a normal load.
+- Decoded clusters stay cached; once queries cover every cluster, memory
+  approaches eager loading, but the mapped pages are file-backed and
+  reclaimable.
+- Only flat-clustered built states decode lazily; `flat` / `clustered-hnsw` load
+  as before.
+- Kotlin: `HouyiDB.loadView(path): Long`.
+
 ### 2.9 Search budget and recall presets
 
 ```c

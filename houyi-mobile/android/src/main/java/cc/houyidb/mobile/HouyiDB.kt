@@ -91,6 +91,7 @@ object HouyiDB {
     ): Int
     @JvmStatic external fun nativeSave(handle: Long, path: String): Int
     @JvmStatic external fun nativeLoad(path: String): Long
+    @JvmStatic external fun nativeLoadView(path: String): Long
     @JvmStatic external fun nativeSaveBytes(handle: Long): ByteArray?
     @JvmStatic external fun nativeLoadBytes(bytes: ByteArray): Long
     @JvmStatic external fun nativeLastError(): String
@@ -318,6 +319,26 @@ object HouyiDB {
         val handle = nativeLoad(path)
         if (handle == 0L) {
             throw IllegalStateException("HouyiDB load failed: ${lastError()}")
+        }
+        return handle
+    }
+
+    /**
+     * 以 view 模式从文件加载：只读 mmap + 元数据解析，簇向量首次检索时按簇解码。
+     *
+     * 不校验整文件 CRC（结构校验完整）；加载后**不得原地截断或改写该文件**
+     * （「临时文件 + rename」是安全的）。写入会先整体物化，之后行为与普通加载一致。
+     * EN: Load from a file in view mode: read-only mmap plus metadata parsing;
+     * cluster vectors decode per cluster on first search. The whole-file CRC is
+     * skipped (structural validation remains complete); do not truncate or
+     * overwrite the file in place after loading (temp file + rename is safe).
+     * The first write materializes the clusters; afterwards behavior matches a
+     * normal load.
+     */
+    fun loadView(path: String): Long {
+        val handle = nativeLoadView(path)
+        if (handle == 0L) {
+            throw IllegalStateException("HouyiDB loadView failed: ${lastError()}")
         }
         return handle
     }

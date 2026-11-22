@@ -174,6 +174,24 @@ void*   houyi_mobile_db_load_buffer(const uint8_t* bytes, size_t len);
   `load_buffer` 调用期间被读取，返回后可立即加密或清零。
 - Kotlin：`HouyiDB.saveBytes(handle): ByteArray` / `HouyiDB.loadBytes(bytes): Long`。
 
+**view 模式加载（低启动延迟 / 低峰值内存）**：
+
+```c
+void* houyi_mobile_db_load_view(const char* path);  // NULL 表示失败
+```
+
+- 只读 `mmap` 快照，加载只解析元数据；`flat-clustered` 构建态的簇向量在该簇
+  第一次被检索时解码并缓存。100k×128 f16 实测：加载约 7 ms、到首次查询约
+  11 ms，峰值 RSS 27 MB（eager 加载为 86 MB）。
+- **不计算整文件 CRC**（结构校验仍完整）；需要完整性校验时用
+  `houyi_mobile_db_load`。映射期间**不得原地截断或改写该文件**；`save` 的
+  「临时文件 + rename」是安全的，Vault 等宿主原地覆写请改用 `load_buffer`。
+- 首次写入会把所有簇整体物化（约一次 eager 解码成本），之后行为与普通加载一致。
+- 已解码的簇会常驻缓存；查询覆盖全部簇后内存占用接近 eager，但映射页是文件页、
+  可被内核回收。
+- 仅 `flat-clustered` 构建态惰性解码；`flat` / `clustered-hnsw` 仍按原方式加载。
+- Kotlin：`HouyiDB.loadView(path): Long`。
+
 ### 2.9 检索预算与召回预设
 
 ```c
