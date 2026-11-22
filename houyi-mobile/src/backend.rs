@@ -133,6 +133,11 @@ impl SearchPreset {
     }
 }
 
+// 每个集合只持有一个 Backend（在 Mutex 后），多出的几十字节可忽略；索引
+// 内联避免了每次检索的额外间接。允许该尺寸差异。
+// EN: One Backend per collection behind a Mutex, so the extra bytes are
+// negligible and inlining avoids an extra indirection on every search.
+#[allow(clippy::large_enum_variant)]
 enum BackendKind {
     Flat(VectorStore),
     FlatClustered(LazyIndex<FlatClustered>),
@@ -719,7 +724,15 @@ impl Backend {
                 BackendSnapshot::FlatClusteredPending(store.rows())
             }
             BackendKind::FlatClustered(LazyIndex::Built { index, .. }) => {
-                BackendSnapshot::FlatClusteredBuilt(index.encode_state()?)
+                // 未写入过的 view 索引直接带原始窗口保存，避免为保存解码全部簇。
+                // EN: A view index that has not been written to carries its raw
+                // window into the save, avoiding a full decode just to persist.
+                match index.state_window() {
+                    Some((source, base, len)) => {
+                        BackendSnapshot::FlatClusteredView { source, base, len }
+                    }
+                    None => BackendSnapshot::FlatClusteredBuilt(index.encode_state()?),
+                }
             }
             BackendKind::ClusteredHnsw(LazyIndex::Pending(store)) => {
                 BackendSnapshot::ClusteredHnsw {

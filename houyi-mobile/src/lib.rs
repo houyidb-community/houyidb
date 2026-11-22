@@ -1627,16 +1627,37 @@ mod tests {
             houyi_mobile_db_insert(abi_db, name.as_ptr(), 1, v.as_ptr(), 4),
             0
         );
+        let v2 = [0.0f32, 1.0, 0.0, 0.0];
+        assert_eq!(
+            houyi_mobile_db_insert(abi_db, name.as_ptr(), 2, v2.as_ptr(), 4),
+            0
+        );
+        // 建图后保存才会走构建态；view 加载的惰性解码路径需要真实索引。
+        // EN: Only a built index saves a built state; the view lazy-decode path
+        // needs a real index.
+        assert!(houyi_mobile_db_build(abi_db, name.as_ptr()) > 0);
         let abi_path =
             std::env::temp_dir().join(format!("houyi-mobile-abi-{}.bin", std::process::id()));
         let abi_path_c = CString::new(abi_path.to_str().unwrap()).unwrap();
         assert_eq!(houyi_mobile_db_save(abi_db, abi_path_c.as_ptr()), 0);
         let abi_loaded = houyi_mobile_db_load(abi_path_c.as_ptr());
         assert!(!abi_loaded.is_null());
-        assert_eq!(houyi_mobile_db_count(abi_loaded, name.as_ptr()), 1);
+        assert_eq!(houyi_mobile_db_count(abi_loaded, name.as_ptr()), 2);
         let abi_viewed = houyi_mobile_db_load_view(abi_path_c.as_ptr());
         assert!(!abi_viewed.is_null());
-        assert_eq!(houyi_mobile_db_count(abi_viewed, name.as_ptr()), 1);
+        assert_eq!(houyi_mobile_db_count(abi_viewed, name.as_ptr()), 2);
+        let mut view_results = vec![HouyiMobileResult { id: 0, score: 0.0 }; 2];
+        let found = houyi_mobile_db_search_u64(
+            abi_viewed,
+            name.as_ptr(),
+            v.as_ptr(),
+            4,
+            2,
+            view_results.as_mut_ptr(),
+            view_results.len() as u32,
+        );
+        assert_eq!(found, 2);
+        assert_eq!(view_results[0].id, 1);
         assert_eq!(houyi_mobile_db_save(abi_db, std::ptr::null()), -1);
         assert!(houyi_mobile_db_load(std::ptr::null()).is_null());
         assert!(houyi_mobile_db_load_view(std::ptr::null()).is_null());

@@ -327,7 +327,8 @@ object HouyiDB {
      * 以 view 模式从文件加载：只读 mmap + 元数据解析，簇向量首次检索时按簇解码。
      *
      * 不校验整文件 CRC（结构校验完整）；加载后**不得原地截断或改写该文件**
-     * （「临时文件 + rename」是安全的）。写入会先整体物化，之后行为与普通加载一致。
+     * （「临时文件 + rename」是安全的）。首次写入只解码触达的簇及其范数，其余簇
+     * 保持惰性；未写入时保存直接复用原始构建态字节，写入后重新编码。
      * EN: Load from a file in view mode: read-only mmap plus metadata parsing;
      * cluster vectors decode per cluster on first search. The whole-file CRC is
      * skipped (structural validation remains complete); do not truncate or

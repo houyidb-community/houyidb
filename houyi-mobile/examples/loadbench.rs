@@ -53,8 +53,8 @@ fn vm_hwm_mb() -> Option<f64> {
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
-    match args.get(1).map(String::as_str) {
-        Some("build") => {
+    match (args.get(1).map(String::as_str), args.len()) {
+        (Some("build"), n) if n >= 4 => {
             let path = &args[2];
             let dtype = dtype_of(&args[3]);
             let (ids, vectors) = synth();
@@ -81,7 +81,7 @@ fn main() {
                 "insert_ms={insert_ms:.1},build_ms={build_ms:.1},save_ms={save_ms:.1},bytes={bytes}"
             );
         }
-        Some("dump") => {
+        (Some("dump"), n) if n >= 3 => {
             let path = &args[2];
             let (_, vectors) = synth();
             use std::io::Write;
@@ -94,7 +94,7 @@ fn main() {
             f.flush().unwrap();
             println!("dumped n={N} dims={DIMS} bytes={}", 16 + vectors.len() * 4);
         }
-        Some("load") => {
+        (Some("load"), n) if n >= 4 => {
             let path = &args[2];
             let iters: usize = args[3].parse().unwrap();
             let view = args.get(4).is_some_and(|s| s == "view");
@@ -122,7 +122,7 @@ fn main() {
         }
         _ => {
             eprintln!(
-                "usage: loadbench build <path> <f16|i8> | dump <base.bin> | load <path> <iters>"
+                "usage: loadbench build <path> <f16|i8> | dump <base.bin> | load <path> <iters> [view]"
             );
             std::process::exit(2);
         }

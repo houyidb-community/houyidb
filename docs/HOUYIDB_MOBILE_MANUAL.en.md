@@ -199,8 +199,9 @@ void* houyi_mobile_db_load_view(const char* path);  // NULL on failure
   `houyi_mobile_db_load` when integrity verification is required. Do not truncate
   or overwrite the file in place while it is mapped; `save`'s temp-file + rename
   is safe, and a Vault-style in-place overwrite should use `load_buffer`.
-- The first write materializes every cluster (roughly one eager decode); after
-  that, behavior matches a normal load.
+- The first write decodes only the clusters it touches and their norms; the
+  rest stay lazy. Saving an unwritten view reuses the raw built-state bytes;
+  after a write the index is re-encoded from the current data.
 - Decoded clusters stay cached; once queries cover every cluster, memory
   approaches eager loading, but the mapped pages are file-backed and
   reclaimable.

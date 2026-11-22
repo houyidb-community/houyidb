@@ -56,6 +56,17 @@ impl SnapshotBytes for MmapSource {
     }
 }
 
+/// 堆缓冲字节源（mmap 不可用时的回退，保持 view 的按簇惰性解码）。
+/// EN: Heap-buffer byte source (fallback when mmap is unavailable; keeps the
+/// lazy per-cluster decode of view mode).
+struct VecSource(Vec<u8>);
+
+impl SnapshotBytes for VecSource {
+    fn bytes(&self) -> &[u8] {
+        &self.0
+    }
+}
+
 /// 并行 CRC32：分块计算后用 `Hasher::combine` 按原始顺序合并。
 ///
 /// `combine` 的语义是「self 的数据在前、other 的数据在后」，因此按块顺序
@@ -284,9 +295,17 @@ pub(crate) fn load_view_from(path: &Path) -> Result<MobileDB, String> {
     // EN: SAFETY: read-only mapping; the handle may close after mapping and the
     // mapping stays valid. The caller must ensure nobody truncates or
     // overwrites the file in place during use (see the public docs).
-    let map = unsafe { memmap2::Mmap::map(&file) }
-        .map_err(|e| format!("snapshot: mmap {}: {e}", path.display()))?;
-    decode_snapshot_view(Arc::new(MmapSource(map)))
+    match unsafe { memmap2::Mmap::map(&file) } {
+        Ok(map) => decode_snapshot_view(Arc::new(MmapSource(map))),
+        Err(_) => {
+            // 部分文件系统不支持映射：退回整块读取，仍保持按簇惰性解码。
+            // EN: Some filesystems cannot map; fall back to a whole-file copy
+            // while keeping the lazy per-cluster decode.
+            let bytes = std::fs::read(path)
+                .map_err(|e| format!("snapshot: read {}: {e}", path.display()))?;
+            decode_snapshot_view(Arc::new(VecSource(bytes)))
+        }
+    }
 }
 
 fn temp_path(path: &Path) -> PathBuf {
@@ -1007,9 +1026,27 @@ mod tests {
                 viewed.search("faces", q, 10).unwrap()
             );
         }
-        // 写入触发整体物化；之后新向量可被检索到，且可再次保存/加载。
-        // EN: The write materializes the clusters; the new vector is searchable
-        // and the database can be saved and loaded again.
+        // 未写入的 view 保存直接复用原始构建态字节（不触发全量解码），
+        // 往返后与 eager 检索一致。
+        // EN: Saving an unwritten view reuses its raw built-state bytes (no full
+        // decode) and roundtrips to eager-equivalent search results.
+        let view_saved =
+            std::env::temp_dir().join(format!("houyi-mobile-view-raw-{}.bin", std::process::id()));
+        viewed.save_to(&view_saved).unwrap();
+        let reloaded_view = MobileDB::load_from(&view_saved).unwrap();
+        assert_eq!(reloaded_view.count("faces").unwrap(), n);
+        for qi in 0..2 {
+            let q = &vectors[qi * dims..(qi + 1) * dims];
+            assert_eq!(
+                eager.search("faces", q, 10).unwrap(),
+                reloaded_view.search("faces", q, 10).unwrap()
+            );
+        }
+        // 写入触发该簇及其余范数按需解码；之后新向量可被检索到，且可再次
+        // 保存/加载。
+        // EN: The write decodes the touched cluster (and norms) on demand; the
+        // new vector is searchable and the database can be saved and loaded
+        // again.
         let mut probe = vec![0.0f32; dims];
         probe[0] = 1.0;
         viewed.insert("faces", 9001, &probe).unwrap();
@@ -1020,6 +1057,7 @@ mod tests {
         let reloaded = MobileDB::load_from(&path2).unwrap();
         assert_eq!(reloaded.count("faces").unwrap(), n + 1);
         let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&view_saved);
         let _ = std::fs::remove_file(&path2);
     }
 

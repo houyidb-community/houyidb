@@ -186,7 +186,8 @@ void* houyi_mobile_db_load_view(const char* path);  // NULL 表示失败
 - **不计算整文件 CRC**（结构校验仍完整）；需要完整性校验时用
   `houyi_mobile_db_load`。映射期间**不得原地截断或改写该文件**；`save` 的
   「临时文件 + rename」是安全的，Vault 等宿主原地覆写请改用 `load_buffer`。
-- 首次写入会把所有簇整体物化（约一次 eager 解码成本），之后行为与普通加载一致。
+- 首次写入只解码本次会触碰的簇及其范数，其余簇保持惰性。保存时：未写入过的
+  视图直接复用原始构建态字节；写入后按当前数据重新编码。
 - 已解码的簇会常驻缓存；查询覆盖全部簇后内存占用接近 eager，但映射页是文件页、
   可被内核回收。
 - 仅 `flat-clustered` 构建态惰性解码；`flat` / `clustered-hnsw` 仍按原方式加载。

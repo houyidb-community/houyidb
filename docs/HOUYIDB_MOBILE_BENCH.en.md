@@ -129,8 +129,9 @@ Conclusions:
 
 New `loadView` / `houyi_mobile_db_load_view`: map the snapshot read-only and
 parse metadata only; flat-clustered built-state clusters decode and cache on the
-first search that touches them. The first write materializes every cluster;
-afterwards behavior matches eager loading.
+first search that touches them. The first write decodes only the clusters it
+touches and their norms; saving an unwritten view reuses the raw built-state
+bytes, while a written index is re-encoded.
 
 Same-session alternating A/B (100k×128, 31 °C, warm page cache; median of 15
 valid samples):
