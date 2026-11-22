@@ -1347,24 +1347,36 @@ fn decode_cluster_payloads(
     }
 }
 
+/// 按 T 的位模式整块拷贝字节（小端宿主的快路径）。
+///
+/// 调用方必须先确认 `bytes.len()` 是 `size_of::<T>()` 的整数倍；只分配不零
+/// 初始化，拷贝会写满全部元素，省掉一遍全量 memset。
+/// EN: Copy a byte block as T bit patterns (the little-endian fast path).
+/// Callers must ensure `bytes.len()` is a multiple of `size_of::<T>()`. The
+/// allocation is not zero-initialized because the copy fills every element,
+/// saving a full memset pass.
+fn bulk_bitcopy<T: Copy>(bytes: &[u8]) -> Vec<T> {
+    debug_assert!(bytes.len().is_multiple_of(std::mem::size_of::<T>()));
+    let len = bytes.len() / std::mem::size_of::<T>();
+    let mut out: Vec<T> = Vec::with_capacity(len);
+    // SAFETY：调用方保证字节数是 T 大小的整数倍且容量为 len；拷贝写满全部元素
+    // 后才 set_len，T: Copy 无析构问题。
+    // EN: SAFETY: the caller guarantees the byte length is a multiple of
+    // size_of::<T>() and capacity is len; the copy fills every element before
+    // set_len, and T: Copy has no drop concern.
+    unsafe {
+        std::ptr::copy_nonoverlapping(bytes.as_ptr(), out.as_mut_ptr() as *mut u8, bytes.len());
+        out.set_len(len);
+    }
+    out
+}
+
 #[cfg(target_endian = "little")]
 fn bulk_f32(bytes: &[u8]) -> Result<Vec<f32>, String> {
     if !bytes.len().is_multiple_of(4) {
         return Err("flat-clustered state: f32 payload not aligned".to_string());
     }
-    let len = bytes.len() / 4;
-    // 只分配不零初始化：拷贝会写满全部元素，少一遍 26 MB 级的 memset。
-    // EN: Allocate without zero-init: the copy fills every element, saving a
-    // full memset pass over the payload.
-    let mut out: Vec<f32> = Vec::with_capacity(len);
-    // SAFETY：容量为 len 且拷贝覆盖全部元素后才 set_len；f32 为 Copy，无析构问题。
-    // EN: SAFETY: capacity is len, every element is written before set_len, and
-    // f32 is Copy so there is no drop concern.
-    unsafe {
-        std::ptr::copy_nonoverlapping(bytes.as_ptr(), out.as_mut_ptr() as *mut u8, bytes.len());
-        out.set_len(len);
-    }
-    Ok(out)
+    Ok(bulk_bitcopy(bytes))
 }
 
 #[cfg(not(target_endian = "little"))]
@@ -1383,18 +1395,7 @@ fn bulk_f16(bytes: &[u8]) -> Result<Vec<f16>, String> {
     if !bytes.len().is_multiple_of(2) {
         return Err("flat-clustered state: f16 payload not aligned".to_string());
     }
-    let len = bytes.len() / 2;
-    // 同 bulk_f32：不零初始化，直接写入位模式。
-    // EN: Like bulk_f32: skip zero-init and write the bit patterns directly.
-    let mut out: Vec<f16> = Vec::with_capacity(len);
-    // SAFETY：容量为 len 且拷贝覆盖全部元素后才 set_len；f16 是 Copy 的 u16 封装。
-    // EN: SAFETY: capacity is len, every element is written before set_len, and
-    // f16 is a Copy u16 wrapper.
-    unsafe {
-        std::ptr::copy_nonoverlapping(bytes.as_ptr(), out.as_mut_ptr() as *mut u8, bytes.len());
-        out.set_len(len);
-    }
-    Ok(out)
+    Ok(bulk_bitcopy(bytes))
 }
 
 #[cfg(not(target_endian = "little"))]
@@ -1409,18 +1410,10 @@ fn bulk_f16(bytes: &[u8]) -> Result<Vec<f16>, String> {
 }
 
 fn bulk_i8(bytes: &[u8]) -> Vec<i8> {
-    // i8 与 u8 布局相同，直接整块拷贝（逐字节 map 会被 LLVM 优化但不如 memcpy 稳定）。
-    // EN: i8 and u8 share a layout, so copy the whole block (a per-byte map may be
-    // optimized by LLVM but a memcpy is the reliable shape).
-    let mut out: Vec<i8> = Vec::with_capacity(bytes.len());
-    // SAFETY：容量为 len 且拷贝覆盖全部元素后才 set_len；i8 为 Copy。
-    // EN: SAFETY: capacity is len, every element is written before set_len, and
-    // i8 is Copy.
-    unsafe {
-        std::ptr::copy_nonoverlapping(bytes.as_ptr(), out.as_mut_ptr() as *mut u8, bytes.len());
-        out.set_len(bytes.len());
-    }
-    out
+    // i8 与 u8 布局相同，直接整块拷贝；单字节类型在任何端序下都成立。
+    // EN: i8 and u8 share a layout, so copy the whole block; a single-byte type
+    // is endian-independent.
+    bulk_bitcopy(bytes)
 }
 
 /// 构建态状态字节的 magic：HOUYI Flat Clustered v1。

@@ -307,6 +307,13 @@ object HouyiDB {
         check(nativeSave(handle, path))
     }
 
+    /**
+     * 从文件加载。内部使用只读 mmap：加载期间不得原地改写/截断该文件
+     * （「临时文件 + rename」原子替换是安全的；宿主必须原地覆写时请改用 loadBytes）。
+     * EN: Load from a file. Uses a read-only mmap internally: do not overwrite or
+     * truncate the file in place during loading (atomic temp-file + rename is
+     * safe; when an in-place host overwrite is required, use loadBytes).
+     */
     fun load(path: String): Long {
         val handle = nativeLoad(path)
         if (handle == 0L) {

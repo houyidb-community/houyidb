@@ -91,8 +91,40 @@ Cumulative versus the original per-element decode (176 / 148.5 ms, measured in
 an earlier session; indicative only): about **4.9× / 5.3×**. Peak RSS is close between versions (f16 87 MB / i8 51 MB)
 because the decoded buffers are still owned; the mmap gain is one fewer
 whole-file copy and heap allocation, and mapped pages are file-backed and
-reclaimable. Against USearch f32 64.5 MB at 53–97 ms, f16 now sits at about
-two-thirds of its fastest figure and i8 remains faster in absolute terms.
+reclaimable. See the next section for the exact same-data USearch comparison.
+
+### USearch cold-load comparison (same device, same 100k×128 vectors)
+
+Houyi exported the base vectors; USearch v2.26.6 built f32/f16/i8 indexes from the
+same file. Three alternating rounds, median of 15 valid samples each. USearch's
+`load` deserializes into RAM; `view` is a zero-copy mmap that defers page faults
+to first access:
+
+| Open mode | File | load | First query | Ready-to-query |
+|---|---:|---:|---:|---:|
+| Houyi f16 (28 °C) | 26.6 MB | 35.7 ms | ~0.8 ms | ~36.5 ms |
+| Houyi f16 (31 °C) | 26.6 MB | 52.7 ms | ~0.9 ms | ~53.4 ms |
+| Houyi i8 (28 °C) | 14.2 MB | 27.8 ms | ~0.8 ms | ~28.6 ms |
+| Houyi i8 (31 °C) | 14.2 MB | 30.7 ms | ~1.1 ms | ~31.8 ms |
+| USearch f16 `load` | 40.5 MB | 38.4 ms | 0.8 ms | 39.2 ms |
+| USearch i8 `load` | 27.7 MB | 32.9 ms | 0.5 ms | 33.3 ms |
+| USearch f32 `load` | 66.1 MB | 52.5 ms | 0.6 ms | 53.1 ms |
+| **USearch f16 `view`** | 40.5 MB | 7.3 ms | 1.9 ms | **9.2 ms** |
+| **USearch i8 `view`** | 27.7 MB | 8.5 ms | 1.1 ms | **9.7 ms** |
+| **USearch f32 `view`** | 66.1 MB | 7.7 ms | 3.0 ms | **10.8 ms** |
+
+Conclusions:
+
+- Against `load` (deserialize into RAM): Houyi f16/i8 is slightly faster or on
+  par at 28 °C; at 31 °C f16 falls behind as the CPU throttles, while i8 stays
+  slightly ahead. USearch's load numbers are temperature-insensitive (38.4 /
+  32.9 / 52.5 ms across rounds), whereas Houyi's eager decode depends more on
+  CPU frequency.
+- Against `view` (zero-copy mmap): **Houyi is 3–6× slower.** USearch defers the
+  page-fault cost to the first query (1–3 ms), so it is ready in 9–11 ms.
+- Therefore cold start cannot be claimed as a win over USearch yet; closing the
+  gap needs a view/lazy-decode mode for snapshots (a new API; the existing
+  eager-load semantics stay unchanged).
 
 ## Thread-count sweep (128d×100k, RAYON_NUM_THREADS, 3 runs each)
 

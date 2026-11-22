@@ -82,7 +82,36 @@ i8 绝对值更快。
 **4.9× / 5.3×**。
 峰值 RSS 两版接近（f16 87 MB / i8 51 MB）：解码后仍需自有簇缓冲；mmap 的收益是
 省掉一次整块拷贝与堆分配，且映射页是文件页、可被内核回收。
-对照 USearch f32 64.5 MB 的 53–97 ms：f16 现在约为其最快值的 2/3，i8 仍更快。
+对 USearch 的精确对照见下一节。
+
+### 与 USearch 的冷加载对照（同机、同一份 100k×128 向量）
+
+用 Houyi 导出基准向量，USearch v2.26.6 读取同一文件构建 f32/f16/i8 索引；双方
+交替 3 轮，各取 15 个有效样本的中位数。USearch 的 `load` 把索引反序列化进内存，
+`view` 是 mmap 零拷贝、缺页推到首次访问：
+
+| 打开方式 | 文件 | load | 首次查询 | 到首查可用 |
+|---|---:|---:|---:|---:|
+| Houyi f16（28 °C） | 26.6 MB | 35.7 ms | ~0.8 ms | ~36.5 ms |
+| Houyi f16（31 °C） | 26.6 MB | 52.7 ms | ~0.9 ms | ~53.4 ms |
+| Houyi i8（28 °C） | 14.2 MB | 27.8 ms | ~0.8 ms | ~28.6 ms |
+| Houyi i8（31 °C） | 14.2 MB | 30.7 ms | ~1.1 ms | ~31.8 ms |
+| USearch f16 `load` | 40.5 MB | 38.4 ms | 0.8 ms | 39.2 ms |
+| USearch i8 `load` | 27.7 MB | 32.9 ms | 0.5 ms | 33.3 ms |
+| USearch f32 `load` | 66.1 MB | 52.5 ms | 0.6 ms | 53.1 ms |
+| **USearch f16 `view`** | 40.5 MB | 7.3 ms | 1.9 ms | **9.2 ms** |
+| **USearch i8 `view`** | 27.7 MB | 8.5 ms | 1.1 ms | **9.7 ms** |
+| **USearch f32 `view`** | 66.1 MB | 7.7 ms | 3.0 ms | **10.8 ms** |
+
+结论：
+
+- 对 `load`（反序列化进内存）：Houyi f16/i8 在 28 °C 下略快或持平；31 °C 时
+  f16 因 CPU 降频落后，i8 仍略快。USearch 的 load 耗时对温度不敏感（38.4 /
+  32.9 / 52.5 ms 三轮几乎不变），Houyi 的 eager 解码更依赖 CPU 频率。
+- 对 `view`（mmap 零拷贝）：**Houyi 落后 3–6×**。USearch 把缺页成本推到首次
+  查询（1–3 ms），总启动仅 9–11 ms。
+- 因此不能宣称冷启动已超越 USearch；要追平需要给快照增加 view/惰性解码模式
+  （新 API，现有 eager 加载语义不变）。
 
 ## 线程数扫描（128d×100k，RAYON_NUM_THREADS，各 3 次）
 

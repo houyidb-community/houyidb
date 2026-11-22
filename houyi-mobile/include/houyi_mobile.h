@@ -160,6 +160,14 @@ int32_t houyi_mobile_db_set_search_preset(void* db, const char* name, uint8_t pr
 // index needs a rebuild (use set_search_options nprobe at runtime).
 int32_t houyi_mobile_db_set_build_nprobe(void* db, const char* name, uint32_t nprobe);
 int32_t houyi_mobile_db_save(void* db, const char* path);
+// 从文件加载数据库；失败返回 NULL。内部用只读 mmap：加载期间调用方不得让
+// 其他进程/线程原地截断或改写该文件（「临时文件 + rename」原子替换是安全的；
+// 必须原地覆写时请改用 houyi_mobile_db_load_buffer）。违反该前提可能 SIGBUS。
+// EN: Load a database from a file; returns NULL on failure. Uses a read-only
+// mmap internally: while loading, the caller must not let another process or
+// thread truncate or overwrite the file in place (atomic temp-file + rename is
+// safe; use houyi_mobile_db_load_buffer when an in-place overwrite is required).
+// Breaking this precondition can raise SIGBUS.
 void* houyi_mobile_db_load(const char* path);
 // 内存快照：把整个数据库编码进调用方缓冲区，**不写任何临时文件**（加密/上传由
 // 调用方负责）。返回 0 成功、-1 参数非法（db/written 为 NULL）、-2 缓冲区不足。

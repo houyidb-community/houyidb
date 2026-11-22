@@ -188,19 +188,21 @@ pub(crate) fn load_from(path: &Path) -> Result<MobileDB, String> {
         return Err(format!("snapshot: file too large ({size} bytes)"));
     }
     // 只读映射省掉整块 read 拷贝与一份峰值内存；解码会在返回前把所有数据
-    // 复制进自有的簇缓冲，映射随后即可释放。快照由本库以「临时文件 +
-    // rename」原子替换，已打开的 inode 不会被本库截断，因此正常使用下映射
-    // 期间不会因截断触发 SIGBUS。
+    // 复制进自有的簇缓冲，映射随后即可释放。SIGBUS 风险来自外部前提：映射
+    // 期间不得有他方原地截断/改写该文件；本库 save_to 的「临时文件 + rename」
+    // 原子替换满足该前提，宿主自行原地覆写时请改用 load_bytes（见公开文档）。
     // EN: A read-only mapping removes the whole-file read copy and one peak
     // memory copy; decoding copies everything into owned cluster buffers before
-    // returning, so the mapping can be dropped. This library replaces snapshots
-    // atomically (temp file + rename) and never truncates an open inode, so
-    // normal use cannot SIGBUS the mapping.
+    // returning, so the mapping can be dropped. The SIGBUS risk is an external
+    // precondition: nobody may truncate or overwrite the file in place while it
+    // is mapped. This library's atomic temp-file + rename satisfies it; hosts
+    // that overwrite in place should use load_bytes (see the public docs).
     if let Ok(file) = std::fs::File::open(path) {
-        // SAFETY：映射为只读，文件句柄在 map 生命周期内保持打开；如上所述
-        // 不会发生并发截断。
-        // EN: SAFETY: the mapping is read-only, the handle stays open for the
-        // mapping's lifetime, and concurrent truncation cannot happen as above.
+        // SAFETY：映射只读，文件句柄在 map 生命周期内保持打开；并发截断是
+        // 调用方需遵守的外部前提（见上方说明），不是本调用能建立的保证。
+        // EN: SAFETY: the mapping is read-only and the handle stays open for the
+        // mapping's lifetime; concurrent truncation is an external precondition
+        // for the caller (see above), not something this call can guarantee.
         if let Ok(map) = unsafe { memmap2::Mmap::map(&file) } {
             return decode_snapshot(&map);
         }
@@ -699,7 +701,19 @@ impl MobileDB {
     }
 
     /// 从 `path` 加载数据库（新句柄）。
+    ///
+    /// 文件通过只读 mmap 读取：**调用方必须保证加载期间没有其他进程/线程
+    /// 原地修改或截断该文件**。本库的 `save_to` 使用临时文件 + rename，满足
+    /// 该前提；Vault 等宿主若原地覆写同一路径，请改用 `load_bytes`，或把覆写
+    /// 也改成原子 rename。违反该前提可能触发 SIGBUS。
     /// EN: Load a database from `path` (new handle).
+    ///
+    /// The file is read through a read-only mmap: **the caller must ensure no
+    /// other process/thread modifies or truncates the file in place while it is
+    /// being loaded.** This library's `save_to` uses a temp file + rename and
+    /// satisfies the requirement; if a Vault-style host overwrites the same path
+    /// in place, use `load_bytes` instead, or make that overwrite atomic.
+    /// Breaking the requirement can raise SIGBUS.
     pub fn load_from(path: impl AsRef<Path>) -> Result<MobileDB, String> {
         load_from(path.as_ref())
     }
