@@ -49,6 +49,23 @@ nprobe sweep (512d×50k, f16, one build, runtime `set_search_options`):
 - clustered-hnsw 128d×100k cold load: 237.0 / 240.3 / 239.5 ms (median 239 ms),
   recall 0.9350.
 
+## Cold-load optimization (P2 follow-up, 128d×100k, alternating A/B in one session)
+
+| Index | Before (warm median) | After | Speedup |
+|---|---:|---:|---:|
+| flat-clustered f16 (25.9 MB snapshot) | 176 ms | **95.5 ms** | 1.8× |
+| flat-clustered i8 (13.8 MB snapshot) | 148.5 ms | **46.5 ms** | 3.2× |
+
+How: decode now reads metadata sequentially and memcpys whole cluster payloads in
+parallel (f16 keeps its u16 bit pattern, i8 stays bytes) instead of converting
+element by element; the norm cache rebuild is parallel too. The snapshot format
+and CRC validation are unchanged, and old snapshots still load. Against USearch
+f32 64.5 MB at 53–97 ms, f16 is now in the same range and i8 is faster in
+absolute terms.
+
+(Persisting the norm cache into the snapshot was also tried: 80 vs 80 ms median
+in A/B, no gain, reverted.)
+
 ## Thread-count sweep (128d×100k, RAYON_NUM_THREADS, 3 runs each)
 
 | Threads | f16 p50 median | i8 p50 median | Build |

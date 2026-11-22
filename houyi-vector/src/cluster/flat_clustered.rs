@@ -340,16 +340,21 @@ struct CosineNormCache {
 
 impl CosineNormCache {
     fn build(vecs: &ClusterVectors, dims: usize) -> Self {
-        let mut inv_vec_norms = Vec::new();
-        for cluster in 0..vecs.clusters() {
-            let count = vecs.cluster_len(cluster) / dims;
-            let mut inv = Vec::with_capacity(count);
-            for slot in 0..count {
-                let norm2 = vecs.norm2(cluster, slot, dims);
-                inv.push(inv_norm_from_norm2(norm2));
-            }
-            inv_vec_norms.push(inv);
-        }
+        // 每簇独立：并行计算，加载时省掉一次全量串行遍历。
+        // EN: Each cluster is independent, so compute in parallel and save a
+        // full serial pass during load.
+        let inv_vec_norms = (0..vecs.clusters())
+            .into_par_iter()
+            .map(|cluster| {
+                let count = vecs.cluster_len(cluster) / dims;
+                let mut inv = Vec::with_capacity(count);
+                for slot in 0..count {
+                    let norm2 = vecs.norm2(cluster, slot, dims);
+                    inv.push(inv_norm_from_norm2(norm2));
+                }
+                inv
+            })
+            .collect();
         CosineNormCache { inv_vec_norms }
     }
 
@@ -1197,16 +1202,19 @@ impl FlatClustered {
         for _ in 0..centroid_len {
             centroids.push(r.f32()?);
         }
-        let mut cluster_ids: Vec<Vec<u64>> = Vec::with_capacity(num_clusters);
-        let mut cluster_vecs = match dtype {
-            FlatStorageDtype::F32 => ClusterVectors::F32(Vec::with_capacity(num_clusters)),
-            FlatStorageDtype::F16 => ClusterVectors::F16(Vec::with_capacity(num_clusters)),
-            FlatStorageDtype::I8 => ClusterVectors::I8 {
-                codes: Vec::with_capacity(num_clusters),
-                scales: Vec::with_capacity(num_clusters),
-            },
+        // 两阶段解码：先顺序读出每簇的 id 与向量载荷窗口，再并行把载荷
+        // 直接拷贝进目标类型（小端宿主一次 memcpy，不做逐元素转换）。
+        // EN: Two-phase decode: read ids and payload windows sequentially, then
+        // copy each cluster payload into its target type in parallel (one memcpy
+        // per cluster on little-endian hosts instead of per-element conversion).
+        let elem_bytes = match dtype {
+            FlatStorageDtype::F32 => 4,
+            FlatStorageDtype::F16 => 2,
+            _ => 1,
         };
         let mut seen = ahash::AHashSet::new();
+        let mut windows: Vec<ClusterWindow> = Vec::with_capacity(num_clusters);
+        let mut cluster_ids: Vec<Vec<u64>> = Vec::with_capacity(num_clusters);
         for _ in 0..num_clusters {
             let count = r.u32()? as usize;
             // ids 至少占 8 B，先按剩余字节拒绝明显的分配放大。
@@ -1226,58 +1234,36 @@ impl FlatClustered {
             let vec_len = count
                 .checked_mul(dims)
                 .ok_or_else(|| "flat-clustered state: vector size overflow".to_string())?;
-            match &mut cluster_vecs {
-                ClusterVectors::F32(v) => {
-                    let bytes = vec_len
-                        .checked_mul(4)
-                        .ok_or_else(|| "flat-clustered state: vector bytes overflow".to_string())?;
-                    if bytes > r.remaining() {
-                        return Err("flat-clustered state: vector payload truncated".to_string());
-                    }
-                    let mut list = Vec::with_capacity(vec_len);
-                    for _ in 0..vec_len {
-                        list.push(r.f32()?);
-                    }
-                    v.push(list);
-                }
-                ClusterVectors::F16(v) => {
-                    let bytes = vec_len
-                        .checked_mul(2)
-                        .ok_or_else(|| "flat-clustered state: vector bytes overflow".to_string())?;
-                    if bytes > r.remaining() {
-                        return Err("flat-clustered state: vector payload truncated".to_string());
-                    }
-                    let mut list = Vec::with_capacity(vec_len);
-                    for _ in 0..vec_len {
-                        list.push(f16::from_bits(r.u16()?));
-                    }
-                    v.push(list);
-                }
-                ClusterVectors::I8 { codes, scales } => {
-                    let code_bytes = vec_len;
-                    if code_bytes > r.remaining() {
-                        return Err("flat-clustered state: i8 payload truncated".to_string());
-                    }
-                    let mut list = Vec::with_capacity(vec_len);
-                    for _ in 0..vec_len {
-                        list.push(r.u8()? as i8);
-                    }
-                    let scale_bytes = count
-                        .checked_mul(4)
-                        .ok_or_else(|| "flat-clustered state: scale bytes overflow".to_string())?;
-                    if scale_bytes > r.remaining() {
-                        return Err("flat-clustered state: i8 scales truncated".to_string());
-                    }
-                    let mut scale_list = Vec::with_capacity(count);
-                    for _ in 0..count {
-                        scale_list.push(r.f32()?);
-                    }
-                    codes.push(list);
-                    scales.push(scale_list);
-                }
+            let vec_bytes = vec_len
+                .checked_mul(elem_bytes)
+                .ok_or_else(|| "flat-clustered state: vector bytes overflow".to_string())?;
+            if vec_bytes > r.remaining() {
+                return Err("flat-clustered state: vector payload truncated".to_string());
             }
+            let vec_off = r.pos();
+            r.skip(vec_bytes)?;
+            let scale_off = if dtype == FlatStorageDtype::I8 {
+                let scale_bytes = count
+                    .checked_mul(4)
+                    .ok_or_else(|| "flat-clustered state: scale bytes overflow".to_string())?;
+                if scale_bytes > r.remaining() {
+                    return Err("flat-clustered state: i8 scales truncated".to_string());
+                }
+                let off = r.pos();
+                r.skip(scale_bytes)?;
+                Some(off)
+            } else {
+                None
+            };
             cluster_ids.push(ids);
+            windows.push(ClusterWindow {
+                vec_off,
+                vec_bytes,
+                count,
+                scale_off,
+            });
         }
+        let cluster_vecs = decode_cluster_payloads(bytes, &windows, dtype)?;
         if r.remaining() != 0 {
             return Err("flat-clustered state: trailing bytes".to_string());
         }
@@ -1299,6 +1285,126 @@ impl FlatClustered {
     }
 }
 
+/// 单簇向量载荷在状态字节中的窗口（供并行解码）。
+/// EN: Windows of one cluster's vector payload inside the state bytes (for
+/// parallel decoding).
+struct ClusterWindow {
+    vec_off: usize,
+    vec_bytes: usize,
+    count: usize,
+    scale_off: Option<usize>,
+}
+
+/// i8 簇解码的中间结果：量化码 + 每簇缩放系数。
+/// EN: Intermediate result for i8 cluster decoding: quantized codes plus the
+/// per-cluster scales.
+type ScaledCodes = (Vec<i8>, Vec<f32>);
+
+/// 并行把各簇载荷直接拷贝成目标存储类型。
+///
+/// 小端宿主（所有移动端目标）直接 memcpy，f16 视为 u16 位模式、i8 视为字节，
+/// 不做逐元素转换；大端宿主回退到逐元素 from_le_bytes，保持正确性。
+/// EN: Copy each cluster payload into its storage type in parallel. On
+/// little-endian hosts (every mobile target) this is a memcpy: f16 keeps its u16
+/// bit pattern and i8 stays bytes, with no per-element conversion. Big-endian
+/// hosts fall back to element-wise from_le_bytes for correctness.
+fn decode_cluster_payloads(
+    bytes: &[u8],
+    windows: &[ClusterWindow],
+    dtype: FlatStorageDtype,
+) -> Result<ClusterVectors, String> {
+    match dtype {
+        FlatStorageDtype::F32 => {
+            let lists: Result<Vec<Vec<f32>>, String> = windows
+                .par_iter()
+                .map(|w| bulk_f32(&bytes[w.vec_off..w.vec_off + w.vec_bytes]))
+                .collect();
+            Ok(ClusterVectors::F32(lists?))
+        }
+        FlatStorageDtype::F16 => {
+            let lists: Result<Vec<Vec<f16>>, String> = windows
+                .par_iter()
+                .map(|w| bulk_f16(&bytes[w.vec_off..w.vec_off + w.vec_bytes]))
+                .collect();
+            Ok(ClusterVectors::F16(lists?))
+        }
+        _ => {
+            let pairs: Result<Vec<ScaledCodes>, String> = windows
+                .par_iter()
+                .map(|w| {
+                    let codes = bulk_i8(&bytes[w.vec_off..w.vec_off + w.vec_bytes])?;
+                    let off = w
+                        .scale_off
+                        .ok_or_else(|| "flat-clustered state: missing i8 scales".to_string())?;
+                    let scales = bulk_f32(&bytes[off..off + w.count * 4])?;
+                    Ok((codes, scales))
+                })
+                .collect();
+            let pairs = pairs?;
+            let (codes, scales) = pairs.into_iter().unzip();
+            Ok(ClusterVectors::I8 { codes, scales })
+        }
+    }
+}
+
+#[cfg(target_endian = "little")]
+fn bulk_f32(bytes: &[u8]) -> Result<Vec<f32>, String> {
+    if !bytes.len().is_multiple_of(4) {
+        return Err("flat-clustered state: f32 payload not aligned".to_string());
+    }
+    let mut out = vec![0f32; bytes.len() / 4];
+    // SAFETY：目标缓冲已按 f32 长度分配，字节数与来源一致。
+    // EN: SAFETY: destination is sized for f32 and the byte counts match.
+    unsafe {
+        std::ptr::copy_nonoverlapping(bytes.as_ptr(), out.as_mut_ptr() as *mut u8, bytes.len());
+    }
+    Ok(out)
+}
+
+#[cfg(not(target_endian = "little"))]
+fn bulk_f32(bytes: &[u8]) -> Result<Vec<f32>, String> {
+    if !bytes.len().is_multiple_of(4) {
+        return Err("flat-clustered state: f32 payload not aligned".to_string());
+    }
+    Ok(bytes
+        .chunks_exact(4)
+        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect())
+}
+
+#[cfg(target_endian = "little")]
+fn bulk_f16(bytes: &[u8]) -> Result<Vec<f16>, String> {
+    if !bytes.len().is_multiple_of(2) {
+        return Err("flat-clustered state: f16 payload not aligned".to_string());
+    }
+    let mut out = vec![f16::from_bits(0); bytes.len() / 2];
+    // SAFETY：f16 是 u16 的透明封装，目标缓冲已按元素数分配。
+    // EN: SAFETY: f16 is a transparent u16 wrapper and the destination is sized
+    // for the element count.
+    unsafe {
+        std::ptr::copy_nonoverlapping(bytes.as_ptr(), out.as_mut_ptr() as *mut u8, bytes.len());
+    }
+    Ok(out)
+}
+
+#[cfg(not(target_endian = "little"))]
+fn bulk_f16(bytes: &[u8]) -> Result<Vec<f16>, String> {
+    if !bytes.len().is_multiple_of(2) {
+        return Err("flat-clustered state: f16 payload not aligned".to_string());
+    }
+    Ok(bytes
+        .chunks_exact(2)
+        .map(|c| f16::from_bits(u16::from_le_bytes([c[0], c[1]])))
+        .collect())
+}
+
+fn bulk_i8(bytes: &[u8]) -> Result<Vec<i8>, String> {
+    Ok(bytes.iter().map(|&b| b as i8).collect())
+}
+
+/// 单簇向量载荷在状态字节中的窗口（供并行解码）。
+/// EN: Windows of one cluster's vector payload inside the state bytes (for
+/// parallel decoding).
 const FLAT_CLUSTERED_STATE_MAGIC: &[u8; 8] = b"HOUYIFC1";
 const FLAT_CLUSTERED_STATE_VERSION: u32 = 1;
 /// 构建态解码的防御上限：移动端实际远小于此值，避免恶意/损坏头部放大分配。
@@ -1340,6 +1446,16 @@ impl<'a> StateReader<'a> {
     fn remaining(&self) -> usize {
         self.bytes.len().saturating_sub(self.pos)
     }
+    fn pos(&self) -> usize {
+        self.pos
+    }
+    fn skip(&mut self, n: usize) -> Result<(), String> {
+        if n > self.remaining() {
+            return Err("flat-clustered state: truncated payload".to_string());
+        }
+        self.pos += n;
+        Ok(())
+    }
     fn take(&mut self, n: usize) -> Result<&'a [u8], String> {
         if n > self.remaining() {
             return Err("flat-clustered state: truncated".to_string());
@@ -1350,10 +1466,6 @@ impl<'a> StateReader<'a> {
     }
     fn u8(&mut self) -> Result<u8, String> {
         Ok(self.take(1)?[0])
-    }
-    fn u16(&mut self) -> Result<u16, String> {
-        let b = self.take(2)?;
-        Ok(u16::from_le_bytes([b[0], b[1]]))
     }
     fn u32(&mut self) -> Result<u32, String> {
         let b = self.take(4)?;
