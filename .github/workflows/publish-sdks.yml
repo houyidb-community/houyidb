@@ -18,6 +18,10 @@ on:
         description: "Comma-separated: python,npm,nuget,crates (default python)"
         type: string
         default: "python"
+      yank_houyidb_placeholder:
+        description: "Yank the legacy houyidb 0.1.0 placeholder before publishing"
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -186,17 +190,38 @@ jobs:
         with:
           name: crate-package
           path: target/package/*.crate
+      - if: inputs.yank_houyidb_placeholder
+        run: cargo yank --vers 0.1.0 houyidb --token "$CARGO_REGISTRY_TOKEN"
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
       - if: >-
           (github.event_name == 'release' || inputs.publish) &&
           (github.event_name == 'release' || contains(inputs.ecosystems, 'crates'))
         run: |
-          cargo publish -p houyidb-client --token "$CARGO_REGISTRY_TOKEN"
+          # 版本已发布时继续（方便手动重跑只补发门面）；其他错误照常失败。
+          # EN: Continue when a version is already published (so a manual
+          # re-dispatch can backfill the facade); other errors still fail.
+          publish_crate() {
+            local pkg="$1" out rc
+            set +e
+            out=$(cargo publish -p "$pkg" --token "$CARGO_REGISTRY_TOKEN" 2>&1)
+            rc=$?
+            set -e
+            printf '%s\n' "$out"
+            if [ "$rc" -eq 0 ]; then return 0; fi
+            if printf '%s' "$out" | grep -q "already uploaded"; then
+              echo "$pkg is already published; continuing"
+              return 0
+            fi
+            return "$rc"
+          }
+          publish_crate houyidb-client
           # 门面依赖刚发布的 client；等索引刷新后重试几次。
           # EN: The facade depends on the just-published client; give the index
           # a moment and retry a few times.
           for attempt in 1 2 3 4 5; do
             sleep 10
-            cargo publish -p houyidb --token "$CARGO_REGISTRY_TOKEN" && break
+            if publish_crate houyidb; then break; fi
             if [ "$attempt" = 5 ]; then exit 1; fi
           done
         env:
